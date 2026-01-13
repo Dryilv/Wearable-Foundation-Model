@@ -19,14 +19,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast
 
-# 导入新模型
-from model import CWT_MAE 
+# 【修改 1】导入新的预训练模型类
+from model import CWT_MAE_Pretrained 
 from dataset import PhysioSignalDataset
 
 torch.set_float32_matmul_precision('high') 
 
 # -------------------------------------------------------------------
-# 1. 辅助工具类
+# 1. 辅助工具类 (保持不变)
 # -------------------------------------------------------------------
 class SmoothedValue(object):
     def __init__(self, window_size=20, fmt=None):
@@ -104,7 +104,7 @@ def init_distributed_mode():
         return 0, 0, 1
 
 # -------------------------------------------------------------------
-# 2. 可视化函数
+# 2. 可视化函数 (需要修改路径)
 # -------------------------------------------------------------------
 def save_reconstruction_images(model, batch, epoch, save_dir):
     model.eval()
@@ -133,10 +133,13 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
         plt.grid(True, alpha=0.3)
 
         # --- 2. 频域图谱 ---
+        # 【修改 2】获取 patch_embed 的路径变了
         if isinstance(model, DDP):
-            patch_embed = model.module.patch_embed
+            # model -> DDP -> CWT_MAE_Pretrained -> encoder (timm) -> patch_embed
+            patch_embed = model.module.encoder.patch_embed
         else:
-            patch_embed = model.patch_embed
+            # model -> CWT_MAE_Pretrained -> encoder (timm) -> patch_embed
+            patch_embed = model.encoder.patch_embed
             
         p_h, p_w = patch_embed.patch_size
         B, C, H, W = imgs.shape
@@ -166,17 +169,12 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
     model.train()
 
 # -------------------------------------------------------------------
-# 3. 学习率调度器 (基于 Step)
+# 3. 学习率调度器 (保持不变)
 # -------------------------------------------------------------------
 def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_steps, base_lr, min_lr):
-    """
-    基于 Step 的 Cosine Decay 调度器
-    """
     if current_step < warmup_steps:
-        # Linear Warmup
         lr = base_lr * current_step / warmup_steps
     else:
-        # Cosine Decay
         progress = (current_step - warmup_steps) / (total_steps - warmup_steps)
         lr = min_lr + (base_lr - min_lr) * 0.5 * (1. + math.cos(math.pi * progress))
             
@@ -188,7 +186,7 @@ def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_s
     return lr
 
 # -------------------------------------------------------------------
-# 4. 训练逻辑
+# 4. 训练逻辑 (保持不变)
 # -------------------------------------------------------------------
 def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device, start_time_global, 
                     total_steps, warmup_steps, base_lr, min_lr):
@@ -203,11 +201,8 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     for step, batch in enumerate(dataloader):
-        # --- [修改点] 每个 Step 更新学习率 ---
-        # 计算全局步数
         global_step = epoch * num_steps_per_epoch + step
         
-        # 更新 LR
         adjust_learning_rate_per_step(
             optimizer, 
             current_step=global_step, 
@@ -216,7 +211,6 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
             base_lr=base_lr, 
             min_lr=min_lr
         )
-        # ----------------------------------
 
         batch = batch.to(device, non_blocking=True)
 
@@ -251,7 +245,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
     return metric_logger['loss'].global_avg
 
 # -------------------------------------------------------------------
-# 5. 主函数
+# 5. 主函数 (修改模型初始化)
 # -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -290,7 +284,6 @@ def main():
         drop_last=True
     )
 
-    # --- [修改点] 计算总步数和 Warmup 步数 ---
     num_steps_per_epoch = len(dataloader)
     total_epochs = config['train']['epochs']
     warmup_epochs = config['train']['warmup_epochs']
@@ -304,16 +297,21 @@ def main():
     if is_main_process():
         logger.info(f"Total Steps: {total_steps}, Warmup Steps: {warmup_steps}")
         logger.info(f"Base LR: {base_lr}, Min LR: {min_lr}")
-    # ---------------------------------------
 
-    model = CWT_MAE(
+    # 【修改 3】实例化新的预训练模型
+    # 注意：这里移除了 depth 和 num_heads，因为它们由 model_name 决定
+    # 增加了 model_name 参数
+    model = CWT_MAE_Pretrained(
         signal_len=config['data']['signal_len'],
         cwt_scales=config['model'].get('cwt_scales', 64),
         patch_size_time=config['model'].get('patch_size_time', 50),
         patch_size_freq=config['model'].get('patch_size_freq', 4),
-        embed_dim=config['model']['embed_dim'],
-        depth=config['model']['depth'],
-        num_heads=config['model']['num_heads'],
+        
+        # 新增：指定预训练模型名称
+        model_name=config['model'].get('backbone', 'vit_base_patch16_224'),
+        
+        # Encoder 的 depth 和 num_heads 不需要传了，timm 会自动处理
+        
         decoder_embed_dim=config['model']['decoder_embed_dim'],
         decoder_depth=config['model']['decoder_depth'],
         decoder_num_heads=config['model']['decoder_num_heads'],
@@ -339,10 +337,6 @@ def main():
     if config['train']['resume'] and os.path.isfile(config['train']['resume']):
         checkpoint = torch.load(config['train']['resume'], map_location='cpu')
         model.module.load_state_dict(checkpoint['model'])
-        
-        # 如果是调整 LR 后 Resume，建议注释掉下面这行
-        # optimizer.load_state_dict(checkpoint['optimizer'])
-        
         start_epoch = checkpoint['epoch'] + 1
         if is_main_process():
             logger.info(f"Resumed from epoch {start_epoch}")
@@ -356,11 +350,8 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         sampler.set_epoch(epoch)
         
-        # 移除旧的 adjust_learning_rate 调用
-        
         train_one_epoch(
             model, dataloader, optimizer, epoch, logger, config, device, start_time_global,
-            # 传入 Step 调度所需的参数
             total_steps=total_steps,
             warmup_steps=warmup_steps,
             base_lr=base_lr,
