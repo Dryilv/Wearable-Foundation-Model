@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast
 
 # 导入新模型
-from model_improved import CWT_MAE 
+from model import CWT_MAE 
 from dataset import PhysioSignalDataset
 
 torch.set_float32_matmul_precision('high') 
