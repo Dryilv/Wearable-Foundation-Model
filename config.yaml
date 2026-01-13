@@ -45,7 +45,7 @@ model:
 train:
   # 批次大小 (根据显存调整，ViT-Base 显存占用较大)
   # 如果显存不足，尝试降低到 32 或 16
-  batch_size: 128
+  batch_size: 64
   
   # 训练轮数
   epochs: 100
