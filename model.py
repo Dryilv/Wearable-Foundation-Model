@@ -3,9 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-import torch._dynamo
-# 允许编译失败时自动回退到普通模式，而不是直接报错退出
-torch._dynamo.config.suppress_errors = True
+
 # ===================================================================
 # 1. CWT 模块 (保持不变)
 # ===================================================================
@@ -60,61 +58,44 @@ def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0):
     return cwt_out
 
 # ===================================================================
-# 2. RoPE (Rotary Positional Embedding) 组件 【新增】
+# 2. RoPE (Rotary Positional Embedding) 组件
 # ===================================================================
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=6000):
         super().__init__()
         self.dim = dim
-        # 预计算 theta
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
         self.max_seq_len = max_seq_len
-        # 缓存 cos/sin
         self._update_cache(max_seq_len)
 
     def _update_cache(self, seq_len):
         self.max_seq_len = seq_len
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
-        # 拼接成 (seq_len, dim)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos().to(dtype=torch.bfloat16), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype=torch.bfloat16), persistent=False)
 
     def forward(self, x, pos_ids):
-        # x: [B, N, H, D/H]
-        # pos_ids: [B, N]
         seq_len = torch.max(pos_ids) + 1
         if seq_len > self.max_seq_len:
             self._update_cache(int(seq_len * 1.5))
-            
-        # 根据 pos_ids 选取对应的 cos/sin
-        # cos: [B, N, Dim]
         cos = F.embedding(pos_ids, self.cos_cached).to(x.dtype)
         sin = F.embedding(pos_ids, self.sin_cached).to(x.dtype)
-        
         return cos.unsqueeze(2), sin.unsqueeze(2)
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    """
-    应用 RoPE 旋转
-    q, k: [B, N, H, D_head]
-    cos, sin: [B, N, 1, D_head] (广播到 H)
-    """
-    # 将 q, k 切分为两半进行旋转
-    # x = [x1, x2] -> [-x2, x1]
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
-
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 # ===================================================================
-# 3. 基础组件 (支持 RoPE 的 Attention 和 Block)
+# 3. 基础组件 (修正 PatchEmbed，保持 TensorizedBlock)
 # ===================================================================
 
 class TensorizedLinear(nn.Module):
@@ -135,6 +116,11 @@ class TensorizedLinear(nn.Module):
         return self.u(self.v(x))
 
 class DecomposedPatchEmbed(nn.Module):
+    """
+    【修正版】内存安全的 Patch Embedding
+    由于输入通道仅为 3，直接使用标准卷积是最优解。
+    之前的分解版本会导致中间张量膨胀到 94 亿元素，引发 32-bit 索引错误。
+    """
     def __init__(self, img_size=(64, 3000), patch_size=(4, 50), in_chans=3, embed_dim=768, norm_layer=None):
         super().__init__()
         self.img_size = img_size
@@ -142,23 +128,21 @@ class DecomposedPatchEmbed(nn.Module):
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
 
-        self.proj_channel = nn.Conv2d(in_chans, embed_dim, kernel_size=1, stride=1)
-        self.proj_freq = nn.Conv2d(embed_dim, embed_dim, kernel_size=(patch_size[0], 1), stride=(patch_size[0], 1), groups=embed_dim) 
-        self.proj_time = nn.Conv2d(embed_dim, embed_dim, kernel_size=(1, patch_size[1]), stride=(1, patch_size[1]), groups=embed_dim) 
+        # 直接使用标准卷积，一步到位完成下采样和升维
+        # 避免了中间产生 (B, 768, 64, 3000) 的巨大张量
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
-        x = self.proj_channel(x)
-        x = self.proj_freq(x)
-        x = self.proj_time(x)
+        # x: (B, 3, 64, 3000)
+        # proj -> (B, 768, 16, 60) -> 元素数量大幅减少，安全
+        x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x
 
 class RoPEAttention(nn.Module):
-    """
-    替代 nn.MultiheadAttention，支持 RoPE
-    """
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
@@ -172,16 +156,12 @@ class RoPEAttention(nn.Module):
 
     def forward(self, x, rope_cos=None, rope_sin=None):
         B, N, C = x.shape
-        # qkv: [B, N, 3*C] -> [B, N, 3, H, C/H] -> [3, B, N, H, C/H]
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # 应用 RoPE
         if rope_cos is not None and rope_sin is not None:
             q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
 
-        # Flash Attention (PyTorch 2.0+)
-        # q, k, v shape: [B, N, H, D] -> transpose to [B, H, N, D] for F.scaled_dot_product_attention
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -198,7 +178,6 @@ class TensorizedBlock(nn.Module):
                  rank_ratio=0.5, norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        # 使用自定义 RoPE Attention
         self.attn = RoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.norm2 = norm_layer(dim)
         
@@ -217,7 +196,6 @@ class TensorizedBlock(nn.Module):
         return x
 
 class Block(nn.Module):
-    """Decoder Block (Standard Linear MLP)"""
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -265,7 +243,7 @@ class CWT_MAE_RoPE(nn.Module):
         self.time_loss_weight = time_loss_weight
         self.patch_size_time = patch_size_time
         
-        # 1. Patch Embed
+        # 1. Patch Embed (修正为标准卷积)
         self.patch_embed = DecomposedPatchEmbed(
             img_size=(cwt_scales, signal_len),
             patch_size=(patch_size_freq, patch_size_time),
@@ -276,14 +254,12 @@ class CWT_MAE_RoPE(nn.Module):
         self.num_patches = self.patch_embed.num_patches
         self.grid_size = self.patch_embed.grid_size 
 
-        # 2. RoPE Generator (Encoder & Decoder)
-        # head_dim = embed_dim // num_heads
+        # 2. RoPE Generator
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
         self.rope_decoder = RotaryEmbedding(dim=decoder_embed_dim // decoder_num_heads)
 
         # 3. Encoder
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # 依然保留 Absolute Pos Embed，作为 Global Anchor，RoPE 作为 Relative 增强
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
         
         self.blocks = nn.ModuleList([
@@ -354,33 +330,22 @@ class CWT_MAE_RoPE(nn.Module):
         return x_masked, mask, ids_restore, ids_keep
 
     def forward_encoder(self, x):
-        # x: [B, 3, H, W] -> [B, N, D]
         x = self.patch_embed(x)
-        
-        # 添加绝对位置编码 (Global Anchor)
         x = x + self.pos_embed[:, 1:, :]
-        
-        # Masking
         x_masked, mask, ids_restore, ids_keep = self.random_masking(x, self.mask_ratio)
         
-        # 拼接 CLS Token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x_masked), dim=1)
         
-        # --- 准备 RoPE 的 Position IDs ---
-        # CLS token 位置设为 0
-        # Patch tokens 位置设为 ids_keep + 1 (因为 0 被 CLS 占了)
         B = x.shape[0]
         cls_pos = torch.zeros(B, 1, device=x.device, dtype=torch.long)
         patch_pos = ids_keep + 1
-        pos_ids = torch.cat((cls_pos, patch_pos), dim=1) # [B, N_keep + 1]
+        pos_ids = torch.cat((cls_pos, patch_pos), dim=1)
         
-        # 生成 RoPE 旋转矩阵
         rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
         
         for blk in self.blocks:
-            # 传入 RoPE 参数
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
             
         x = self.norm(x)
@@ -389,18 +354,13 @@ class CWT_MAE_RoPE(nn.Module):
     def forward_decoder(self, x, ids_restore):
         x = self.decoder_embed(x)
         mask_tokens = self.mask_token.repeat(x.shape[0], self.num_patches + 1 - x.shape[1], 1)
-        
         x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)
         x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
         x = torch.cat([x[:, :1, :], x_], dim=1)
-        
         x = x + self.decoder_pos_embed
         
-        # --- 准备 Decoder RoPE ---
-        # Decoder 看到的是完整序列，位置是连续的 0, 1, 2, ... N
         B, N, _ = x.shape
         pos_ids = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
-        
         rope_cos, rope_sin = self.rope_decoder(x, pos_ids)
         
         for blk in self.decoder_blocks:
@@ -431,7 +391,6 @@ class CWT_MAE_RoPE(nn.Module):
 
     def forward(self, x):
         if x.dim() == 3: x = x.squeeze(1)
-        
         imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
         
         dtype_orig = imgs.dtype
@@ -460,27 +419,3 @@ class CWT_MAE_RoPE(nn.Module):
         total_loss = loss_spec + self.time_loss_weight * loss_time
         
         return total_loss, pred_spec, pred_time, imgs
-
-# ===================================================================
-# 测试代码
-# ===================================================================
-if __name__ == "__main__":
-    # 模拟输入: Batch=2, Length=3000
-    x = torch.randn(2, 3000)
-    
-    model = CWT_MAE_RoPE(
-        signal_len=3000,
-        mask_ratio=0.75,     
-        mlp_rank_ratio=0.5,  
-        embed_dim=768
-    )
-    
-    loss, pred_spec, pred_time, imgs = model(x)
-    
-    print(f"Input shape: {x.shape}")
-    print(f"Loss: {loss.item()}")
-    print(f"Spec Pred shape: {pred_spec.shape}")
-    print(f"Time Pred shape: {pred_time.shape}")
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total Parameters: {total_params / 1e6:.2f} M")
