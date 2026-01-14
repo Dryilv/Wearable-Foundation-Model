@@ -21,7 +21,7 @@ train:
   
   # 修改保存路径，区分新旧模型
   save_dir: "./checkpoint_rope_tensor_768"
-  resume: ""              # 如果是第一次跑新模型，置空；否则填路径
+  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/checkpoint_rope_tensor_768/checkpoint_last.pth"              # 如果是第一次跑新模型，置空；否则填路径
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
