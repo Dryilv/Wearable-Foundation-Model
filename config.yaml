@@ -7,7 +7,7 @@ train:
   # 引入张量分解后，显存占用会降低。
   # 24G 显存建议: 64 - 96
   # 80G 显存建议: 256 - 512
-  batch_size: 384          
+  batch_size: 256          
   
   base_lr: 1.5e-4         # 稍微调大一点，因为 Batch Size 较大且数据量大
   min_lr: 1.0e-6
