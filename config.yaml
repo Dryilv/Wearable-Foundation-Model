@@ -1,78 +1,66 @@
-# --- config.yaml ---
+train:
+  # 2w 小时数据量巨大，200 epoch 可能需要训练很久。
+  # 建议先跑 50-100 epoch 看 Loss 收敛曲线。
+  epochs: 100             
+  
+  # [显存优化] 
+  # 引入张量分解后，显存占用会降低。
+  # 24G 显存建议: 64 - 96
+  # 80G 显存建议: 256 - 512
+  batch_size: 64          
+  
+  base_lr: 1.5e-4         # 稍微调大一点，因为 Batch Size 较大且数据量大
+  min_lr: 1.0e-6
+  warmup_epochs: 5        # 数据量大，Warmup 可以稍微短一点
+  weight_decay: 0.05      # 张量分解本身有正则化效果，WD 可以适当降低 (0.1 -> 0.05)
+  clip_grad: 3.0          
+  use_amp: True           # 必须开启，配合代码中的 bfloat16
+  
+  log_interval: 50
+  save_freq: 5
+  
+  # 修改保存路径，区分新旧模型
+  save_dir: "./checkpoint_rope_tensor_768"
+  resume: ""              # 如果是第一次跑新模型，置空；否则填路径
 
 data:
-  # 数据索引文件的路径 (json格式)
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
-  
-  # 信号长度 (必须与 model.signal_len 一致)
-  signal_len: 3000
-  
-  # DataLoader 的工作线程数
-  num_workers: 8
+  signal_len: 3000        # 30秒 @ 100Hz
+  num_workers: 16         # 保持高并发加载
 
 model:
-  # --- 预训练骨干网络 ---
-  # 推荐使用 vit_base_patch16_224 (ImageNet-1k 预训练)
-  # 也可以尝试 vit_small_patch16_224 (更轻量) 或 vit_large_patch16_224 (更强但显存消耗大)
-  backbone: "vit_base_patch16_224"
-
-  # --- CWT (连续小波变换) 设置 ---
-  # 尺度数量 (对应生成的频谱图高度)
-  cwt_scales: 64
+  # --- CWT & Patch 参数 ---
+  cwt_scales: 64          
   
-  # --- Patch Embedding 设置 ---
-  # 这里的设置决定了输入 Transformer 的网格大小
-  # 频谱图高度 H = cwt_scales = 64
-  # 频谱图宽度 W = signal_len = 3000
-  # Patch 高度 = 4 -> Grid H = 64 / 4 = 16
-  # Patch 宽度 = 50 -> Grid W = 3000 / 50 = 60
-  # 总 Patch 数 = 16 * 60 = 960
-  patch_size_freq: 4
-  patch_size_time: 50
-
-  # --- Decoder 设置 (轻量级) ---
-  decoder_embed_dim: 512
-  decoder_depth: 8
-  decoder_num_heads: 16
+  # [关键] 深度可分离 PatchEmbed 配置
+  # 时间轴: 3000 / 50 = 60 patches
+  # 频率轴: 64 / 4 = 16 patches
+  # 总 Token = 960
+  patch_size_time: 50     
+  patch_size_freq: 4      
+  
+  # --- Transformer 架构 (ViT-Base) ---
+  embed_dim: 768          
+  depth: 12               
+  num_heads: 12           
+  
+  # --- [新增] 张量分解参数 ---
+  # 控制 MLP 层的秩。
+  # 0.25: 极度压缩，适合小数据防过拟合。
+  # 0.50: 平衡点，适合中大数据 (推荐)。
+  # 0.75-1.0: 高容量，适合超大规模数据。
+  mlp_rank_ratio: 0.5     
+  
+  # --- Decoder ---
+  decoder_embed_dim: 512  
+  decoder_depth: 8        
+  decoder_num_heads: 16   
   
   # --- 训练策略 ---
-  # Mask 比例 (MAE 通常使用 50% - 75%)
-  mask_ratio: 0.6
+  # [重要] 针对 ECG/PPG 的高自相关性，必须高 Mask Ratio
+  # 0.75 意味着遮住 22.5秒，只留 7.5秒让模型猜。
+  mask_ratio: 0.75         
   
-  # 时域重建损失的权重 (Total Loss = Spec_Loss + weight * Time_Loss)
+  # --- Loss 权重 ---
+  # 建议提高时域 Loss 权重，确保重建出的波形 R 波尖锐，无相位偏差
   time_loss_weight: 1.0
-
-train:
-  # 批次大小 (根据显存调整，ViT-Base 显存占用较大)
-  # 如果显存不足，尝试降低到 32 或 16
-  batch_size: 64
-  
-  # 训练轮数
-  epochs: 100
-  
-  # 预热轮数 (由于 PatchEmbed 是新初始化的，建议至少预热 5-10 轮)
-  warmup_epochs: 10
-  
-  # 基础学习率 (配合 AdamW)
-  base_lr: 1.5e-4
-  
-  # 最小学习率 (Cosine Decay 的终点)
-  min_lr: 1.0e-6
-  
-  # 权重衰减
-  weight_decay: 0.05
-  
-  # 梯度裁剪阈值
-  clip_grad: 0.02
-  
-  # 是否使用混合精度训练 (强烈建议开启，节省显存并加速)
-  use_amp: true
-  
-  # 模型保存路径
-  save_dir: "./checkpoints/mae_pretrained_v1"
-  
-  # 每隔多少个 Epoch 保存一次
-  save_freq: 10
-  
-  # 断点续训路径 (如果需要从某个 checkpoint 恢复，填入路径，否则为 null)
-  resume: null

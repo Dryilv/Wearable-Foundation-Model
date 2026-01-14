@@ -19,14 +19,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast
 
-# 【修改 1】导入新的预训练模型类
-from model import CWT_MAE_Pretrained 
+# 【关键修改】导入 RoPE 版本的模型
+# 假设您将上一段代码保存为 model_rope_complete.py
+from model import CWT_MAE_RoPE 
 from dataset import PhysioSignalDataset
 
+# 启用 TensorFloat-32 以加速矩阵乘法 (A100/H100/3090/4090)
 torch.set_float32_matmul_precision('high') 
 
 # -------------------------------------------------------------------
-# 1. 辅助工具类 (保持不变)
+# 1. 辅助工具类
 # -------------------------------------------------------------------
 class SmoothedValue(object):
     def __init__(self, window_size=20, fmt=None):
@@ -104,21 +106,24 @@ def init_distributed_mode():
         return 0, 0, 1
 
 # -------------------------------------------------------------------
-# 2. 可视化函数 (需要修改路径)
+# 2. 可视化函数 (适配新模型输出)
 # -------------------------------------------------------------------
 def save_reconstruction_images(model, batch, epoch, save_dir):
     model.eval()
     with torch.no_grad():
+        # 优先使用 bfloat16，因为 RoPE 在 fp16 下可能溢出，但 bf16 没问题
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with autocast(dtype=amp_dtype):
             loss, pred_spec, pred_time, imgs = model(batch)
         
-        idx = 0
+        idx = 0 # 取 Batch 中的第一个样本
         
         # --- 1. 时域波形 ---
-        orig_signal = batch[idx, 0, :].float().cpu().numpy()
+        # batch: [B, 1, L] -> [L]
+        orig_signal = batch[idx].squeeze().float().cpu().numpy()
         recon_signal = pred_time[idx].float().cpu().numpy()
         
+        # 简单的反归一化用于可视化 (假设模型内部做了 Instance Norm)
         orig_mean = orig_signal.mean()
         orig_std = orig_signal.std()
         recon_signal = recon_signal * (orig_std + 1e-6) + orig_mean
@@ -128,37 +133,41 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
         plt.subplot(3, 1, 1)
         plt.plot(orig_signal, label='Original', color='black', alpha=0.6, linewidth=1)
         plt.plot(recon_signal, label='Reconstructed', color='red', alpha=0.6, linewidth=1)
-        plt.title(f"Epoch {epoch} - Time Domain")
+        plt.title(f"Epoch {epoch} - Time Domain Reconstruction")
         plt.legend()
         plt.grid(True, alpha=0.3)
 
         # --- 2. 频域图谱 ---
-        # 【修改 2】获取 patch_embed 的路径变了
         if isinstance(model, DDP):
-            # model -> DDP -> CWT_MAE_Pretrained -> encoder (timm) -> patch_embed
-            patch_embed = model.module.encoder.patch_embed
+            patch_embed = model.module.patch_embed
         else:
-            # model -> CWT_MAE_Pretrained -> encoder (timm) -> patch_embed
-            patch_embed = model.encoder.patch_embed
+            patch_embed = model.patch_embed
             
         p_h, p_w = patch_embed.patch_size
+        # imgs: [B, 3, H, W] (3 channels: Base, D1, D2)
         B, C, H, W = imgs.shape
         
+        # 取 Channel 0 (Base Signal) 进行展示
         orig_spec = imgs[idx, 0, :, :].float().cpu().numpy()
         
+        # 重建图谱处理
+        # pred_spec: [B, N, 3 * p_h * p_w]
+        # 需要 reshape 回 [B, 3, H, W]
         pred_patches = pred_spec[idx].view(H // p_h, W // p_w, C, p_h, p_w)
+        # Permute: [Grid_H, Grid_W, C, P_h, P_w] -> [C, Grid_H, P_h, Grid_W, P_w]
         pred_patches = pred_patches.permute(2, 0, 3, 1, 4)
+        # Reshape: [C, H, W]
         recon_img = pred_patches.reshape(C, H, W)
         recon_spec = recon_img[0].float().cpu().numpy()
 
         plt.subplot(3, 1, 2)
         plt.imshow(orig_spec, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Original CWT (Ch 0)")
+        plt.title("Original CWT (Channel 0)")
         plt.colorbar()
 
         plt.subplot(3, 1, 3)
         plt.imshow(recon_spec, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Reconstructed CWT (Ch 0)")
+        plt.title("Reconstructed CWT (Channel 0)")
         plt.colorbar()
 
         plt.tight_layout()
@@ -169,7 +178,7 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
     model.train()
 
 # -------------------------------------------------------------------
-# 3. 学习率调度器 (保持不变)
+# 3. 学习率调度器
 # -------------------------------------------------------------------
 def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_steps, base_lr, min_lr):
     if current_step < warmup_steps:
@@ -186,7 +195,7 @@ def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_s
     return lr
 
 # -------------------------------------------------------------------
-# 4. 训练逻辑 (保持不变)
+# 4. 训练逻辑
 # -------------------------------------------------------------------
 def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device, start_time_global, 
                     total_steps, warmup_steps, base_lr, min_lr):
@@ -198,6 +207,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
     header = f'Epoch: [{epoch}/{config["train"]["epochs"]}]'
     num_steps_per_epoch = len(dataloader)
     
+    # 优先使用 bfloat16
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     for step, batch in enumerate(dataloader):
@@ -214,6 +224,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
 
         batch = batch.to(device, non_blocking=True)
 
+        # 混合精度训练
         with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
             loss, _, _, _ = model(batch)
         
@@ -224,13 +235,15 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
 
         optimizer.zero_grad()
         loss.backward()
+        
+        # 梯度裁剪 (对于 RoPE 和 Tensor Decomposition 很重要)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config['train']['clip_grad'])
         optimizer.step()
 
         metric_logger['loss'].update(loss_value)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
 
-        if step % 20 == 0 and is_main_process():
+        if step % 50 == 0 and is_main_process():
             elapsed = time.time() - start_time_global
             logger.info(
                 f"{header} Step: [{step}/{num_steps_per_epoch}] "
@@ -245,7 +258,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
     return metric_logger['loss'].global_avg
 
 # -------------------------------------------------------------------
-# 5. 主函数 (修改模型初始化)
+# 5. 主函数
 # -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -298,28 +311,28 @@ def main():
         logger.info(f"Total Steps: {total_steps}, Warmup Steps: {warmup_steps}")
         logger.info(f"Base LR: {base_lr}, Min LR: {min_lr}")
 
-    # 【修改 3】实例化新的预训练模型
-    # 注意：这里移除了 depth 和 num_heads，因为它们由 model_name 决定
-    # 增加了 model_name 参数
-    model = CWT_MAE_Pretrained(
+    # 【关键修改】初始化 RoPE 模型
+    model = CWT_MAE_RoPE(
         signal_len=config['data']['signal_len'],
         cwt_scales=config['model'].get('cwt_scales', 64),
         patch_size_time=config['model'].get('patch_size_time', 50),
         patch_size_freq=config['model'].get('patch_size_freq', 4),
-        
-        # 新增：指定预训练模型名称
-        model_name=config['model'].get('backbone', 'vit_base_patch16_224'),
-        
-        # Encoder 的 depth 和 num_heads 不需要传了，timm 会自动处理
-        
+        embed_dim=config['model']['embed_dim'],
+        depth=config['model']['depth'],
+        num_heads=config['model']['num_heads'],
         decoder_embed_dim=config['model']['decoder_embed_dim'],
         decoder_depth=config['model']['decoder_depth'],
         decoder_num_heads=config['model']['decoder_num_heads'],
-        mask_ratio=config['model']['mask_ratio'],
+        
+        # 针对 2w 小时数据的关键参数
+        mask_ratio=config['model'].get('mask_ratio', 0.75),       # 建议 0.75
+        mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5), # 建议 0.5
+        
         time_loss_weight=config['model'].get('time_loss_weight', 1.0)
     )
     model.to(device)
 
+    # 尝试编译模型 (PyTorch 2.0+)
     try:
         model = torch.compile(model)
         if is_main_process():
@@ -337,12 +350,14 @@ def main():
     if config['train']['resume'] and os.path.isfile(config['train']['resume']):
         checkpoint = torch.load(config['train']['resume'], map_location='cpu')
         model.module.load_state_dict(checkpoint['model'])
+        # optimizer.load_state_dict(checkpoint['optimizer']) # 视情况恢复优化器
         start_epoch = checkpoint['epoch'] + 1
         if is_main_process():
             logger.info(f"Resumed from epoch {start_epoch}")
 
     vis_batch = None
     if is_main_process():
+        # 获取一个 Batch 用于固定可视化
         vis_batch = next(iter(dataloader)).to(device)
 
     start_time_global = time.time()
