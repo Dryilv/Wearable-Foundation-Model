@@ -3,7 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-
+import torch._dynamo
+# 允许编译失败时自动回退到普通模式，而不是直接报错退出
+torch._dynamo.config.suppress_errors = True
 # ===================================================================
 # 1. CWT 模块 (保持不变)
 # ===================================================================

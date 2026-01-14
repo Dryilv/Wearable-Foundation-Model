@@ -18,7 +18,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast
-
+import torch._dynamo
+# 允许编译失败时自动回退到普通模式，而不是直接报错退出
+torch._dynamo.config.suppress_errors = True
 # 【关键修改】导入 RoPE 版本的模型
 # 假设您将上一段代码保存为 model_rope_complete.py
 from model import CWT_MAE_RoPE 
