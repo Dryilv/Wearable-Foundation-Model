@@ -92,5 +92,4 @@ class SupCon_CWT_MAE(nn.Module):
         
         # Normalize (关键：SupCon 必须在单位球面上计算)
         feat = F.normalize(feat, dim=1)
-        
         return feat

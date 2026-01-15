@@ -20,28 +20,39 @@ class SignalAugmentation:
         
         return [torch.from_numpy(view1).unsqueeze(0), torch.from_numpy(view2).unsqueeze(0)]
 
-    def _augment(self, signal):
-        # 1. 随机裁剪 (Random Crop)
+    def _augment(self, signal, seed_crop=None):
+        # 1. 裁剪逻辑修改：确保两个 View 的物理位置接近
         current_len = len(signal)
+        
         if current_len > self.signal_len:
-            # 随机选起点
-            start = np.random.randint(0, current_len - self.signal_len)
+            # 【关键修改】限制随机裁剪的范围，或者让两个 View 共享同一个中心
+            # 策略：先定一个中心，然后在中心附近微调
+            center = current_len // 2
+            max_shift = self.signal_len // 10 # 允许 10% 的错位
+            
+            # 随机偏移
+            shift = np.random.randint(-max_shift, max_shift)
+            start = center - (self.signal_len // 2) + shift
+            
+            # 边界保护
+            start = max(0, min(start, current_len - self.signal_len))
+            
             crop = signal[start : start + self.signal_len]
         else:
-            # 填充
             pad_len = self.signal_len - current_len
             crop = np.pad(signal, (0, pad_len), 'constant')
 
-        # 2. 随机幅度缩放 (Random Amplitude Scaling)
-        scale = np.random.uniform(0.8, 1.2)
+        # 2. 缩放 (保持)
+        scale = np.random.uniform(0.9, 1.1) # 稍微温和一点
         crop = crop * scale
 
-        # 3. 随机高斯噪声 (Gaussian Noise)
+        # 3. 噪声 (减小)
+        # 初始阶段建议先关掉噪声，或者加很小的噪声
         if np.random.rand() > 0.5:
-            noise = np.random.normal(0, 0.01, size=crop.shape).astype(np.float32)
+            noise = np.random.normal(0, 0.001, size=crop.shape).astype(np.float32)
             crop = crop + noise
 
-        # 4. Instance Norm (必须做，保证分布一致)
+        # 4. Norm
         mean = np.mean(crop)
         std = np.std(crop)
         if std < 1e-6: std = 1e-6
