@@ -43,20 +43,28 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-@torch.no_grad()
 def concat_all_gather(tensor):
     """
-    [关键] 将所有 GPU 上的 tensor 收集并拼接。
-    用于对比学习，扩大负样本池。
+    将所有 GPU 上的 tensor 收集并拼接。
+    同时保留当前 GPU 数据的梯度，确保 Loss 可以反向传播。
     """
     if not dist.is_initialized():
         return tensor
     
+    # 1. 准备容器
     tensors_gather = [torch.ones_like(tensor) for _ in range(dist.get_world_size())]
-    dist.all_gather(tensors_gather, tensor, async_op=False)
     
+    # 2. 收集所有数据 (此时所有数据都是 detached 的，没有梯度)
+    dist.all_gather(tensors_gather, tensor.contiguous(), async_op=False)
+    
+    # 3. 【核心修复】将当前 GPU 的 tensor (带梯度) 填回列表
+    # 这样 torch.cat 后，属于本进程的那部分数据就有了梯度路径
+    tensors_gather[dist.get_rank()] = tensor
+    
+    # 4. 拼接
     output = torch.cat(tensors_gather, dim=0)
     return output
+
 
 # -------------------------------------------------------------------
 # Dataset Wrapper
