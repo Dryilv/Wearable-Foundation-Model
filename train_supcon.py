@@ -155,33 +155,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
         # 6. Backward
         if use_amp and amp_dtype == torch.float16:
             scaler.scale(loss).backward()
-            print("\n[DEBUG] Checking Gradients (AMP Scaled):")
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_mean = param.grad.abs().mean().item()
-                    if grad_mean > 0:
-                        print(f"✅ {name} has grad: {grad_mean:.6f}")
-                        break # 只要看到有一个参数有梯度，就说明通路是通的
-                else:
-                    # 只打印 Head 的参数，看看是不是 Head 就断了
-                    if "head" in name:
-                        print(f"❌ {name} has NO GRAD!")
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-             # 【调试插入点 B】
-            print("\n[DEBUG] Checking Gradients (Standard):")
-            has_grad = False
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_sum = param.grad.abs().sum().item()
-                    if grad_sum > 0:
-                        print(f"✅ {name} | Grad Sum: {grad_sum:.6f}")
-                        has_grad = True
-                        break 
-            if not has_grad:
-                print("❌ CRITICAL: No parameters received gradients!")
             optimizer.step()
         
         total_loss += loss.item()
