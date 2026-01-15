@@ -170,6 +170,18 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
             scaler.update()
         else:
             loss.backward()
+             # 【调试插入点 B】
+            print("\n[DEBUG] Checking Gradients (Standard):")
+            has_grad = False
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_sum = param.grad.abs().sum().item()
+                    if grad_sum > 0:
+                        print(f"✅ {name} | Grad Sum: {grad_sum:.6f}")
+                        has_grad = True
+                        break 
+            if not has_grad:
+                print("❌ CRITICAL: No parameters received gradients!")
             optimizer.step()
         
         total_loss += loss.item()
