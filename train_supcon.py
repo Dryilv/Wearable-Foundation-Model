@@ -97,7 +97,10 @@ class SupConDataset(Dataset):
 # -------------------------------------------------------------------
 # 训练逻辑
 # -------------------------------------------------------------------
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=True):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=False):
+    """
+    SupCon 训练核心循环 (强制 Float32 版本)
+    """
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
@@ -105,9 +108,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
     total_loss = 0
     count = 0
     
-    # 优先使用 bfloat16
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    # 【关键修改 1】移除 GradScaler，强制使用 Float32
+    # CWT 对精度非常敏感，AMP 会导致 Loss 卡在 5.54
+    # scaler = GradScaler(...) <--- 删除
     
     iterator = tqdm(loader, desc=f"Epoch {epoch} SupCon") if dist.get_rank() == 0 else loader
     
@@ -123,50 +126,48 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
         
         optimizer.zero_grad()
         
-        with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-            # 2. Forward
-            # features: [2*B, feat_dim] (已经归一化)
-            features = model(images)
-            
-            # 3. Split views
-            f1, f2 = torch.split(features, [bsz, bsz], dim=0)
-            
-            # 4. DDP Gather (构建全局 Batch)
-            if dist.is_initialized():
-                # 【关键修复】使用 torch.distributed.nn.all_gather
-                # 这个函数会自动处理 Autograd Graph，确保梯度能回传到所有 GPU
-                # all_gather 返回的是 list of tensors，需要 cat 起来
-                all_f1 = torch.cat(all_gather(f1), dim=0)
-                all_f2 = torch.cat(all_gather(f2), dim=0)
-                all_labels = torch.cat(all_gather(labels), dim=0)
-                
-                # 拼接成 SupConLoss 需要的格式: [Global_Batch, 2, Dim]
-                features_global = torch.cat([all_f1.unsqueeze(1), all_f2.unsqueeze(1)], dim=1)
-                labels_global = all_labels
-            else:
-                features_global = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-                labels_global = labels
-            if dist.get_rank() == 0 and count == 0: # 只看第一个 batch
-                print(f"\n[DEBUG] Labels in batch: {labels.cpu().numpy()}")
-                print(f"[DEBUG] Unique labels: {torch.unique(labels).cpu().numpy()}") 
-            # 5. Compute Loss
-            loss = criterion(features_global, labels_global)
+        # 【关键修改 2】移除 autocast 上下文
+        # with autocast(...): <--- 删除，直接裸跑 Float32
         
-        # 6. Backward
-        if use_amp and amp_dtype == torch.float16:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+        # 2. Forward
+        # features: [2*B, feat_dim]
+        features = model(images)
+        
+        # 3. Split views
+        f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+        
+        # 4. DDP Gather (构建全局 Batch)
+        if dist.is_initialized():
+            # 【关键修改 3】使用 torch.distributed.nn.all_gather
+            # 这个函数支持自动微分，梯度可以传回所有 GPU
+            all_f1 = torch.cat(all_gather(f1), dim=0)
+            all_f2 = torch.cat(all_gather(f2), dim=0)
+            all_labels = torch.cat(all_gather(labels), dim=0)
+            
+            # 拼接成 SupConLoss 需要的格式: [Global_Batch, 2, Dim]
+            features_global = torch.cat([all_f1.unsqueeze(1), all_f2.unsqueeze(1)], dim=1)
+            labels_global = all_labels
         else:
-            loss.backward()
-            optimizer.step()
+            features_global = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+            labels_global = labels
+
+        # 5. Compute Loss
+        loss = criterion(features_global, labels_global)
+        
+        # 6. Backward (标准反向传播)
+        loss.backward()
+        
+        # 梯度裁剪 (可选，防止爆炸)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+        
+        optimizer.step()
         
         total_loss += loss.item()
         count += 1
         
         if dist.get_rank() == 0:
             iterator.set_postfix({'loss': total_loss / count})
-           
+            
     return total_loss / count
 
 # -------------------------------------------------------------------
