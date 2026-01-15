@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model_rope_complete import CWT_MAE_RoPE, cwt_wrap
+from model import CWT_MAE_RoPE, cwt_wrap
 
 class SupCon_CWT_MAE(nn.Module):
     def __init__(self, pretrained_path=None, head='mlp', feat_dim=128, 
