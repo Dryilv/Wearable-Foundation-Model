@@ -164,7 +164,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
         
         if dist.get_rank() == 0:
             iterator.set_postfix({'loss': total_loss / count})
-            
+    if dist.get_rank() == 0 and count == 0: # 只看第一个 batch
+        print(f"\n[DEBUG] Labels in batch: {labels.cpu().numpy()}")
+        print(f"[DEBUG] Unique labels: {torch.unique(labels).cpu().numpy()}")        
     return total_loss / count
 
 # -------------------------------------------------------------------
