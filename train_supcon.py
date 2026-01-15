@@ -9,11 +9,12 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast
+# 【关键】引入支持梯度的 all_gather
+from torch.distributed.nn import all_gather 
 from tqdm import tqdm
 import numpy as np
 import pickle
 import json
-import math
 
 # 导入自定义模块
 from model_supcon import SupCon_CWT_MAE
@@ -43,29 +44,6 @@ def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def concat_all_gather(tensor):
-    """
-    将所有 GPU 上的 tensor 收集并拼接。
-    同时保留当前 GPU 数据的梯度，确保 Loss 可以反向传播。
-    """
-    if not dist.is_initialized():
-        return tensor
-    
-    # 1. 准备容器
-    tensors_gather = [torch.ones_like(tensor) for _ in range(dist.get_world_size())]
-    
-    # 2. 收集所有数据 (此时所有数据都是 detached 的，没有梯度)
-    dist.all_gather(tensors_gather, tensor.contiguous(), async_op=False)
-    
-    # 3. 【核心修复】将当前 GPU 的 tensor (带梯度) 填回列表
-    # 这样 torch.cat 后，属于本进程的那部分数据就有了梯度路径
-    tensors_gather[dist.get_rank()] = tensor
-    
-    # 4. 拼接
-    output = torch.cat(tensors_gather, dim=0)
-    return output
-
-
 # -------------------------------------------------------------------
 # Dataset Wrapper
 # -------------------------------------------------------------------
@@ -79,7 +57,9 @@ class SupConDataset(Dataset):
             
         # 初始化数据增强器
         self.augment = SignalAugmentation(signal_len=signal_len, mode=mode)
-        print(f"[{mode}] Loaded {len(self.file_list)} samples for SupCon.")
+        
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"[{mode}] Loaded {len(self.file_list)} samples for SupCon.")
 
     def __len__(self):
         return len(self.file_list)
@@ -98,21 +78,19 @@ class SupConDataset(Dataset):
             else:
                 raw_signal = raw_data
             
-            # 获取标签 (假设 task_index=0)
+            # 获取标签
             if 'label' in content and isinstance(content['label'], list):
                 label = int(content['label'][0]['class'])
             else:
-                # 适配不同的数据格式，根据实际情况修改
                 label = 0 
             
             # [核心] 生成两个 View
-            # augment 内部会处理裁剪、缩放、加噪和归一化
             views = self.augment(raw_signal) # 返回 [view1, view2]
             
             return views[0], views[1], torch.tensor(label, dtype=torch.long)
             
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            # print(f"Error loading {file_path}: {e}")
             dummy = torch.zeros(1, self.signal_len)
             return dummy, dummy, torch.tensor(0, dtype=torch.long)
 
@@ -155,10 +133,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
             
             # 4. DDP Gather (构建全局 Batch)
             if dist.is_initialized():
-                # 收集所有 GPU 的特征和标签
-                all_f1 = concat_all_gather(f1)
-                all_f2 = concat_all_gather(f2)
-                all_labels = concat_all_gather(labels)
+                # 【关键修复】使用 torch.distributed.nn.all_gather
+                # 这个函数会自动处理 Autograd Graph，确保梯度能回传到所有 GPU
+                # all_gather 返回的是 list of tensors，需要 cat 起来
+                all_f1 = torch.cat(all_gather(f1), dim=0)
+                all_f2 = torch.cat(all_gather(f2), dim=0)
+                all_labels = torch.cat(all_gather(labels), dim=0)
                 
                 # 拼接成 SupConLoss 需要的格式: [Global_Batch, 2, Dim]
                 features_global = torch.cat([all_f1.unsqueeze(1), all_f2.unsqueeze(1)], dim=1)
@@ -198,10 +178,11 @@ def main():
     parser.add_argument('--save_dir', type=str, default="./checkpoints_supcon")
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=256, help="Per-GPU batch size")
+    parser.add_argument('--batch_size', type=int, default=64, help="Per-GPU batch size")
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--temp', type=float, default=0.07, help="SupCon temperature")
+    parser.add_argument('--base_lr', type=float, default=1e-4, help="Encoder LR")
+    parser.add_argument('--head_lr', type=float, default=1e-3, help="Projection Head LR (should be larger)")
+    parser.add_argument('--temp', type=float, default=0.1, help="SupCon temperature (try 0.1 or 0.2)")
     parser.add_argument('--feat_dim', type=int, default=128, help="Projection head dimension")
     
     # 模型参数 (必须与预训练一致)
@@ -249,8 +230,16 @@ def main():
     
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
-    # 3. Optimizer & Loss
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+    # 3. Optimizer (分层学习率)
+    # Projection Head 是随机初始化的，需要更大的 LR 才能动起来
+    head_params = list(map(id, model.module.head.parameters()))
+    base_params = filter(lambda p: id(p) not in head_params, model.parameters())
+    
+    optimizer = optim.AdamW([
+        {'params': base_params, 'lr': args.base_lr},       # Encoder: 1e-4
+        {'params': model.module.head.parameters(), 'lr': args.head_lr} # Head: 1e-3
+    ], weight_decay=0.05)
+    
     criterion = SupConLoss(temperature=args.temp).to(device)
     
     # 4. Loop
