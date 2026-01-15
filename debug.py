@@ -50,7 +50,7 @@ labels = torch.arange(BATCH_SIZE).to(DEVICE) # [0, 1, 2, ... 15]
 # 3. 检查 CWT 输出 (关键疑点)
 print("\n[3] Checking CWT Output...")
 try:
-    from model_rope_complete import cwt_wrap
+    from model import cwt_wrap
     with torch.no_grad():
         cwt_out = cwt_wrap(raw_data, num_scales=64)
         print(f"   CWT Shape: {cwt_out.shape}")
