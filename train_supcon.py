@@ -190,7 +190,7 @@ def main():
     parser.add_argument('--save_dir', type=str, default="./checkpoints_supcon")
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=64, help="Per-GPU batch size")
+    parser.add_argument('--batch_size', type=int, default=256, help="Per-GPU batch size")
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--temp', type=float, default=0.07, help="SupCon temperature")
