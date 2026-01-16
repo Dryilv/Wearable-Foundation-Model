@@ -1,265 +1,269 @@
-import os
-import argparse
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler
-from torch.amp import autocast
-# 【关键】引入支持梯度的 all_gather
-from torch.distributed.nn import all_gather 
-from tqdm import tqdm
-import numpy as np
-import pickle
-import json
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
-# 导入自定义模块
-from model_supcon import SupCon_CWT_MAE
-from losses import SupConLoss
-from augmentations import SignalAugmentation
+# 假设你的原模型代码保存在 model.py 中
+from model import CWT_MAE_RoPE, cwt_wrap
 
-# 开启矩阵乘法加速
-torch.set_float32_matmul_precision('high')
-
-# -------------------------------------------------------------------
-# DDP 工具函数
-# -------------------------------------------------------------------
-def setup_distributed():
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
-        dist.barrier()
-        return local_rank, rank, world_size
-    else:
-        print("Not using distributed mode")
-        return 0, 0, 1
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-# -------------------------------------------------------------------
-# Dataset Wrapper
-# -------------------------------------------------------------------
-class SupConDataset(Dataset):
-    def __init__(self, data_root, split_file, mode='train', signal_len=3000):
-        self.data_root = data_root
-        self.signal_len = signal_len
-        
-        with open(split_file, 'r') as f:
-            self.file_list = json.load(f)[mode]
-            
-        # 初始化数据增强器
-        self.augment = SignalAugmentation(signal_len=signal_len, mode=mode)
-        
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            print(f"[{mode}] Loaded {len(self.file_list)} samples for SupCon.")
-
-    def __len__(self):
-        return len(self.file_list)
-
-    def __getitem__(self, idx):
-        filename = self.file_list[idx]
-        file_path = os.path.join(self.data_root, filename)
-        
-        try:
-            with open(file_path, 'rb') as f:
-                content = pickle.load(f)
-            
-            raw_data = content['data']
-            if raw_data.ndim == 2: 
-                raw_signal = raw_data[0, :]
-            else:
-                raw_signal = raw_data
-            
-            # 获取标签
-            if 'label' in content and isinstance(content['label'], list):
-                label = int(content['label'][0]['class'])
-            else:
-                label = 0 
-            
-            # [核心] 生成两个 View
-            views = self.augment(raw_signal) # 返回 [view1, view2]
-            
-            return views[0], views[1], torch.tensor(label, dtype=torch.long)
-            
-        except Exception as e:
-            # print(f"Error loading {file_path}: {e}")
-            dummy = torch.zeros(1, self.signal_len)
-            return dummy, dummy, torch.tensor(0, dtype=torch.long)
-
-# -------------------------------------------------------------------
-# 训练逻辑
-# -------------------------------------------------------------------
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=False):
+# ===================================================================
+# 1. 改造模型：特征提取器 (Feature Extractor)
+# ===================================================================
+class CWT_MAE_Encoder(CWT_MAE_RoPE):
     """
-    SupCon 训练核心循环 (强制 Float32 版本)
+    继承原模型，添加专门用于下游任务的特征提取方法。
+    核心改动：
+    1. 移除 Masking 过程
+    2. 生成顺序的 RoPE 位置编码
+    3. 使用 Global Average Pooling (GAP) 替代 CLS Token
     """
-    model.train()
-    if hasattr(loader.sampler, 'set_epoch'):
-        loader.sampler.set_epoch(epoch)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # 如果显存紧张，可以删除 Decoder 部分，因为对比学习不需要它
+        # del self.decoder_blocks
+        # del self.decoder_embed
+        # del self.decoder_pred_spec
+        # del self.time_pred
+
+    def forward_features(self, x):
+        # -------------------------------------------------------
+        # 1. 预处理 (CWT + Normalization) - 保持与预训练完全一致
+        # -------------------------------------------------------
+        if x.dim() == 3: x = x.squeeze(1)
+        # CWT 变换
+        imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
         
-    total_loss = 0
-    count = 0
-    
-    # 【关键修改 1】移除 GradScaler，强制使用 Float32
-    # CWT 对精度非常敏感，AMP 会导致 Loss 卡在 5.54
-    # scaler = GradScaler(...) <--- 删除
-    
-    iterator = tqdm(loader, desc=f"Epoch {epoch} SupCon") if dist.get_rank() == 0 else loader
-    
-    for images1, images2, labels in iterator:
-        images1 = images1.to(device, non_blocking=True)
-        images2 = images2.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        # 标准化 (Instance Normalization logic from original code)
+        dtype_orig = imgs.dtype
+        imgs_f32 = imgs.float() 
+        mean = imgs_f32.mean(dim=(2, 3), keepdim=True)
+        std = imgs_f32.std(dim=(2, 3), keepdim=True)
+        std = torch.clamp(std, min=1e-5)
+        imgs = (imgs_f32 - mean) / std
+        imgs = imgs.to(dtype=dtype_orig)
+
+        # -------------------------------------------------------
+        # 2. Patch Embedding & Positional Embedding
+        # -------------------------------------------------------
+        x = self.patch_embed(imgs) # (B, N, D)
+        x = x + self.pos_embed[:, 1:, :]
+
+        # 拼接 CLS Token
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1) # (B, N+1, D)
+
+        # -------------------------------------------------------
+        # 3. 构建顺序的 RoPE (关键修正)
+        # -------------------------------------------------------
+        # 原代码是乱序 Mask 的，这里我们需要完整的顺序
+        B, SeqLen, _ = x.shape
+        # 生成 [0, 1, 2, ..., SeqLen-1]
+        pos_ids = torch.arange(SeqLen, device=x.device).unsqueeze(0).expand(B, -1)
         
-        bsz = labels.shape[0]
+        # 获取旋转位置编码
+        rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
         
-        # 1. 拼接两个 View: [2*B, 1, L]
-        images = torch.cat([images1, images2], dim=0)
-        
-        optimizer.zero_grad()
-        
-        # 【关键修改 2】移除 autocast 上下文
-        # with autocast(...): <--- 删除，直接裸跑 Float32
-        
-        # 2. Forward
-        # features: [2*B, feat_dim]
-        features = model(images)
-        
-        # 3. Split views
-        f1, f2 = torch.split(features, [bsz, bsz], dim=0)
-        
-        # 4. DDP Gather (构建全局 Batch)
-        if dist.is_initialized():
-            # 【关键修改 3】使用 torch.distributed.nn.all_gather
-            # 这个函数支持自动微分，梯度可以传回所有 GPU
-            all_f1 = torch.cat(all_gather(f1), dim=0)
-            all_f2 = torch.cat(all_gather(f2), dim=0)
-            all_labels = torch.cat(all_gather(labels), dim=0)
+        # -------------------------------------------------------
+        # 4. Transformer Encoder Forward
+        # -------------------------------------------------------
+        for blk in self.blocks:
+            x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
             
-            # 拼接成 SupConLoss 需要的格式: [Global_Batch, 2, Dim]
-            features_global = torch.cat([all_f1.unsqueeze(1), all_f2.unsqueeze(1)], dim=1)
-            labels_global = all_labels
-        else:
-            features_global = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-            labels_global = labels
+        x = self.norm(x)
 
-        # 5. Compute Loss
-        loss = criterion(features_global, labels_global)
+        # -------------------------------------------------------
+        # 5. 特征聚合 (Pooling)
+        # -------------------------------------------------------
+        # MAE 论文建议：对于分类任务，Global Average Pooling (GAP) 优于 CLS Token
+        # x[:, 0] 是 CLS, x[:, 1:] 是所有 Patch
+        global_feat = torch.mean(x[:, 1:, :], dim=1) 
         
-        # 6. Backward (标准反向传播)
-        loss.backward()
-        
-        # 梯度裁剪 (可选，防止爆炸)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-        
-        optimizer.step()
-        
-        total_loss += loss.item()
-        count += 1
-        
-        if dist.get_rank() == 0:
-            iterator.set_postfix({'loss': total_loss / count})
-            
-    return total_loss / count
+        return global_feat
 
-# -------------------------------------------------------------------
-# 主函数
-# -------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, required=True)
-    parser.add_argument('--split_file', type=str, required=True)
-    parser.add_argument('--pretrained_path', type=str, default=None, help="CWT-MAE 预训练权重")
-    parser.add_argument('--save_dir', type=str, default="./checkpoints_supcon")
-    
-    # 训练参数
-    parser.add_argument('--batch_size', type=int, default=64, help="Per-GPU batch size")
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--base_lr', type=float, default=1e-4, help="Encoder LR")
-    parser.add_argument('--head_lr', type=float, default=1e-3, help="Projection Head LR (should be larger)")
-    parser.add_argument('--temp', type=float, default=0.1, help="SupCon temperature (try 0.1 or 0.2)")
-    parser.add_argument('--feat_dim', type=int, default=128, help="Projection head dimension")
-    
-    # 模型参数 (必须与预训练一致)
-    parser.add_argument('--signal_len', type=int, default=3000)
-    parser.add_argument('--embed_dim', type=int, default=768)
-    parser.add_argument('--depth', type=int, default=12)
-    parser.add_argument('--num_heads', type=int, default=12)
-    parser.add_argument('--cwt_scales', type=int, default=64)
-    parser.add_argument('--patch_size_time', type=int, default=50)
-    parser.add_argument('--patch_size_freq', type=int, default=4)
-    parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
-    
-    args = parser.parse_args()
-    
-    local_rank, rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}")
-    
-    if rank == 0:
-        os.makedirs(args.save_dir, exist_ok=True)
-        print(f"Running SupCon on {world_size} GPUs. Global Batch Size: {args.batch_size * world_size}")
-    
-    # 1. Dataset
-    train_ds = SupConDataset(args.data_root, args.split_file, mode='train', signal_len=args.signal_len)
-    
-    sampler = DistributedSampler(train_ds, shuffle=True)
-    # drop_last=True 很重要，保证所有 GPU 的 batch size 一致，否则 all_gather 会卡死
-    loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, 
-                        num_workers=4, pin_memory=True, drop_last=True)
-    
-    # 2. Model
-    model = SupCon_CWT_MAE(
-        pretrained_path=args.pretrained_path,
-        head='mlp',
-        feat_dim=args.feat_dim,
-        # Encoder Args
-        signal_len=args.signal_len,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        cwt_scales=args.cwt_scales,
-        patch_size_time=args.patch_size_time,
-        patch_size_freq=args.patch_size_freq,
-        mlp_rank_ratio=args.mlp_rank_ratio
-    ).to(device)
-    
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-    
-    # 3. Optimizer (分层学习率)
-    # Projection Head 是随机初始化的，需要更大的 LR 才能动起来
-    head_params = list(map(id, model.module.head.parameters()))
-    base_params = filter(lambda p: id(p) not in head_params, model.parameters())
-    
-    optimizer = optim.AdamW([
-        {'params': base_params, 'lr': args.base_lr},       # Encoder: 1e-4
-        {'params': model.module.head.parameters(), 'lr': args.head_lr} # Head: 1e-3
-    ], weight_decay=0.05)
-    
-    criterion = SupConLoss(temperature=args.temp).to(device)
-    
-    # 4. Loop
-    for epoch in range(args.epochs):
-        loss = train_one_epoch(model, loader, criterion, optimizer, device, epoch)
+# ===================================================================
+# 2. SupCon 整体架构 (Backbone + Projection Head)
+# ===================================================================
+class SupConMAE(nn.Module):
+    def __init__(self, pretrained_model, head_dim=128, feat_dim=768):
+        super().__init__()
+        self.encoder = pretrained_model
         
-        if rank == 0:
-            print(f"Epoch {epoch+1}/{args.epochs} | Loss: {loss:.4f}")
-            
-            # 保存权重
-            if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
-                save_path = os.path.join(args.save_dir, f"supcon_encoder_epoch_{epoch+1}.pth")
-                # 只保存 Encoder 部分，方便 Phase 2 加载
-                torch.save(model.module.encoder_model.state_dict(), save_path)
-                print(f"Saved encoder weights to {save_path}")
+        # Projection Head: 将特征映射到对比空间
+        # 结构通常为: Linear -> ReLU -> Linear
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feat_dim, head_dim)
+        )
 
-    cleanup_distributed()
+    def forward(self, x):
+        # 1. 提取特征 (B, 768)
+        feat = self.encoder.forward_features(x)
+        
+        # 2. 特征归一化 (可选，但在对比学习中通常有益)
+        feat = F.normalize(feat, dim=1)
+        
+        # 3. 投影 (B, 128)
+        proj = self.head(feat)
+        
+        # 4. 投影向量必须做 L2 归一化
+        proj = F.normalize(proj, dim=1)
+        
+        return proj
 
+# ===================================================================
+# 3. Supervised Contrastive Loss (核心 Loss)
+# ===================================================================
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        """
+        Args:
+            features: (batch_size, head_dim) 归一化后的投影特征
+            labels: (batch_size) 真实标签
+        """
+        device = features.device
+        batch_size = features.shape[0]
+        
+        # 计算相似度矩阵 (B, B)
+        similarity_matrix = torch.matmul(features, features.T) / self.temperature
+        
+        # 构建 Label Mask
+        # mask[i, j] = 1 表示 i 和 j 是同一类
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(device)
+        
+        # 移除对角线 (自己与自己的对比不计算在内)
+        logits_mask = torch.scatter(
+            torch.ones_like(mask), 
+            1, 
+            torch.arange(batch_size).view(-1, 1).to(device), 
+            0
+        )
+        mask = mask * logits_mask
+        
+        # 数值稳定性处理 (减去每行最大值)
+        logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
+        logits = similarity_matrix - logits_max.detach()
+        
+        # 计算分母: sum(exp(logits)) over all negatives and positives (except self)
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
+        
+        # 计算分子: 只取正样本对 (Same Class) 的 log_prob
+        # mean_log_prob_pos: 每个样本与其所有正样本对的平均对数概率
+        # 如果一个样本没有正样本对（batch里只有它自己这一类），mask.sum(1) 为 0，需要避免除零
+        mask_sum = mask.sum(1)
+        mask_sum[mask_sum == 0] = 1.0 # 避免除零，此时分子也是0，结果为0
+        
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
+        
+        # Loss
+        loss = - mean_log_prob_pos
+        loss = loss.mean()
+        
+        return loss
+
+# ===================================================================
+# 4. 训练流程示例
+# ===================================================================
 if __name__ == "__main__":
-    main()
+    # 配置参数
+    SIGNAL_LEN = 3000
+    EMBED_DIM = 768
+    BATCH_SIZE = 32
+    LR = 1e-4
+    EPOCHS = 50
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    PRETRAINED_PATH = "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/checkpoint_rope_tensor_768/checkpoint_last.pth" # 你的预训练权重路径
+
+    # 1. 初始化模型
+    # 注意：参数必须与预训练时完全一致
+    base_model = CWT_MAE_Encoder(
+        signal_len=SIGNAL_LEN, 
+        embed_dim=EMBED_DIM, 
+        depth=12, 
+        num_heads=12,
+        cwt_scales=64
+    )
+
+    # 2. 加载预训练权重
+    try:
+        checkpoint = torch.load(PRETRAINED_PATH, map_location='cpu')
+        # 处理权重键值不匹配问题 (例如预训练保存时带了 'module.' 前缀)
+        state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        msg = base_model.load_state_dict(state_dict, strict=False)
+        print(f"Pretrained weights loaded: {msg}")
+    except FileNotFoundError:
+        print("Warning: Pretrained weights not found, initializing randomly.")
+
+    # 3. 包装 SupCon 模型
+    model = SupConMAE(base_model, head_dim=128, feat_dim=EMBED_DIM).to(DEVICE)
+
+    # 4. 准备数据 (示例)
+    # 假设你有 waveforms (N, 3000) 和 labels (N,)
+    dummy_data = torch.randn(100, SIGNAL_LEN)
+    dummy_labels = torch.randint(0, 5, (100,)) # 5类
+    dataset = TensorDataset(dummy_data, dummy_labels)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+    # 5. 优化器 & Loss
+    criterion = SupConLoss(temperature=0.07)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+
+    # 6. 训练循环
+    print("Start SupCon Training...")
+    model.train()
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        for batch_idx, (waveforms, labels) in enumerate(dataloader):
+            waveforms, labels = waveforms.to(DEVICE), labels.to(DEVICE)
+            
+            # Forward
+            projections = model(waveforms)
+            
+            # Calculate Loss
+            loss = criterion(projections, labels)
+            
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{EPOCHS}] Loss: {avg_loss:.4f}")
+
+    # ===================================================================
+    # 7. 训练结束后的使用方式 (Linear Probing)
+    # ===================================================================
+    print("\nTraining finished. Extracting encoder for classification...")
+    
+    # 提取训练好的 Encoder
+    trained_encoder = model.encoder
+    
+    # 构建最终分类器
+    class LinearClassifier(nn.Module):
+        def __init__(self, encoder, num_classes):
+            super().__init__()
+            self.encoder = encoder
+            self.fc = nn.Linear(EMBED_DIM, num_classes)
+            
+        def forward(self, x):
+            # 此时只用 encoder 提取特征，不需要 projection head
+            with torch.no_grad():
+                feat = self.encoder.forward_features(x)
+            return self.fc(feat)
+
+    classifier = LinearClassifier(trained_encoder, num_classes=5).to(DEVICE)
+    
+    # 此时通常冻结 Encoder，只训练 FC
+    for param in classifier.encoder.parameters():
+        param.requires_grad = False
+        
+    print("Classifier ready for Linear Probing.")
