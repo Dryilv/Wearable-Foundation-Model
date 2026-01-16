@@ -1,39 +1,47 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
+import numpy as np
+import os
+import argparse
 
-# 假设你的原模型代码保存在 model.py 中
+# 导入你的自定义模块
 from model import CWT_MAE_RoPE, cwt_wrap
+from dataset_cls import DownstreamClassificationDataset
 
 # ===================================================================
-# 1. 改造模型：特征提取器 (Feature Extractor)
+# 1. 模型改造: 提取特征用于对比学习
 # ===================================================================
 class CWT_MAE_Encoder(CWT_MAE_RoPE):
     """
-    继承原模型，添加专门用于下游任务的特征提取方法。
-    核心改动：
-    1. 移除 Masking 过程
-    2. 生成顺序的 RoPE 位置编码
-    3. 使用 Global Average Pooling (GAP) 替代 CLS Token
+    继承原模型，专门用于提取下游任务特征。
+    改动点：
+    1. 移除 Masking。
+    2. 生成顺序的 RoPE 位置编码。
+    3. 输出 Global Average Pooling 特征。
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # 如果显存紧张，可以删除 Decoder 部分，因为对比学习不需要它
-        # del self.decoder_blocks
-        # del self.decoder_embed
-        # del self.decoder_pred_spec
-        # del self.time_pred
+        # 移除 Decoder 以节省显存 (对比学习不需要重建)
+        del self.decoder_blocks
+        del self.decoder_embed
+        del self.decoder_pred_spec
+        del self.time_pred
+        del self.decoder_norm
+        del self.decoder_pos_embed
+        del self.mask_token
 
     def forward_features(self, x):
-        # -------------------------------------------------------
-        # 1. 预处理 (CWT + Normalization) - 保持与预训练完全一致
-        # -------------------------------------------------------
+        # x shape: (B, 1, 3000) or (B, 3000)
         if x.dim() == 3: x = x.squeeze(1)
-        # CWT 变换
+        
+        # 1. CWT 变换
+        # 注意：dataset 中已经做了一次 Instance Norm (1D)，
+        # 这里 cwt_wrap 后模型内部通常还会做一次 2D 的 Norm，保持双重 Norm 有助于稳定性
         imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
         
-        # 标准化 (Instance Normalization logic from original code)
+        # 2. 内部标准化 (保持与预训练一致)
         dtype_orig = imgs.dtype
         imgs_f32 = imgs.float() 
         mean = imgs_f32.mean(dim=(2, 3), keepdim=True)
@@ -42,55 +50,37 @@ class CWT_MAE_Encoder(CWT_MAE_RoPE):
         imgs = (imgs_f32 - mean) / std
         imgs = imgs.to(dtype=dtype_orig)
 
-        # -------------------------------------------------------
-        # 2. Patch Embedding & Positional Embedding
-        # -------------------------------------------------------
+        # 3. Patch Embedding
         x = self.patch_embed(imgs) # (B, N, D)
         x = x + self.pos_embed[:, 1:, :]
 
-        # 拼接 CLS Token
+        # 4. CLS Token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1) # (B, N+1, D)
 
-        # -------------------------------------------------------
-        # 3. 构建顺序的 RoPE (关键修正)
-        # -------------------------------------------------------
-        # 原代码是乱序 Mask 的，这里我们需要完整的顺序
+        # 5. 生成顺序的 RoPE (关键修正：不再是乱序)
         B, SeqLen, _ = x.shape
-        # 生成 [0, 1, 2, ..., SeqLen-1]
         pos_ids = torch.arange(SeqLen, device=x.device).unsqueeze(0).expand(B, -1)
-        
-        # 获取旋转位置编码
         rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
         
-        # -------------------------------------------------------
-        # 4. Transformer Encoder Forward
-        # -------------------------------------------------------
+        # 6. Encoder Forward
         for blk in self.blocks:
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
             
         x = self.norm(x)
 
-        # -------------------------------------------------------
-        # 5. 特征聚合 (Pooling)
-        # -------------------------------------------------------
-        # MAE 论文建议：对于分类任务，Global Average Pooling (GAP) 优于 CLS Token
-        # x[:, 0] 是 CLS, x[:, 1:] 是所有 Patch
+        # 7. 特征聚合: Global Average Pooling (GAP)
+        # 忽略 CLS token (index 0)，对所有 Patch tokens 求平均
         global_feat = torch.mean(x[:, 1:, :], dim=1) 
         
         return global_feat
 
-# ===================================================================
-# 2. SupCon 整体架构 (Backbone + Projection Head)
-# ===================================================================
 class SupConMAE(nn.Module):
-    def __init__(self, pretrained_model, head_dim=128, feat_dim=768):
+    def __init__(self, encoder, head_dim=128, feat_dim=768):
         super().__init__()
-        self.encoder = pretrained_model
-        
-        # Projection Head: 将特征映射到对比空间
-        # 结构通常为: Linear -> ReLU -> Linear
+        self.encoder = encoder
+        # Projection Head: (Dim -> Dim -> 128)
         self.head = nn.Sequential(
             nn.Linear(feat_dim, feat_dim),
             nn.ReLU(inplace=True),
@@ -98,22 +88,14 @@ class SupConMAE(nn.Module):
         )
 
     def forward(self, x):
-        # 1. 提取特征 (B, 768)
         feat = self.encoder.forward_features(x)
-        
-        # 2. 特征归一化 (可选，但在对比学习中通常有益)
-        feat = F.normalize(feat, dim=1)
-        
-        # 3. 投影 (B, 128)
+        feat = F.normalize(feat, dim=1) # 特征层归一化
         proj = self.head(feat)
-        
-        # 4. 投影向量必须做 L2 归一化
-        proj = F.normalize(proj, dim=1)
-        
+        proj = F.normalize(proj, dim=1) # 投影层归一化 (SupCon 必须)
         return proj
 
 # ===================================================================
-# 3. Supervised Contrastive Loss (核心 Loss)
+# 2. Loss Function
 # ===================================================================
 class SupConLoss(nn.Module):
     def __init__(self, temperature=0.07):
@@ -121,23 +103,17 @@ class SupConLoss(nn.Module):
         self.temperature = temperature
 
     def forward(self, features, labels):
-        """
-        Args:
-            features: (batch_size, head_dim) 归一化后的投影特征
-            labels: (batch_size) 真实标签
-        """
         device = features.device
         batch_size = features.shape[0]
         
-        # 计算相似度矩阵 (B, B)
+        # 计算相似度矩阵
         similarity_matrix = torch.matmul(features, features.T) / self.temperature
         
-        # 构建 Label Mask
-        # mask[i, j] = 1 表示 i 和 j 是同一类
+        # 构建 Mask (同类为1，异类为0)
         labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, labels.T).float().to(device)
         
-        # 移除对角线 (自己与自己的对比不计算在内)
+        # 移除对角线 (自己不与自己对比)
         logits_mask = torch.scatter(
             torch.ones_like(mask), 
             1, 
@@ -146,87 +122,116 @@ class SupConLoss(nn.Module):
         )
         mask = mask * logits_mask
         
-        # 数值稳定性处理 (减去每行最大值)
+        # 数值稳定性
         logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
         logits = similarity_matrix - logits_max.detach()
         
-        # 计算分母: sum(exp(logits)) over all negatives and positives (except self)
+        # 计算分母
         exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
         
-        # 计算分子: 只取正样本对 (Same Class) 的 log_prob
-        # mean_log_prob_pos: 每个样本与其所有正样本对的平均对数概率
-        # 如果一个样本没有正样本对（batch里只有它自己这一类），mask.sum(1) 为 0，需要避免除零
+        # 计算分子 (只取正样本对)
         mask_sum = mask.sum(1)
-        mask_sum[mask_sum == 0] = 1.0 # 避免除零，此时分子也是0，结果为0
+        mask_sum[mask_sum == 0] = 1.0 # 避免除零
         
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
         
-        # Loss
         loss = - mean_log_prob_pos
         loss = loss.mean()
-        
         return loss
 
 # ===================================================================
-# 4. 训练流程示例
+# 3. 训练主流程
 # ===================================================================
-if __name__ == "__main__":
-    # 配置参数
-    SIGNAL_LEN = 3000
-    EMBED_DIM = 768
-    BATCH_SIZE = 32
-    LR = 1e-4
-    EPOCHS = 50
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    PRETRAINED_PATH = "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/checkpoint_rope_tensor_768/checkpoint_last.pth" # 你的预训练权重路径
+def main():
+    # --- 配置参数 ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_root', type=str, default='./data', help='数据根目录')
+    parser.add_argument('--split_file', type=str, default='./split.json', help='数据集划分文件')
+    parser.add_argument('--pretrained_path', type=str, default='./mae_pretrained.pth', help='预训练权重路径')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_supcon', help='保存路径')
+    parser.add_argument('--batch_size', type=int, default=64, help='SupCon 需要较大的 Batch Size')
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--temp', type=float, default=0.07, help='SupCon Temperature')
+    parser.add_argument('--task_index', type=int, default=0, help='Dataset task index')
+    args = parser.parse_args()
 
-    # 1. 初始化模型
-    # 注意：参数必须与预训练时完全一致
-    base_model = CWT_MAE_Encoder(
-        signal_len=SIGNAL_LEN, 
-        embed_dim=EMBED_DIM, 
-        depth=12, 
-        num_heads=12,
-        cwt_scales=64
+    os.makedirs(args.save_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- 1. 准备数据 ---
+    print(f"Loading dataset from {args.data_root}...")
+    train_dataset = DownstreamClassificationDataset(
+        data_root=args.data_root,
+        split_file=args.split_file,
+        mode='train',
+        signal_len=3000,
+        task_index=args.task_index
+    )
+    
+    # drop_last=True 很重要，避免最后一个 batch 只有 1 个样本导致 BN 或 Loss 报错
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=4, 
+        pin_memory=True,
+        drop_last=True 
     )
 
-    # 2. 加载预训练权重
-    try:
-        checkpoint = torch.load(PRETRAINED_PATH, map_location='cpu')
-        # 处理权重键值不匹配问题 (例如预训练保存时带了 'module.' 前缀)
+    # --- 2. 初始化模型 ---
+    print("Initializing model...")
+    # 必须与预训练时的参数保持一致
+    base_encoder = CWT_MAE_Encoder(
+        signal_len=3000,
+        cwt_scales=64,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        patch_size_time=50,
+        patch_size_freq=4
+    )
+
+    # --- 3. 加载预训练权重 ---
+    if os.path.exists(args.pretrained_path):
+        print(f"Loading pretrained weights from {args.pretrained_path}")
+        checkpoint = torch.load(args.pretrained_path, map_location='cpu')
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-        msg = base_model.load_state_dict(state_dict, strict=False)
-        print(f"Pretrained weights loaded: {msg}")
-    except FileNotFoundError:
-        print("Warning: Pretrained weights not found, initializing randomly.")
+        
+        # strict=False 是必须的，因为我们删除了 decoder
+        msg = base_encoder.load_state_dict(state_dict, strict=False)
+        print(f"Load status: {msg}")
+        # 检查是否正确加载了 encoder (missing keys 应该主要是 decoder_*)
+    else:
+        print("WARNING: Pretrained path not found! Training from scratch (Not recommended for SupCon).")
 
-    # 3. 包装 SupCon 模型
-    model = SupConMAE(base_model, head_dim=128, feat_dim=EMBED_DIM).to(DEVICE)
+    # 包装 SupCon
+    model = SupConMAE(base_encoder, head_dim=128, feat_dim=768).to(device)
 
-    # 4. 准备数据 (示例)
-    # 假设你有 waveforms (N, 3000) 和 labels (N,)
-    dummy_data = torch.randn(100, SIGNAL_LEN)
-    dummy_labels = torch.randint(0, 5, (100,)) # 5类
-    dataset = TensorDataset(dummy_data, dummy_labels)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    # --- 4. 优化器与 Loss ---
+    criterion = SupConLoss(temperature=args.temp)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    
+    # 可选: 学习率调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    # 5. 优化器 & Loss
-    criterion = SupConLoss(temperature=0.07)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-
-    # 6. 训练循环
+    # --- 5. 训练循环 ---
     print("Start SupCon Training...")
     model.train()
-    for epoch in range(EPOCHS):
+    
+    for epoch in range(args.epochs):
         total_loss = 0
-        for batch_idx, (waveforms, labels) in enumerate(dataloader):
-            waveforms, labels = waveforms.to(DEVICE), labels.to(DEVICE)
-            
+        step_count = 0
+        
+        for batch_idx, (waveforms, labels) in enumerate(train_loader):
+            waveforms = waveforms.to(device) # (B, 1, 3000)
+            labels = labels.to(device)       # (B,)
+
             # Forward
-            projections = model(waveforms)
+            projections = model(waveforms) # (B, 128)
             
-            # Calculate Loss
+            # Loss
             loss = criterion(projections, labels)
             
             # Backward
@@ -235,35 +240,30 @@ if __name__ == "__main__":
             optimizer.step()
             
             total_loss += loss.item()
+            step_count += 1
             
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{EPOCHS}] Loss: {avg_loss:.4f}")
+            if batch_idx % 10 == 0:
+                print(f"Epoch [{epoch+1}/{args.epochs}] Step [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
-    # ===================================================================
-    # 7. 训练结束后的使用方式 (Linear Probing)
-    # ===================================================================
-    print("\nTraining finished. Extracting encoder for classification...")
-    
-    # 提取训练好的 Encoder
-    trained_encoder = model.encoder
-    
-    # 构建最终分类器
-    class LinearClassifier(nn.Module):
-        def __init__(self, encoder, num_classes):
-            super().__init__()
-            self.encoder = encoder
-            self.fc = nn.Linear(EMBED_DIM, num_classes)
-            
-        def forward(self, x):
-            # 此时只用 encoder 提取特征，不需要 projection head
-            with torch.no_grad():
-                feat = self.encoder.forward_features(x)
-            return self.fc(feat)
-
-    classifier = LinearClassifier(trained_encoder, num_classes=5).to(DEVICE)
-    
-    # 此时通常冻结 Encoder，只训练 FC
-    for param in classifier.encoder.parameters():
-        param.requires_grad = False
+        avg_loss = total_loss / step_count
+        scheduler.step()
         
-    print("Classifier ready for Linear Probing.")
+        print(f"=== Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f} ===")
+        
+        # 保存权重
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == args.epochs:
+            save_path = os.path.join(args.save_dir, f'supcon_epoch_{epoch+1}.pth')
+            # 保存 encoder 的权重，方便后续做 Linear Probing
+            torch.save({
+                'encoder': model.encoder.state_dict(),
+                'head': model.head.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch
+            }, save_path)
+            print(f"Checkpoint saved to {save_path}")
+
+    print("Training Complete.")
+    print("Next Step: Load 'encoder' weights into a classifier and train only the Linear Layer (Linear Probing).")
+
+if __name__ == "__main__":
+    main()
