@@ -197,14 +197,40 @@ def main():
     if os.path.exists(args.pretrained_path):
         print(f"Loading pretrained weights from {args.pretrained_path}")
         checkpoint = torch.load(args.pretrained_path, map_location='cpu')
-        state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
         
-        # strict=False 是必须的，因为我们删除了 decoder
-        msg = base_encoder.load_state_dict(state_dict, strict=False)
-        print(f"Load status: {msg}")
-        # 检查是否正确加载了 encoder (missing keys 应该主要是 decoder_*)
+        # 获取原始 state_dict
+        raw_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        
+        # --- 关键修复步骤：去除 _orig_mod. 前缀 ---
+        new_state_dict = {}
+        for k, v in raw_state_dict.items():
+            # 去除 torch.compile 产生的 _orig_mod. 前缀
+            if k.startswith('_orig_mod.'):
+                new_key = k[10:] # 去掉前10个字符
+            # 去除 DDP 可能产生的 module. 前缀 (以防万一)
+            elif k.startswith('module.'):
+                new_key = k[7:]
+            else:
+                new_key = k
+            
+            new_state_dict[new_key] = v
+            
+        # 加载修复后的权重
+        msg = base_encoder.load_state_dict(new_state_dict, strict=False)
+        
+        # --- 验证加载结果 ---
+        # 我们只允许 decoder 相关的层缺失，Encoder 的层必须全部加载成功
+        missing_encoder_keys = [k for k in msg.missing_keys if not k.startswith('decoder') and not k.startswith('mask_token') and not k.startswith('time_')]
+        
+        if len(missing_encoder_keys) > 0:
+            print("\n[ERROR] 严重警告：以下 Encoder 核心权重未加载成功！")
+            print(missing_encoder_keys[:10]) # 打印前10个看看
+            raise RuntimeError("预训练权重加载失败，请检查 Key 匹配情况。")
+        else:
+            print("\n[SUCCESS] Encoder 权重加载成功！(忽略 Decoder 缺失是正常的)")
+            
     else:
-        print("WARNING: Pretrained path not found! Training from scratch (Not recommended for SupCon).")
+        print("WARNING: Pretrained path not found! Training from scratch.")
 
     # 包装 SupCon
     model = SupConMAE(base_encoder, head_dim=128, feat_dim=768).to(device)
