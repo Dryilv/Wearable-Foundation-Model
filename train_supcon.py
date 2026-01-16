@@ -254,6 +254,46 @@ def main():
             waveforms = waveforms.to(device) # (B, 1, 3000)
             labels = labels.to(device)       # (B,)
 
+            # =================================================================
+            # [DEBUG CHECKLIST] - 仅在每个 Epoch 的第 0 步运行，用于诊断
+            # =================================================================
+            if batch_idx == 0:
+                print(f"\n{'='*20} DEBUG INFO (Epoch {epoch+1}) {'='*20}")
+                
+                # 1. 检查 Batch 内是否有同类样本 (SupCon 的核心)
+                unique_labels, counts = torch.unique(labels, return_counts=True)
+                num_positive_pairs = (counts > 1).sum().item()
+                print(f"[Labels] Batch Size: {labels.size(0)}")
+                print(f"[Labels] Unique Classes: {len(unique_labels)}")
+                print(f"[Labels] Classes with >1 samples: {num_positive_pairs} (必须 > 0，最好 > Batch/2)")
+                if num_positive_pairs == 0:
+                    print(">>> [CRITICAL WARNING] Batch 内没有同类样本！Loss 将无法下降！请使用 BalancedBatchSampler。")
+
+                # 2. 检查输入数据是否正常
+                print(f"[Input] Mean: {waveforms.mean().item():.4f}, Std: {waveforms.std().item():.4f}")
+                if waveforms.std().item() < 1e-6:
+                    print(">>> [WARNING] 输入信号标准差极小，可能是死数据或全0数据！")
+
+                # 3. 检查 Encoder 输出特征 (是否坍塌或 NaN)
+                with torch.no_grad():
+                    # 临时提取一次特征
+                    raw_feat = model.encoder.forward_features(waveforms)
+                    print(f"[Encoder Feat] Mean: {raw_feat.mean().item():.4f}, Std: {raw_feat.std().item():.4f}")
+                    if torch.isnan(raw_feat).any():
+                        print(">>> [CRITICAL ERROR] Encoder 输出包含 NaN！检查 CWT 或 预训练权重。")
+                    if raw_feat.std().item() < 1e-4:
+                        print(">>> [WARNING] Encoder 特征坍塌 (所有输出都一样)，模型可能未正确加载权重。")
+
+                # 4. 检查 Projection Head 输出 (是否归一化)
+                with torch.no_grad():
+                    proj = model(waveforms)
+                    # 检查 L2 Norm 是否为 1
+                    norm = torch.norm(proj, p=2, dim=1).mean().item()
+                    print(f"[Projection] L2 Norm (Should be ~1.0): {norm:.4f}")
+                    
+                print(f"{'='*60}\n")
+            # =================================================================
+
             # Forward
             projections = model(waveforms) # (B, 128)
             
@@ -263,6 +303,10 @@ def main():
             # Backward
             optimizer.zero_grad()
             loss.backward()
+            
+            # 梯度裁剪 (防止梯度爆炸导致 NaN)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             total_loss += loss.item()
@@ -272,7 +316,8 @@ def main():
                 print(f"Epoch [{epoch+1}/{args.epochs}] Step [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
         avg_loss = total_loss / step_count
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         
         print(f"=== Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f} ===")
         
