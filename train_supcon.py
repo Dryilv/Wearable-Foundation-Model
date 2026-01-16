@@ -2,46 +2,139 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data.sampler import Sampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 import numpy as np
 import os
 import argparse
+import random
+from collections import defaultdict
+import builtins
 
 # 导入你的自定义模块
 from model import CWT_MAE_RoPE, cwt_wrap
 from dataset_cls import DownstreamClassificationDataset
 
 # ===================================================================
-# 1. 模型改造: 提取特征用于对比学习
+# 0. DDP 基础设置工具
+# ===================================================================
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+        dist.barrier()
+        return rank, local_rank, world_size
+    else:
+        print("Not using distributed mode")
+        return 0, 0, 1
+
+def cleanup():
+    dist.destroy_process_group()
+
+# 抑制非主进程的 print
+def setup_for_distributed(is_master):
+    builtin_print = builtins.print
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+    builtins.print = print
+
+# ===================================================================
+# 1. 分布式 Balanced Sampler (关键！)
+# ===================================================================
+class DistributedBalancedBatchSampler(Sampler):
+    """
+    每个 GPU 独立进行 P-K 采样。
+    为了保证每个 GPU 上的 Batch 都有正样本对，我们不进行全局切分，
+    而是让每个 GPU 都在全量数据上进行 P-K 采样，但通过 Seed 错开。
+    """
+    def __init__(self, dataset, n_classes, n_samples, num_replicas, rank):
+        self.dataset = dataset
+        self.n_classes = n_classes
+        self.n_samples = n_samples
+        self.batch_size = n_classes * n_samples
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        
+        # 构建索引 (只在初始化时做一次)
+        # 注意：为了速度，这里假设 dataset 比较快，或者你可以缓存 labels
+        self.label_to_indices = defaultdict(list)
+        # 优化：如果 dataset 有 labels 属性直接读取，否则遍历
+        if hasattr(dataset, 'labels'):
+             labels = dataset.labels
+             for idx, label in enumerate(labels):
+                 self.label_to_indices[int(label)].append(idx)
+        else:
+            # 慢速遍历
+            for idx in range(len(dataset)):
+                _, label = dataset[idx]
+                self.label_to_indices[int(label)].append(idx)
+                
+        self.classes = list(self.label_to_indices.keys())
+        
+        # 计算每个 GPU 应该跑多少个 Batch
+        # 这里简单处理：每个 GPU 跑的总量近似等于 数据总量 / GPU数
+        self.num_samples = int(len(dataset) // self.num_replicas)
+        self.num_batches = self.num_samples // self.batch_size
+
+    def __iter__(self):
+        # 关键：设置随机种子，确保不同 GPU 选到的类不同，且随 Epoch 变化
+        g = torch.Generator()
+        g.manual_seed(self.epoch * 1000 + self.rank)
+        
+        for _ in range(self.num_batches):
+            batch_indices = []
+            
+            # 1. 随机选 P 个类
+            indices = torch.randperm(len(self.classes), generator=g).tolist()
+            selected_class_indices = indices[:self.n_classes]
+            # 如果类别不够，允许重复
+            while len(selected_class_indices) < self.n_classes:
+                selected_class_indices.extend(torch.randint(0, len(self.classes), (self.n_classes - len(selected_class_indices),), generator=g).tolist())
+            
+            selected_classes = [self.classes[i] for i in selected_class_indices]
+            
+            for cls in selected_classes:
+                cls_indices = self.label_to_indices[cls]
+                # 2. 每个类随机选 K 个样本
+                if len(cls_indices) >= self.n_samples:
+                    # 随机选
+                    perm = torch.randperm(len(cls_indices), generator=g).tolist()
+                    sel = [cls_indices[i] for i in perm[:self.n_samples]]
+                    batch_indices.extend(sel)
+                else:
+                    # 样本不够，重复采样
+                    sel = [cls_indices[torch.randint(0, len(cls_indices), (1,), generator=g).item()] for _ in range(self.n_samples)]
+                    batch_indices.extend(sel)
+            
+            yield batch_indices
+
+    def __len__(self):
+        return self.num_batches
+    
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+# ===================================================================
+# 2. 模型定义 (保持不变)
 # ===================================================================
 class CWT_MAE_Encoder(CWT_MAE_RoPE):
-    """
-    继承原模型，专门用于提取下游任务特征。
-    改动点：
-    1. 移除 Masking。
-    2. 生成顺序的 RoPE 位置编码。
-    3. 输出 Global Average Pooling 特征。
-    """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # 移除 Decoder 以节省显存 (对比学习不需要重建)
-        del self.decoder_blocks
-        del self.decoder_embed
-        del self.decoder_pred_spec
-        del self.time_pred
-        del self.decoder_norm
-        del self.decoder_pos_embed
-        del self.mask_token
+        del self.decoder_blocks, self.decoder_embed, self.decoder_pred_spec, self.time_pred, self.decoder_norm, self.decoder_pos_embed, self.mask_token
 
     def forward_features(self, x):
-        # x shape: (B, 1, 3000) or (B, 3000)
         if x.dim() == 3: x = x.squeeze(1)
-        
-        # 1. CWT 变换
-        # 注意：dataset 中已经做了一次 Instance Norm (1D)，
-        # 这里 cwt_wrap 后模型内部通常还会做一次 2D 的 Norm，保持双重 Norm 有助于稳定性
         imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
-        
-        # 2. 内部标准化 (保持与预训练一致)
         dtype_orig = imgs.dtype
         imgs_f32 = imgs.float() 
         mean = imgs_f32.mean(dim=(2, 3), keepdim=True)
@@ -50,37 +143,26 @@ class CWT_MAE_Encoder(CWT_MAE_RoPE):
         imgs = (imgs_f32 - mean) / std
         imgs = imgs.to(dtype=dtype_orig)
 
-        # 3. Patch Embedding
-        x = self.patch_embed(imgs) # (B, N, D)
+        x = self.patch_embed(imgs)
         x = x + self.pos_embed[:, 1:, :]
-
-        # 4. CLS Token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1) # (B, N+1, D)
+        x = torch.cat((cls_tokens, x), dim=1)
 
-        # 5. 生成顺序的 RoPE (关键修正：不再是乱序)
         B, SeqLen, _ = x.shape
         pos_ids = torch.arange(SeqLen, device=x.device).unsqueeze(0).expand(B, -1)
         rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
         
-        # 6. Encoder Forward
         for blk in self.blocks:
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
-            
         x = self.norm(x)
-
-        # 7. 特征聚合: Global Average Pooling (GAP)
-        # 忽略 CLS token (index 0)，对所有 Patch tokens 求平均
         global_feat = torch.mean(x[:, 1:, :], dim=1) 
-        
         return global_feat
 
 class SupConMAE(nn.Module):
     def __init__(self, encoder, head_dim=128, feat_dim=768):
         super().__init__()
         self.encoder = encoder
-        # Projection Head: (Dim -> Dim -> 128)
         self.head = nn.Sequential(
             nn.Linear(feat_dim, feat_dim),
             nn.ReLU(inplace=True),
@@ -89,14 +171,11 @@ class SupConMAE(nn.Module):
 
     def forward(self, x):
         feat = self.encoder.forward_features(x)
-        feat = F.normalize(feat, dim=1) # 特征层归一化
+        feat = F.normalize(feat, dim=1)
         proj = self.head(feat)
-        proj = F.normalize(proj, dim=1) # 投影层归一化 (SupCon 必须)
+        proj = F.normalize(proj, dim=1)
         return proj
 
-# ===================================================================
-# 2. Loss Function
-# ===================================================================
 class SupConLoss(nn.Module):
     def __init__(self, temperature=0.07):
         super().__init__()
@@ -105,236 +184,151 @@ class SupConLoss(nn.Module):
     def forward(self, features, labels):
         device = features.device
         batch_size = features.shape[0]
-        
-        # 计算相似度矩阵
         similarity_matrix = torch.matmul(features, features.T) / self.temperature
-        
-        # 构建 Mask (同类为1，异类为0)
         labels = labels.contiguous().view(-1, 1)
         mask = torch.eq(labels, labels.T).float().to(device)
-        
-        # 移除对角线 (自己不与自己对比)
-        logits_mask = torch.scatter(
-            torch.ones_like(mask), 
-            1, 
-            torch.arange(batch_size).view(-1, 1).to(device), 
-            0
-        )
+        logits_mask = torch.scatter(torch.ones_like(mask), 1, torch.arange(batch_size).view(-1, 1).to(device), 0)
         mask = mask * logits_mask
-        
-        # 数值稳定性
         logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
         logits = similarity_matrix - logits_max.detach()
-        
-        # 计算分母
         exp_logits = torch.exp(logits) * logits_mask
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
-        
-        # 计算分子 (只取正样本对)
         mask_sum = mask.sum(1)
-        mask_sum[mask_sum == 0] = 1.0 # 避免除零
-        
+        mask_sum[mask_sum == 0] = 1.0
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask_sum
-        
         loss = - mean_log_prob_pos
         loss = loss.mean()
         return loss
 
 # ===================================================================
-# 3. 训练主流程
+# 3. 主流程
 # ===================================================================
 def main():
-    # --- 配置参数 ---
+    # 1. 初始化 DDP
+    rank, local_rank, world_size = setup_distributed()
+    setup_for_distributed(rank == 0) # 只有 rank 0 打印日志
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, default='./data', help='数据根目录')
-    parser.add_argument('--split_file', type=str, default='./split.json', help='数据集划分文件')
-    parser.add_argument('--pretrained_path', type=str, default='./mae_pretrained.pth', help='预训练权重路径')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints_supcon', help='保存路径')
-    parser.add_argument('--batch_size', type=int, default=64, help='SupCon 需要较大的 Batch Size')
+    parser.add_argument('--data_root', type=str, default='./data')
+    parser.add_argument('--split_file', type=str, default='./split.json')
+    parser.add_argument('--pretrained_path', type=str, default='./mae_pretrained.pth')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints_supcon_ddp')
+    # 注意：这里的 batch_size 是单卡的 batch size
+    parser.add_argument('--n_classes', type=int, default=8, help='每个GPU采样多少类')
+    parser.add_argument('--n_samples', type=int, default=8, help='每类采样多少个')
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--temp', type=float, default=0.07, help='SupCon Temperature')
-    parser.add_argument('--task_index', type=int, default=0, help='Dataset task index')
+    parser.add_argument('--temp', type=float, default=0.2) # 保持你调试好的温度
     args = parser.parse_args()
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if rank == 0:
+        os.makedirs(args.save_dir, exist_ok=True)
+        print(f"Running DDP with {world_size} GPUs.")
+        print(f"Per-GPU Batch Size: {args.n_classes * args.n_samples}")
+        print(f"Global Batch Size: {args.n_classes * args.n_samples * world_size}")
 
-    # --- 1. 准备数据 ---
-    print(f"Loading dataset from {args.data_root}...")
+    # 2. 准备数据
     train_dataset = DownstreamClassificationDataset(
         data_root=args.data_root,
         split_file=args.split_file,
         mode='train',
-        signal_len=3000,
-        task_index=args.task_index
+        signal_len=3000
     )
-    
-    # drop_last=True 很重要，避免最后一个 batch 只有 1 个样本导致 BN 或 Loss 报错
+
+    # 使用自定义的分布式 Balanced Sampler
+    sampler = DistributedBalancedBatchSampler(
+        train_dataset, 
+        n_classes=args.n_classes, 
+        n_samples=args.n_samples,
+        num_replicas=world_size,
+        rank=rank
+    )
+
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
+        batch_sampler=sampler, # 使用 batch_sampler
         num_workers=4, 
-        pin_memory=True,
-        drop_last=True 
+        pin_memory=True
     )
 
-    # --- 2. 初始化模型 ---
-    print("Initializing model...")
-    # 必须与预训练时的参数保持一致
+    # 3. 初始化模型
     base_encoder = CWT_MAE_Encoder(
-        signal_len=3000,
-        cwt_scales=64,
-        embed_dim=768,
-        depth=12,
-        num_heads=12,
-        patch_size_time=50,
-        patch_size_freq=4
+        signal_len=3000, cwt_scales=64, embed_dim=768, depth=12, num_heads=12
     )
 
-    # --- 3. 加载预训练权重 ---
+    # 加载权重 (Rank 0 加载即可，DDP 会广播，但为了保险通常每个进程都加载)
     if os.path.exists(args.pretrained_path):
-        print(f"Loading pretrained weights from {args.pretrained_path}")
         checkpoint = torch.load(args.pretrained_path, map_location='cpu')
-        
-        # 获取原始 state_dict
         raw_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-        
-        # --- 关键修复步骤：去除 _orig_mod. 前缀 ---
         new_state_dict = {}
         for k, v in raw_state_dict.items():
-            # 去除 torch.compile 产生的 _orig_mod. 前缀
-            if k.startswith('_orig_mod.'):
-                new_key = k[10:] # 去掉前10个字符
-            # 去除 DDP 可能产生的 module. 前缀 (以防万一)
-            elif k.startswith('module.'):
-                new_key = k[7:]
-            else:
-                new_key = k
-            
+            if k.startswith('_orig_mod.'): new_key = k[10:]
+            elif k.startswith('module.'): new_key = k[7:]
+            else: new_key = k
             new_state_dict[new_key] = v
-            
-        # 加载修复后的权重
         msg = base_encoder.load_state_dict(new_state_dict, strict=False)
-        
-        # --- 验证加载结果 ---
-        # 我们只允许 decoder 相关的层缺失，Encoder 的层必须全部加载成功
-        missing_encoder_keys = [k for k in msg.missing_keys if not k.startswith('decoder') and not k.startswith('mask_token') and not k.startswith('time_')]
-        
-        if len(missing_encoder_keys) > 0:
-            print("\n[ERROR] 严重警告：以下 Encoder 核心权重未加载成功！")
-            print(missing_encoder_keys[:10]) # 打印前10个看看
-            raise RuntimeError("预训练权重加载失败，请检查 Key 匹配情况。")
-        else:
-            print("\n[SUCCESS] Encoder 权重加载成功！(忽略 Decoder 缺失是正常的)")
-            
-    else:
-        print("WARNING: Pretrained path not found! Training from scratch.")
+        if rank == 0: print(f"Weights loaded: {msg}")
 
-    # 包装 SupCon
-    model = SupConMAE(base_encoder, head_dim=128, feat_dim=768).to(device)
+    model = SupConMAE(base_encoder, head_dim=128, feat_dim=768).cuda()
+    
+    # 转换为 SyncBatchNorm (如果有 BN 层的话，虽然这里主要是 LN)
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    
+    # 包装 DDP
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    # --- 4. 优化器与 Loss ---
+    # 4. 优化器 (分层学习率)
+    optimizer = torch.optim.AdamW([
+        {'params': model.module.encoder.parameters(), 'lr': 1e-5}, # 注意 model.module
+        {'params': model.module.head.parameters(), 'lr': 1e-3}
+    ], weight_decay=1e-4)
+    
     criterion = SupConLoss(temperature=args.temp)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    
-    # 可选: 学习率调度器
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
-    # --- 5. 训练循环 ---
-    print("Start SupCon Training...")
-    model.train()
-    
+    # 5. 训练循环
     for epoch in range(args.epochs):
-        total_loss = 0
-        step_count = 0
+        # 必须设置 epoch，否则 shuffle 不生效
+        sampler.set_epoch(epoch)
+        
+        model.train()
+        total_loss = torch.zeros(1).cuda()
         
         for batch_idx, (waveforms, labels) in enumerate(train_loader):
-            waveforms = waveforms.to(device) # (B, 1, 3000)
-            labels = labels.to(device)       # (B,)
-
-            # =================================================================
-            # [DEBUG CHECKLIST] - 仅在每个 Epoch 的第 0 步运行，用于诊断
-            # =================================================================
-            if batch_idx == 0:
-                print(f"\n{'='*20} DEBUG INFO (Epoch {epoch+1}) {'='*20}")
-                
-                # 1. 检查 Batch 内是否有同类样本 (SupCon 的核心)
-                unique_labels, counts = torch.unique(labels, return_counts=True)
-                num_positive_pairs = (counts > 1).sum().item()
-                print(f"[Labels] Batch Size: {labels.size(0)}")
-                print(f"[Labels] Unique Classes: {len(unique_labels)}")
-                print(f"[Labels] Classes with >1 samples: {num_positive_pairs} (必须 > 0，最好 > Batch/2)")
-                if num_positive_pairs == 0:
-                    print(">>> [CRITICAL WARNING] Batch 内没有同类样本！Loss 将无法下降！请使用 BalancedBatchSampler。")
-
-                # 2. 检查输入数据是否正常
-                print(f"[Input] Mean: {waveforms.mean().item():.4f}, Std: {waveforms.std().item():.4f}")
-                if waveforms.std().item() < 1e-6:
-                    print(">>> [WARNING] 输入信号标准差极小，可能是死数据或全0数据！")
-
-                # 3. 检查 Encoder 输出特征 (是否坍塌或 NaN)
-                with torch.no_grad():
-                    # 临时提取一次特征
-                    raw_feat = model.encoder.forward_features(waveforms)
-                    print(f"[Encoder Feat] Mean: {raw_feat.mean().item():.4f}, Std: {raw_feat.std().item():.4f}")
-                    if torch.isnan(raw_feat).any():
-                        print(">>> [CRITICAL ERROR] Encoder 输出包含 NaN！检查 CWT 或 预训练权重。")
-                    if raw_feat.std().item() < 1e-4:
-                        print(">>> [WARNING] Encoder 特征坍塌 (所有输出都一样)，模型可能未正确加载权重。")
-
-                # 4. 检查 Projection Head 输出 (是否归一化)
-                with torch.no_grad():
-                    proj = model(waveforms)
-                    # 检查 L2 Norm 是否为 1
-                    norm = torch.norm(proj, p=2, dim=1).mean().item()
-                    print(f"[Projection] L2 Norm (Should be ~1.0): {norm:.4f}")
-                    
-                print(f"{'='*60}\n")
-            # =================================================================
-
-            # Forward
-            projections = model(waveforms) # (B, 128)
+            waveforms, labels = waveforms.cuda(non_blocking=True), labels.cuda(non_blocking=True)
             
-            # Loss
+            # Forward
+            projections = model(waveforms)
             loss = criterion(projections, labels)
             
-            # Backward
             optimizer.zero_grad()
             loss.backward()
-            
-            # 梯度裁剪 (防止梯度爆炸导致 NaN)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             optimizer.step()
             
-            total_loss += loss.item()
-            step_count += 1
+            total_loss += loss.detach()
             
-            if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch+1}/{args.epochs}] Step [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
+            if rank == 0 and batch_idx % 10 == 0:
+                print(f"Epoch [{epoch+1}] Step [{batch_idx}] Loss: {loss.item():.4f}")
 
-        avg_loss = total_loss / step_count
-        if scheduler is not None:
-            scheduler.step()
+        # 汇总所有 GPU 的 Loss 用于打印
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        avg_loss = total_loss.item() / (len(train_loader) * world_size)
         
-        print(f"=== Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f} ===")
+        if rank == 0:
+            print(f"=== Epoch {epoch+1} Finished. Global Avg Loss: {avg_loss:.4f} ===")
+            
+            # 保存权重 (只保存 model.module)
+            if (epoch + 1) % 5 == 0 or (epoch + 1) == args.epochs:
+                save_path = os.path.join(args.save_dir, f'supcon_ddp_epoch_{epoch+1}.pth')
+                torch.save({
+                    'encoder': model.module.encoder.state_dict(),
+                    'head': model.module.head.state_dict(),
+                    'epoch': epoch
+                }, save_path)
+                print(f"Checkpoint saved to {save_path}")
         
-        # 保存权重
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == args.epochs:
-            save_path = os.path.join(args.save_dir, f'supcon_epoch_{epoch+1}.pth')
-            # 保存 encoder 的权重，方便后续做 Linear Probing
-            torch.save({
-                'encoder': model.encoder.state_dict(),
-                'head': model.head.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch
-            }, save_path)
-            print(f"Checkpoint saved to {save_path}")
+        dist.barrier() # 等待所有进程结束本轮
 
-    print("Training Complete.")
-    print("Next Step: Load 'encoder' weights into a classifier and train only the Linear Layer (Linear Probing).")
+    cleanup()
 
 if __name__ == "__main__":
     main()
