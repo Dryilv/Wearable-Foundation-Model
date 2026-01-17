@@ -291,18 +291,9 @@ def main():
     
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
-    # Optimizer
-    print("Freezing Encoder for Linear Probing...")
-    for param in model.encoder_model.parameters():
-        param.requires_grad = False
-    
-    # 确保 Head 是可训练的
-    for param in model.head.parameters():
-        param.requires_grad = True
-        
-    # 此时 param_groups 只包含 head 的参数
-    param_groups = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optim.AdamW(param_groups, lr=1e-3, weight_decay=0.05) # LR 可以大一点
+    param_groups = get_layer_wise_lr(model.module, base_lr=args.lr, layer_decay=0.65)
+    optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     best_metric = 0.0
