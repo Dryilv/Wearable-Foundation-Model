@@ -150,6 +150,7 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
     local_labels = []
     local_probs = []
     
+    # 验证时通常不需要 scaler，但保持类型一致
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     iterator = tqdm(loader, desc="Validating") if is_main_process() else loader
@@ -169,9 +170,12 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
                 total_loss += loss.item()
             count += 1
             
-            probs = F.softmax(logits, dim=1)
+            # 【修复 1】强制将 logits 转为 float32 再做 Softmax
+            # 避免 bfloat16 导致的概率和不为 1 的问题
+            probs = F.softmax(logits.float(), dim=1)
+            
             local_labels.append(y)
-            local_probs.append(probs.float()) 
+            local_probs.append(probs) 
 
     local_labels = torch.cat(local_labels)
     local_probs = torch.cat(local_probs)
@@ -184,13 +188,20 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_probs = local_probs
 
     if is_main_process():
-        # 【关键修复】截断多余的 Padding 数据
+        # 截断多余的 Padding 数据
         if len(all_labels) > total_len:
             all_labels = all_labels[:total_len]
             all_probs = all_probs[:total_len]
 
         all_labels_np = all_labels.cpu().numpy()
         all_probs_np = all_probs.cpu().numpy()
+
+        # 【修复 2】手动再次归一化，满足 sklearn 的严格检查
+        # 即使是 float32，有时也会出现 1.0000001 的情况
+        row_sums = all_probs_np.sum(axis=1, keepdims=True)
+        # 防止极少数情况下的除以0（虽然 softmax 不会产生0）
+        row_sums[row_sums == 0] = 1.0 
+        all_probs_np = all_probs_np / row_sums
 
         # 计算指标
         try:
@@ -202,8 +213,8 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
                 auroc = roc_auc_score(all_labels_np, all_probs_np, multi_class='ovr', average='macro')
         except Exception as e:
             print(f"\n[AUC Error] Calculation failed: {e}")
-            print(f"  - Unique Labels in Val: {np.unique(all_labels_np)}")
-            print(f"  - Probs Shape: {all_probs_np.shape}")
+            # 打印部分数据帮助调试
+            print(f"  - Row sums sample (first 5): {all_probs_np[:5].sum(axis=1)}")
             auroc = 0.0
 
         final_preds = np.argmax(all_probs_np, axis=1)
@@ -216,7 +227,6 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         return avg_loss, final_acc, precision, recall, final_f1, auroc
     else:
         return 0, 0, 0, 0, 0, 0
-
 # -------------------------------------------------------------------
 # 主函数
 # -------------------------------------------------------------------
