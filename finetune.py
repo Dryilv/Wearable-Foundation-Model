@@ -98,7 +98,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
     total_loss = 0
     count = 0
     
-    # 【关键】优先使用 bfloat16，与预训练保持一致
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
@@ -139,7 +138,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
 
     return total_loss / count
 
-def validate(model, loader, criterion, device, num_classes, use_amp=True):
+def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True):
+    """
+    Args:
+        total_len: 验证集真实长度，用于去除 DDP padding
+    """
     model.eval()
     total_loss = 0
     count = 0
@@ -181,15 +184,26 @@ def validate(model, loader, criterion, device, num_classes, use_amp=True):
         all_probs = local_probs
 
     if is_main_process():
+        # 【关键修复】截断多余的 Padding 数据
+        if len(all_labels) > total_len:
+            all_labels = all_labels[:total_len]
+            all_probs = all_probs[:total_len]
+
         all_labels_np = all_labels.cpu().numpy()
         all_probs_np = all_probs.cpu().numpy()
 
+        # 计算指标
         try:
             if num_classes == 2:
+                # 二分类：取第二列概率
                 auroc = roc_auc_score(all_labels_np, all_probs_np[:, 1])
             else:
+                # 多分类：One-vs-Rest
                 auroc = roc_auc_score(all_labels_np, all_probs_np, multi_class='ovr', average='macro')
-        except:
+        except Exception as e:
+            print(f"\n[AUC Error] Calculation failed: {e}")
+            print(f"  - Unique Labels in Val: {np.unique(all_labels_np)}")
+            print(f"  - Probs Shape: {all_probs_np.shape}")
             auroc = 0.0
 
         final_preds = np.argmax(all_probs_np, axis=1)
@@ -213,7 +227,7 @@ def main():
     parser.add_argument('--pretrained_path', type=str, default=None)
     parser.add_argument('--save_dir', type=str, default="./checkpoints_cls768")
     
-    parser.add_argument('--num_classes', type=int, default=2)
+    parser.add_argument('--num_classes', type=int, default=2, help="2 for binary (Normal vs Abnormal), 6 for multi-class")
     parser.add_argument('--signal_len', type=int, default=1000)
 
     parser.add_argument('--batch_size', type=int, default=32)
@@ -229,8 +243,7 @@ def main():
     parser.add_argument('--patch_size_time', type=int, default=50)
     parser.add_argument('--patch_size_freq', type=int, default=4)
     
-    # 【新增】张量分解参数，必须与预训练一致
-    parser.add_argument('--mlp_rank_ratio', type=float, default=0.5, help="MLP Rank Ratio (must match pretraining)")
+    parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
 
     parser.add_argument('--clean_indices_path', type=str, default=None)
     parser.add_argument('--clean_test_indices_path', type=str, default=None)
@@ -243,13 +256,18 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
 
-    # Dataset
+    # Dataset 初始化 (传入 num_classes)
     train_ds = DownstreamClassificationDataset(
-        args.data_root, args.split_file, mode='train', signal_len=args.signal_len
+        args.data_root, args.split_file, mode='train', 
+        signal_len=args.signal_len, num_classes=args.num_classes
     )
     val_ds = DownstreamClassificationDataset(
-        args.data_root, args.split_file, mode='test', signal_len=args.signal_len
+        args.data_root, args.split_file, mode='test', 
+        signal_len=args.signal_len, num_classes=args.num_classes
     )
+
+    # 获取验证集真实长度
+    val_dataset_len = len(val_ds)
 
     if args.clean_indices_path and os.path.exists(args.clean_indices_path):
         if is_main_process():
@@ -264,6 +282,8 @@ def main():
         clean_test_indices = np.load(args.clean_test_indices_path)
         clean_test_indices = clean_test_indices[clean_test_indices < len(val_ds)]
         val_ds = Subset(val_ds, clean_test_indices)
+        # 更新长度
+        val_dataset_len = len(val_ds)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
@@ -284,7 +304,6 @@ def main():
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
-        # 传入新增参数
         mlp_rank_ratio=args.mlp_rank_ratio
     )
     model.to(device)
@@ -293,7 +312,6 @@ def main():
 
     param_groups = get_layer_wise_lr(model.module, base_lr=args.lr, layer_decay=0.65)
     optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     best_metric = 0.0
@@ -305,8 +323,11 @@ def main():
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch, use_amp=True)
 
+        # 传入 val_dataset_len
         val_loss, val_acc, val_prec, val_rec, val_f1, val_auc = validate(
-            model, val_loader, criterion, device, args.num_classes, use_amp=True
+            model, val_loader, criterion, device, args.num_classes, 
+            total_len=val_dataset_len, 
+            use_amp=True
         )
 
         if is_main_process():
