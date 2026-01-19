@@ -114,7 +114,7 @@ class TF_MAE_Classifier(nn.Module):
                  num_reasoning_tokens=8, 
                  # 备用 MLP 配置
                  hidden_dim=512, 
-                 dropout_rate=0.5,
+                 dropout_rate=0.0,
                  num_res_blocks=2,
                  **kwargs):
         super().__init__()
