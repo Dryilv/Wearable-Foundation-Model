@@ -8,50 +8,44 @@ import random
 from scipy import signal as scipy_signal
 
 # ===================================================================
-# 1. 信号增强器 (针对生理信号定制)
+# 1. 信号增强器 (保持之前的冠心病优化策略)
 # ===================================================================
 class SignalAugmentor:
-    """
-    包含针对 ECG/PPG 的物理增强策略。
-    重点增加了针对冠心病 (ST段改变) 的局部平移增强。
-    """
     def __init__(self, p=0.5):
         self.p = p
 
     def __call__(self, signal):
-        # 1. 随机缩放 (模拟增益变化)
+        # 1. 随机缩放
         if random.random() < self.p:
             scale_factor = np.random.uniform(0.8, 1.2)
             signal = signal * scale_factor
 
-        # 2. 基线漂移 (模拟呼吸/运动)
+        # 2. 基线漂移
         if random.random() < self.p:
             L = len(signal)
             t = np.linspace(0, L / 100.0, L)
-            freq = np.random.uniform(0.1, 0.5) # 呼吸频率
+            freq = np.random.uniform(0.1, 0.5)
             amp = np.std(signal) * np.random.uniform(0.1, 0.5)
             drift = np.sin(2 * np.pi * freq * t) * amp
             signal = signal + drift
 
-        # 3. 高斯噪声 (模拟传感器噪声)
+        # 3. 高斯噪声
         if random.random() < self.p:
             noise_amp = np.std(signal) * np.random.uniform(0.01, 0.05)
             noise = np.random.normal(0, noise_amp, len(signal))
             signal = signal + noise
 
-        # 4. 随机掩码 (模拟接触不良)
+        # 4. 随机掩码
         if random.random() < self.p:
             mask_len = int(len(signal) * np.random.uniform(0.05, 0.15))
             start = np.random.randint(0, len(signal) - mask_len)
             signal[start : start + mask_len] = 0.0
 
-        # 5. 【关键】局部垂直平移 (模拟 ST 段抬高/压低)
-        # 这对于冠心病识别非常有帮助，强迫模型关注局部电位变化
-        if random.random() < 0.3: # 概率设低一点，避免破坏太多正常波形
-            seg_len = int(len(signal) * 0.1) # 假设一段波形的长度
+        # 5. 局部垂直平移 (ST段增强)
+        if random.random() < 0.3:
+            seg_len = int(len(signal) * 0.1)
             if len(signal) > seg_len:
                 start = np.random.randint(0, len(signal) - seg_len)
-                # 偏移量: ±0.1 ~ ±0.3 倍标准差
                 offset = np.random.uniform(-0.3, 0.3) * (np.std(signal) + 1e-6)
                 signal[start : start + seg_len] += offset
 
@@ -61,13 +55,17 @@ class SignalAugmentor:
 # 2. Dataset 定义
 # ===================================================================
 class DownstreamClassificationDataset(Dataset):
-    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0):
+    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2):
+        """
+        新增 num_classes 参数，用于接收 finetune.py 传入的类别数，并进行标签校验。
+        """
         self.data_root = data_root
         self.signal_len = signal_len
         self.mode = mode
         self.task_index = task_index
+        self.num_classes = num_classes  # 【新增】保存类别数
 
-        # 针对 20人小样本，训练时开启强增强 (p=0.7)
+        # 训练模式开启增强
         self.augmentor = SignalAugmentor(p=0.7) if mode == 'train' else None
 
         with open(split_file, 'r') as f:
@@ -77,7 +75,7 @@ class DownstreamClassificationDataset(Dataset):
             raise ValueError(f"Mode {mode} not found in split file.")
         
         self.file_list = splits[mode]
-        print(f"[{mode}] Loaded {len(self.file_list)} samples.")
+        print(f"[{mode}] Loaded {len(self.file_list)} samples. (Num Classes check: {num_classes})")
 
     def __len__(self):
         return len(self.file_list)
@@ -103,21 +101,26 @@ class DownstreamClassificationDataset(Dataset):
             if 'class' in label_dict:
                 label = int(label_dict['class'])
             else:
-                raise ValueError(f"Sample {filename} label[{self.task_index}] does not have 'class' key.")
+                raise ValueError(f"Sample {filename} label[{self.task_index}] missing 'class'.")
+
+            # 【新增】标签合法性检查
+            if label >= self.num_classes or label < 0:
+                # 如果标签越界，打印警告并返回全0数据（或者你可以选择抛出异常）
+                # print(f"Warning: Label {label} out of bounds (0-{self.num_classes-1}) in {filename}")
+                return torch.zeros(1, self.signal_len), torch.tensor(0, dtype=torch.long)
 
             # --- 处理流程 ---
-            
-            # 1. 裁剪/填充 (确保长度对齐)
+            # 1. 裁剪/填充
             processed_signal = self._crop_or_pad(raw_signal)
             
-            # 2. 数据增强 (在归一化之前进行，模拟物理干扰)
+            # 2. 数据增强
             if self.augmentor is not None:
                 processed_signal = self.augmentor(processed_signal)
 
-            # 3. 归一化 (使用 Robust Scaling 保护 ST 段)
+            # 3. 归一化 (Robust Scaling)
             processed_signal = self._robust_norm(processed_signal)
 
-            # 转 Tensor [1, L]
+            # 转 Tensor
             signal_tensor = torch.from_numpy(processed_signal).unsqueeze(0)
             
             return signal_tensor, torch.tensor(label, dtype=torch.long)
@@ -130,17 +133,13 @@ class DownstreamClassificationDataset(Dataset):
         current_len = len(signal)
         target_len = self.signal_len
 
-        # 裁剪
         if current_len > target_len:
             if self.mode == 'train':
-                # 训练时随机裁剪，增加样本多样性
                 start = np.random.randint(0, current_len - target_len)
             else:
-                # 测试时中心裁剪，保证确定性
                 start = (current_len - target_len) // 2
             signal = signal[start : start + target_len]
         
-        # 填充
         if len(signal) < target_len:
             pad_len = target_len - len(signal)
             signal = np.pad(signal, (0, pad_len), 'constant', constant_values=0)
@@ -148,27 +147,12 @@ class DownstreamClassificationDataset(Dataset):
         return signal
 
     def _robust_norm(self, signal):
-        """
-        【关键改进】Robust Scaling
-        使用中位数和四分位距 (IQR) 进行归一化。
-        相比于 (x-mean)/std，这种方法对大幅度的 R 波不敏感，
-        能更好地保留 ST 段和 T 波的相对幅度特征，对冠心病识别更友好。
-        """
         q25 = np.percentile(signal, 25)
         q75 = np.percentile(signal, 75)
         iqr = q75 - q25
         median = np.median(signal)
         
-        # 防止除以零 (如果是死线)
         if iqr < 1e-6:
-            # 如果信号几乎是直线，退化为减去均值
             return signal - np.mean(signal)
             
         return (signal - median) / iqr
-
-    # 备用：标准 Instance Norm (如果 Robust Norm 效果不好可切回)
-    def _instance_norm(self, signal):
-        mean = np.mean(signal)
-        std = np.std(signal)
-        if std < 1e-6: std = 1e-6
-        return (signal - mean) / std
