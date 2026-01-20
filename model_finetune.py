@@ -232,7 +232,7 @@ class TF_MAE_Classifier(nn.Module):
     def forward(self, x):
         # x: [B, 1, L]
         if x.dim() == 3: x = x.squeeze(1)
-        
+        x = x.float() 
         # 1. CWT 变换 (确保 float32 精度计算)
         imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0)
         
