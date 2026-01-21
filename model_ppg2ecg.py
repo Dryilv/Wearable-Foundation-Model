@@ -24,12 +24,17 @@ class PPG2ECG_Translator(nn.Module):
         checkpoint = torch.load(path, map_location='cpu')
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
         
-        # 移除 DDP 前缀
-        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            # 1. 去除 DDP 产生的 'module.' 前缀
+            name = k.replace('module.', '')
+            # 2. 【关键修复】去除 torch.compile 产生的 '_orig_mod.' 前缀
+            name = name.replace('_orig_mod.', '')
+            new_state_dict[name] = v
         
-        # 加载权重 (strict=False 以防版本微小差异，但理论上应该完全匹配)
+        # strict=False 允许加载部分权重
         msg = self.mae.load_state_dict(new_state_dict, strict=False)
-        print(f"Weights loaded. {msg}")
+        print(f"Weights loaded. Missing keys (expected for decoder/head): {msg.missing_keys}")
 
     def _freeze_encoder(self):
         print("Freezing Encoder parameters...")

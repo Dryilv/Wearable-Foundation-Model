@@ -24,12 +24,13 @@ from dataset_paired import PairedPhysioDataset
 
 # 启用 TensorFloat-32
 torch.set_float32_matmul_precision('high')
+# 允许编译失败时回退，防止某些算子不支持导致崩溃
+torch._dynamo.config.suppress_errors = True
 
 # -------------------------------------------------------------------
-# 工具类 (保持不变)
+# 工具类
 # -------------------------------------------------------------------
 class SmoothedValue(object):
-    """用于平滑统计各项指标 (Loss, Time, etc.)"""
     def __init__(self, window_size=20, fmt=None):
         if fmt is None: fmt = "{median:.4f} ({global_avg:.4f})"
         self.deque = deque(maxlen=window_size)
@@ -94,7 +95,6 @@ def save_translation_vis(model, ppg_batch, ecg_batch, epoch, save_dir):
         ecg_pred = pred_time[idx].float().cpu().numpy()
         
         plt.figure(figsize=(15, 12))
-        
         plt.subplot(4, 1, 1)
         plt.plot(ppg_signal, color='green', alpha=0.8)
         plt.title("Input: PPG Signal")
@@ -107,13 +107,6 @@ def save_translation_vis(model, ppg_batch, ecg_batch, epoch, save_dir):
         plt.legend()
         plt.grid(True, alpha=0.3)
         
-        # 简单的 Spec 可视化
-        if isinstance(model, DDP): scales = model.module.mae.cwt_scales
-        else: scales = model.mae.cwt_scales
-        
-        # 这里为了不引入 cwt_wrap 依赖，仅做时域展示，如果需要频域请自行取消注释并导入 cwt_wrap
-        # ... (频域可视化代码略，保持简洁) ...
-
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"trans_epoch_{epoch}.png"))
         plt.close()
@@ -121,33 +114,31 @@ def save_translation_vis(model, ppg_batch, ecg_batch, epoch, save_dir):
     model.train()
 
 # -------------------------------------------------------------------
-# 【核心修改】训练逻辑：增加时间监控和进度条
+# 训练逻辑
 # -------------------------------------------------------------------
 def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device):
     model.train()
     
-    # 定义指标记录器
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
-    metric_logger['data_time'] = SmoothedValue(window_size=20, fmt='{avg:.4f}') # 数据加载时间
-    metric_logger['batch_time'] = SmoothedValue(window_size=20, fmt='{avg:.4f}') # 整体Batch时间
+    metric_logger['data_time'] = SmoothedValue(window_size=20, fmt='{avg:.4f}')
+    metric_logger['batch_time'] = SmoothedValue(window_size=20, fmt='{avg:.4f}')
+    # 【新增】学习率记录器
+    metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     
     header = f'Epoch: [{epoch}]'
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     num_steps = len(dataloader)
-    start_time = time.time()
     end = time.time()
     
     for step, (ppg, ecg) in enumerate(dataloader):
-        # 1. 记录数据加载时间 (当前时间 - 上一次循环结束时间)
         data_time_val = time.time() - end
         metric_logger['data_time'].update(data_time_val)
         
         ppg = ppg.to(device, non_blocking=True)
         ecg = ecg.to(device, non_blocking=True)
 
-        # 2. 前向传播与反向传播
         with torch.amp.autocast('cuda', dtype=amp_dtype):
             loss, _, _ = model(ppg, ecg_target=ecg)
         
@@ -160,27 +151,25 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config['train'].get('clip_grad', 1.0))
         optimizer.step()
 
-        # 3. 更新 Loss 记录
         metric_logger['loss'].update(loss.item())
+        # 【新增】更新学习率
+        metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
         
-        # 4. 记录 Batch 总时间
         batch_time_val = time.time() - end
         metric_logger['batch_time'].update(batch_time_val)
-        end = time.time() # 重置计时器
+        end = time.time()
 
-        # 5. 日志打印
         if step % config['train']['log_interval'] == 0 and is_main_process():
-            # 计算 ETA (预计剩余时间)
             steps_left = num_steps - step
             eta_seconds = metric_logger['batch_time'].global_avg * steps_left
             eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
             
-            # 打印格式：
-            # Epoch: [0][  50/1000] ETA: 0:15:30  Loss: 0.5 (0.4)  Data: 0.005s  Batch: 0.100s
+            # 【新增】日志中打印 LR
             logger.info(
                 f"{header}[{step:>{len(str(num_steps))}}/{num_steps}] "
                 f"ETA: {eta_string}  "
                 f"Loss: {metric_logger['loss']}  "
+                f"LR: {metric_logger['lr']}  "
                 f"Data: {metric_logger['data_time']}  "
                 f"Batch: {metric_logger['batch_time']}"
             )
@@ -206,7 +195,6 @@ def main():
         Path(config['train']['save_dir']).mkdir(parents=True, exist_ok=True)
     logger = setup_logger(config['train']['save_dir'])
 
-    # Dataset
     dataset = PairedPhysioDataset(
         index_file=config['data']['index_path'],
         signal_len=config['data']['signal_len'],
@@ -225,7 +213,6 @@ def main():
         drop_last=True
     )
 
-    # Model
     model = PPG2ECG_Translator(
         pretrained_path=args.pretrained,
         signal_len=config['data']['signal_len'],
@@ -239,13 +226,22 @@ def main():
         time_loss_weight=config['model'].get('time_loss_weight', 5.0)
     )
     model.to(device)
+
+    # 【新增】使用 torch.compile 加速
+    # 注意：必须在 DDP 包装之前调用
+    if is_main_process():
+        logger.info("Compiling model with torch.compile() ...")
+    try:
+        model = torch.compile(model)
+    except Exception as e:
+        logger.warning(f"torch.compile failed: {e}")
+
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False)
     
     optimizer = optim.AdamW(model.parameters(), 
                             lr=float(config['train']['base_lr']), 
                             weight_decay=float(config['train']['weight_decay']))
     
-    # 可视化 Batch
     vis_ppg, vis_ecg = next(iter(dataloader))
     vis_ppg = vis_ppg.to(device)
     vis_ecg = vis_ecg.to(device)
