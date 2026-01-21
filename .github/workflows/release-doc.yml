@@ -1,12 +1,12 @@
-name: Build Word Doc & Release
+name: Build Docs (Word & PPT) & Release
 
 on:
-  # 1. 自动触发：当推送 v 开头的标签时
+  # 1. 自动触发：推送 v* 标签
   push:
     tags:
       - 'v*'
   
-  # 2. 手动触发：允许手动输入版本号强制构建
+  # 2. 手动触发
   workflow_dispatch:
     inputs:
       manual_version:
@@ -32,40 +32,29 @@ jobs:
         with:
           fetch-depth: 2
 
-      # 2. 确定版本号 (自动 vs 手动)
+      # 2. 确定版本号
       - name: Determine Version
         id: get_version
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # 如果是手动触发，使用输入的版本号
             echo "VERSION=${{ inputs.manual_version }}" >> $GITHUB_OUTPUT
-            echo "IS_MANUAL=true" >> $GITHUB_OUTPUT
           else
-            # 如果是 Tag 触发，使用 Tag 名
             echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-            echo "IS_MANUAL=false" >> $GITHUB_OUTPUT
           fi
 
-      # 3. 检查 README 是否变更 (手动模式下可选跳过)
+      # 3. 检查 README 变更
       - name: Check if README changed
         id: check_changes
         run: |
-          # 如果是手动触发 且 勾选了强制构建，直接通过
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ inputs.force_build }}" == "true" ]; then
-            echo "Manual trigger with force build. Proceeding..."
             echo "readme_changed=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 否则进行常规 Diff 检测
           CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
-          echo "Changed files: $CHANGED_FILES"
-          
           if echo "$CHANGED_FILES" | grep -i -q "README.md"; then
-            echo "README changed."
             echo "readme_changed=true" >> $GITHUB_OUTPUT
           else
-            echo "README not changed."
             echo "readme_changed=false" >> $GITHUB_OUTPUT
           fi
 
@@ -76,24 +65,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pandoc
 
-      # 5. 生成 Word 文档
-      - name: Convert README to Docx
+      # 5. 生成 Word 文档 (原有功能)
+      - name: Generate Word Doc
         if: steps.check_changes.outputs.readme_changed == 'true'
         run: |
           pandoc README.md -f markdown -t docx -o Project_Manual_${{ steps.get_version.outputs.VERSION }}.docx
 
-      # 6. 创建 Release 并上传
+      # 6. 【新增】生成 PPT 演示文稿
+      - name: Generate PPT Slides
+        if: steps.check_changes.outputs.readme_changed == 'true'
+        run: |
+          # -t pptx: 指定输出格式为 PowerPoint
+          # --slide-level=2: 指定二级标题(##)作为每页幻灯片的标题
+          pandoc README.md -f markdown -t pptx -o Project_Slides_${{ steps.get_version.outputs.VERSION }}.pptx --slide-level=2
+
+      # 7. 创建 Release 并上传两个文件
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: steps.check_changes.outputs.readme_changed == 'true'
         with:
-          # 使用确定的版本号作为 Release 标题
           tag_name: ${{ steps.get_version.outputs.VERSION }}
           name: Release ${{ steps.get_version.outputs.VERSION }}
-          body: "Documentation for version ${{ steps.get_version.outputs.VERSION }}."
+          body: "Auto-generated Manual and Slides for version ${{ steps.get_version.outputs.VERSION }}."
           draft: false
           prerelease: false
+          # 这里列出要上传的所有文件
           files: |
             Project_Manual_${{ steps.get_version.outputs.VERSION }}.docx
+            Project_Slides_${{ steps.get_version.outputs.VERSION }}.pptx
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
