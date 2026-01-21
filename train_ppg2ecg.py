@@ -210,8 +210,8 @@ def main():
         index_file=config['data']['index_path'],
         signal_len=config['data']['signal_len'],
         mode='train',
-        row_ppg=0, # 你的数据第一行
-        row_ecg=4  # 你的数据第五行
+        row_ppg=4, # 你的数据第一行
+        row_ecg=0  # 你的数据第五行
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
