@@ -330,25 +330,52 @@ class CWT_MAE_RoPE(nn.Module):
         return x_masked, mask, ids_restore, ids_keep
 
     def forward_encoder(self, x):
+        # 1. Patch Embedding & Position Embedding
         x = self.patch_embed(x)
         x = x + self.pos_embed[:, 1:, :]
-        x_masked, mask, ids_restore, ids_keep = self.random_masking(x, self.mask_ratio)
         
+        # 2. Masking Logic (优化：微调时 mask_ratio=0，跳过繁重的排序计算)
+        if self.mask_ratio == 0.0:
+            # 不进行 Mask，保留所有 Patch
+            x_masked = x
+            B, N, D = x.shape
+            
+            # 生成顺序索引 [0, 1, ..., N-1] 并扩展到 Batch 维度
+            # ids_keep: [B, N]
+            ids_keep = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+            
+            # 在不打乱的情况下，恢复索引也是顺序的
+            ids_restore = ids_keep 
+            
+            # 全 0 mask，表示没有被遮蔽
+            mask = torch.zeros(B, N, device=x.device)
+        else:
+            # 预训练时进行随机 Mask
+            x_masked, mask, ids_restore, ids_keep = self.random_masking(x, self.mask_ratio)
+        
+        # 3. 添加 CLS Token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x_masked), dim=1)
         
+        # 4. 准备 RoPE 需要的位置索引 (Position IDs)
         B = x.shape[0]
+        # CLS token 的位置设为 0
         cls_pos = torch.zeros(B, 1, device=x.device, dtype=torch.long)
+        # Patch tokens 的位置设为 ids_keep + 1 (因为 0 被 CLS 占用了)
+        # 如果是 mask_ratio=0，这里就是 1, 2, ..., N
         patch_pos = ids_keep + 1
         pos_ids = torch.cat((cls_pos, patch_pos), dim=1)
         
+        # 5. 生成旋转位置编码 (RoPE)
         rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
         
+        # 6. Transformer Blocks
         for blk in self.blocks:
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
             
         x = self.norm(x)
+        
         return x, mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
