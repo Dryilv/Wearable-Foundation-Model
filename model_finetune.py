@@ -12,34 +12,22 @@ from model import CWT_MAE_RoPE, cwt_wrap
 # ===================================================================
 class LatentReasoningHead(nn.Module):
     def __init__(self, embed_dim, num_heads, num_classes, num_reasoning_tokens=8, dropout=0.1):
-        """
-        Args:
-            embed_dim: 输入特征维度 (768)
-            num_heads: 注意力头数
-            num_classes: 分类类别数
-            num_reasoning_tokens: "思维步骤"的数量 (建议 8-16)
-        """
         super().__init__()
         self.num_reasoning_tokens = num_reasoning_tokens
         self.embed_dim = embed_dim
         
-        # 1. 定义推理令牌 (Learnable Queries)
-        # 形状: [1, N_reason, Dim]
-        # 这些 Token 相当于医生的"检查清单" (Checklist)
+        # 1. 定义推理令牌
         self.reasoning_tokens = nn.Parameter(torch.zeros(1, num_reasoning_tokens, embed_dim))
-        nn.init.normal_(self.reasoning_tokens, std=0.02)
         
-        # 2. Cross-Attention: Reasoning (Q) <-> Signal Features (K, V)
-        # 作用: 让推理令牌去信号中寻找证据 (例如: Token 1 找 P波, Token 2 找噪声)
+        # 2. Cross-Attention
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
         
-        # 3. Self-Attention: Reasoning (Q) <-> Reasoning (K, V)
-        # 作用: 整合不同证据 (例如: 结合"节律不齐"和"P波消失"得出结论)
+        # 3. Self-Attention
         self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
         
-        # 4. FFN (前馈网络)
+        # 4. FFN
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
@@ -48,10 +36,15 @@ class LatentReasoningHead(nn.Module):
         )
         self.norm3 = nn.LayerNorm(embed_dim)
         
-        # 5. 最终分类器
+        # 5. Classifier
         self.classifier = nn.Linear(embed_dim, num_classes)
         
+        # 6. 初始化权重 (Xavier)
         self._init_weights()
+        
+        # 7. 【修正】重新初始化 reasoning_tokens 为正态分布
+        # 必须在 _init_weights 之后调用，否则会被 Xavier 覆盖
+        nn.init.normal_(self.reasoning_tokens, std=0.02)
 
     def _init_weights(self):
         for p in self.parameters():
@@ -59,29 +52,22 @@ class LatentReasoningHead(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x_encoder):
-        # x_encoder: [Batch, N_patches, Dim] (来自 Encoder 的 Patch Tokens)
         B = x_encoder.shape[0]
-        
-        # 1. 扩展推理令牌到 Batch 维度
-        # queries: [B, N_reason, Dim]
         queries = self.reasoning_tokens.expand(B, -1, -1)
         
-        # 2. Cross Attention: "带着问题看数据"
-        # Query = Reasoning Tokens, Key/Value = Encoder Features
+        # Cross Attention
         attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder)
         queries = self.norm1(queries + attn_out)
         
-        # 3. Self Attention: "综合思考"
+        # Self Attention
         attn_out2, _ = self.self_attn(query=queries, key=queries, value=queries)
         queries = self.norm2(queries + attn_out2)
         
-        # 4. FFN: "逻辑处理"
+        # FFN
         queries = self.norm3(queries + self.ffn(queries))
         
-        # 5. 聚合决策
-        # 将所有推理步骤的结果取平均，形成最终的诊断向量
+        # Global Pooling & Classify
         decision_token = queries.mean(dim=1) 
-        
         logits = self.classifier(decision_token)
         return logits
 
