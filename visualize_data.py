@@ -88,7 +88,7 @@ def visualize_sample(file_path, signal_data, sample_id=None):
     plt.xlabel("Time Steps", fontsize=12)
     plt.tight_layout()
     plt.subplots_adjust(top=0.92) # 给总标题留空间
-    plt.show()
+    plt.savefig("1.png")
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize first 5 rows of physiological signals from PKL files.")
