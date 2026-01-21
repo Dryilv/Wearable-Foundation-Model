@@ -1,4 +1,4 @@
-# CWT-MAE-RoPE 模型架构与微调指南
+# CWT-MAE-RoPE 模型架构与微调指南 version preview 0.0.4
 
 ## 1. 项目概述 (Project Overview)
 
