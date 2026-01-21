@@ -1,124 +1,173 @@
-# CWT-MAE 下游微调模型文档
+# CWT-MAE-RoPE 模型架构与微调指南
 
-## 1. 模型概述 (Overview)
+## 1. 项目概述 (Project Overview)
 
-**TF_MAE_Classifier** 是一个专为下游分类任务设计的封装模型。它加载预训练的 `CWT_MAE_RoPE` 权重作为特征提取器（Encoder），并在此基础上添加了高级分类头。
+本项目实现了一个针对一维时间序列信号的深度学习框架。它结合了信号处理（连续小波变换 CWT）与计算机视觉中的掩码自编码器（MAE）思想，通过 **"预训练-微调" (Pre-train then Fine-tune)** 的范式，实现对时间序列的高效表征学习和下游分类。
 
-**核心特性：**
-*   **轻量化部署**：自动移除预训练模型中的 Decoder 部分（包括重建头、掩码 Token 等），显著降低显存占用。
-*   **灵活的输入适配**：内置位置编码插值算法（Interpolation），允许微调时的输入信号长度与预训练时不同。
-*   **双模式分类头**：
-    *   **CoT 模式 (默认)**：基于 Attention 的隐式思维链推理头，适合捕捉复杂特征。
-    *   **MLP 模式**：基于残差连接的深层 MLP，适合简单任务或作为基准。
+**核心流程：**
+1.  **信号转图像**：利用 CWT 将一维信号转换为三通道时频图（Spectrogram）。
+2.  **预训练 (Pre-training)**：使用带有 RoPE 和张量分解的 Transformer，通过重建被遮蔽的时频图和原始信号来学习通用特征。
+3.  **微调 (Fine-tuning)**：丢弃解码器，加载编码器权重，并连接高级分类头（如思维链推理头）进行具体任务训练。
 
 ---
 
-## 2. 核心组件详解
+## 第一部分：核心架构与预训练 (`model.py`)
 
-### 2.1 隐式思维链头 (`LatentReasoningHead`)
-这是一个基于 Transformer Decoder 思想设计的分类头。它不使用简单的全局平均池化，而是通过可学习的“推理令牌”去主动查询 Encoder 的输出特征。
+### 1.1 信号预处理模块 (CWT Module)
+模型不直接处理原始信号，而是处理其时频表征。
 
-*   **工作原理**:
-    1.  **推理令牌 (Reasoning Tokens)**: 初始化一组可学习的向量（Query），代表模型试图寻找的特定特征模式。
-    2.  **Cross-Attention**: 推理令牌作为 Query，Encoder 的输出 Patch 作为 Key/Value。这一步从全局特征中聚合关键信息。
-    3.  **Self-Attention**: 推理令牌之间进行交互，整合不同维度的特征信息。
-    4.  **FFN & Pooling**: 经过前馈网络后，对推理令牌取平均，输入线性分类器。
-*   **优势**: 相比简单的 Global Average Pooling，能更灵活地关注时频图中的局部显著区域。
+*   **多视图生成 (`cwt_wrap`)**:
+    *   **输入**: 原始信号 $x$。
+    *   **增强**: 计算一阶差分 ($d1$) 和二阶差分 ($d2$)。
+    *   **变换**: 对 $[x, d1, d2]$ 分别进行 Ricker 小波变换。
+    *   **输出**: `(Batch, 3, Scales, Length)` 的 4D 张量，视为 3 通道图像。
+*   **Ricker 小波**: 使用墨西哥帽小波核，通过卷积提取不同频率尺度的特征。
 
-### 2.2 残差 MLP 块 (`ResidualMLPBlock`)
-用于构建深层 MLP 分类头的基本单元。
-*   **结构**: `Norm -> Linear -> GELU -> Dropout -> Linear -> Dropout -> Residual Add`。
-*   **作用**: 在不使用 Attention 的情况下，通过增加深度和非线性能力来处理特征。
+### 1.2 基础组件 (Basic Components)
 
----
+*   **DecomposedPatchEmbed (内存安全版)**:
+    *   使用标准的 `nn.Conv2d` 将 CWT 图像切分为 Patch 并映射到嵌入维度。
+    *   *优化*: 避免了中间张量膨胀导致的显存溢出问题。
+*   **RoPE (Rotary Positional Embedding)**:
+    *   在 Attention 层引入旋转位置编码，增强模型对序列相对位置的感知。
+    *   支持动态缓存，适应变长序列。
+*   **TensorizedLinear (参数高效层)**:
+    *   在 Encoder 的 MLP 中，将全连接层分解为 $U \times V$。
+    *   通过 `rank_ratio` (默认 0.5) 控制参数量，降低过拟合风险。
 
-### 2.3 主分类器 (`TF_MAE_Classifier`)
+### 1.3 预训练模型: `CWT_MAE_RoPE`
 
-这是用户直接交互的主类，负责整合 Encoder 和 Head。
+这是一个非对称的 Encoder-Decoder 架构。
 
-#### 初始化参数
-| 参数名 | 类型 | 默认值 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `pretrained_path` | str | Required | 预训练 `.pth` 权重文件的路径 |
-| `num_classes` | int | Required | 下游任务的类别数量 |
-| `mlp_rank_ratio` | float | 0.5 | Encoder 中 Tensorized Linear 的压缩比 |
-| `use_cot` | bool | True | **True**: 使用 LatentReasoningHead<br>**False**: 使用 Residual MLP |
-| `num_reasoning_tokens`| int | 8 | CoT 模式下的推理令牌数量 |
-| `num_res_blocks` | int | 2 | MLP 模式下的残差块数量 |
-| `hidden_dim` | int | 512 | MLP 模式下的隐藏层维度 |
-| `**kwargs` | dict | - | 传递给 `CWT_MAE_RoPE` 的其他参数 (如 `embed_dim`, `depth`) |
+#### A. 编码器 (Encoder)
+*   **输入**: 部分可见的 Patch（根据 `mask_ratio` 随机采样）。
+*   **位置编码**: 结合了可学习的绝对位置编码和 RoPE。
+*   **结构**: 堆叠多个 `TensorizedBlock`。
 
-#### 关键机制
+#### B. 解码器 (Decoder)
+*   **输入**: 编码器的潜在向量 + 可学习的 `[MASK]` token（恢复完整序列）。
+*   **结构**: 轻量级 Transformer Blocks（标准 Linear，未分解）。
+*   **任务**: 仅用于预训练阶段的重建任务。
 
-1.  **权重加载与清洗 (`_load_pretrained_weights`)**:
-    *   自动识别并移除 `state_dict` 中的 Decoder 权重（如 `decoder_blocks`, `mask_token` 等）。
-    *   处理 DDP 训练产生的 `module.` 前缀。
-    *   **位置编码插值**: 如果微调时的输入长度导致 Patch 数量变化，自动对 `pos_embed` 进行双三次插值（Bicubic Interpolation）以适配新尺寸。
+#### C. 双重损失函数 (Dual Loss)
+模型同时优化频域和时域的重建质量：
+$$ Loss_{total} = Loss_{spec} + \lambda \cdot Loss_{time} $$
 
-2.  **前向传播流程 (`forward`)**:
-    1.  **信号变换**: 输入 `(B, L)` -> CWT 变换 -> 归一化 -> `(B, 3, H, W)`。
-    2.  **编码 (Encoder)**:
-        *   强制 `mask_ratio = 0.0` (关闭掩码)。
-        *   获取 Latent Feature `(B, N+1, Dim)`。
-    3.  **特征选择**:
-        *   **丢弃 CLS Token**: 代码中选择 `latent[:, 1:, :]`，即只使用 Patch Tokens 作为特征。
-    4.  **分类 (Head)**:
-        *   **CoT 模式**: 输入所有 Patch Tokens `(B, N, Dim)` 进行 Attention 交互。
-        *   **MLP 模式**: 对 Patch Tokens 进行全局平均池化 `(B, Dim)`，然后输入 MLP。
+1.  **谱重建 (`forward_loss_spec`)**: 计算被 Mask 掉的时频图 Patch 的 MSE Loss。
+2.  **时域重建 (`forward_loss_time`)**: 通过 `time_reducer` 聚合特征，预测原始一维信号，计算 MSE Loss。
 
 ---
 
-## 3. 使用示例
+## 第二部分：下游任务微调 (`model_finetune.py`)
 
-### 3.1 基础使用 (CoT 模式)
+### 2.1 分类器封装: `TF_MAE_Classifier`
+该类负责将预训练模型适配到具体的分类任务。
+
+*   **自动瘦身**: 初始化时自动删除预训练模型的 Decoder 部分（包括重建头、Mask Token 等），显著降低显存占用。
+*   **位置编码插值**: 如果微调时的输入信号长度与预训练不一致，自动对 `pos_embed` 进行双三次插值（Bicubic Interpolation）。
+*   **特征提取**: 强制关闭 Mask (`mask_ratio=0`)，并丢弃 CLS Token，仅使用 Patch Tokens 作为特征输入。
+
+### 2.2 高级分类头 (Heads)
+
+模型提供了两种分类头模式，通过 `use_cot` 参数切换：
+
+#### A. 隐式思维链头 (Latent Reasoning Head / CoT)
+*   **适用场景**: 复杂信号分类，需要捕捉局部关键特征。
+*   **机制**:
+    1.  初始化一组可学习的 **推理令牌 (Reasoning Tokens)**。
+    2.  通过 **Cross-Attention** 查询 Encoder 输出的全局特征。
+    3.  通过 **Self-Attention** 整合推理结果。
+    4.  最终通过分类器输出 Logits。
+
+#### B. 残差 MLP 头 (Residual MLP)
+*   **适用场景**: 简单任务或作为基准对比。
+*   **机制**: 全局平均池化 -> [LayerNorm -> Linear -> GELU -> Dropout -> Residual] x N -> Output。
+
+---
+
+## 第三部分：API 参数说明
+
+### 3.1 预训练模型 (`CWT_MAE_RoPE`)
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `signal_len` | 3000 | 输入信号长度 |
+| `cwt_scales` | 64 | CWT 尺度（图像高度） |
+| `embed_dim` | 768 | Encoder 维度 |
+| `depth` | 12 | Encoder 层数 |
+| `mask_ratio` | 0.75 | 预训练掩码比例 |
+| `mlp_rank_ratio` | 0.5 | MLP 压缩比 |
+| `time_loss_weight`| 1.0 | 时域损失权重 |
+
+### 3.2 微调模型 (`TF_MAE_Classifier`)
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `pretrained_path` | Required | 预训练权重路径 |
+| `num_classes` | Required | 类别数量 |
+| `use_cot` | True | 是否使用推理头 (False 则使用 MLP) |
+| `num_reasoning_tokens`| 8 | CoT 模式下的 Token 数量 |
+| `num_res_blocks` | 2 | MLP 模式下的残差块数量 |
+
+---
+
+## 第四部分：使用示例
+
+### 4.1 阶段一：预训练 (Pre-training)
+
+```python
+import torch
+from model import CWT_MAE_RoPE
+
+# 1. 初始化模型
+model = CWT_MAE_RoPE(
+    signal_len=3000,
+    cwt_scales=64,
+    mask_ratio=0.75  # 高掩码率用于自监督学习
+)
+
+# 2. 输入数据 (Batch, Length)
+x = torch.randn(32, 3000)
+
+# 3. 前向传播 (返回 Loss 用于反向传播)
+loss, pred_spec, pred_time, imgs = model(x)
+print(f"Pre-training Loss: {loss.item()}")
+```
+
+### 4.2 阶段二：微调 (Fine-tuning)
 
 ```python
 import torch
 from model_finetune import TF_MAE_Classifier
 
-# 1. 定义模型配置 (需与预训练时的配置一致)
-model = TF_MAE_Classifier(
-    pretrained_path="checkpoints/mae_pretrain_epoch_100.pth",
-    num_classes=10,          # 假设有 10 类
-    embed_dim=768,           # 预训练模型的维度
-    depth=12,                # 预训练模型的层数
-    num_heads=12,
-    use_cot=True,            # 启用推理头
-    num_reasoning_tokens=16  # 使用 16 个推理令牌
+# 1. 初始化分类器 (加载预训练权重)
+classifier = TF_MAE_Classifier(
+    pretrained_path="checkpoints/mae_epoch_100.pth",
+    num_classes=10,
+    embed_dim=768,       # 需与预训练一致
+    use_cot=True,        # 启用思维链推理头
+    num_reasoning_tokens=16
 )
 
-# 2. 准备数据 (Batch=4, Length=3000)
-x = torch.randn(4, 3000)
+# 2. 输入数据 (可以是不同的 Batch Size)
+x_val = torch.randn(16, 3000)
 
-# 3. 前向传播
-logits = model(x) # Output: (4, 10)
+# 3. 推理/训练
+logits = classifier(x_val) # Output: (16, 10)
 print(f"Logits shape: {logits.shape}")
-```
-
-### 3.2 使用 MLP 模式 (轻量化)
-
-```python
-model_mlp = TF_MAE_Classifier(
-    pretrained_path="checkpoints/mae_pretrain_epoch_100.pth",
-    num_classes=2,
-    use_cot=False,           # 关闭 CoT
-    num_res_blocks=3,        # 使用 3 层残差块
-    hidden_dim=256
-)
-
-logits = model_mlp(x)
 ```
 
 ---
 
-## 4. 常见问题与注意事项
+## 第五部分：关键技术细节与注意事项
 
 1.  **显存优化**:
-    *   模型初始化时会自动执行 `del self.encoder_model.decoder_blocks` 等操作。加载预训练模型后，显存占用应显著小于预训练阶段。
-2.  **输入长度变化**:
-    *   如果预训练是 3000 点，微调是 6000 点，模型会自动插值位置编码。但建议微调长度不要偏离预训练长度过大（如 >2倍），否则可能影响 CWT 的频域特征分布。
-3.  **CLS Token**:
-    *   当前实现中，分类头**不使用** Encoder 输出的 CLS Token (Index 0)，而是完全依赖 Patch Tokens (Index 1:)。这是因为在 MAE 架构中，Patch Tokens 通常包含更丰富的局部纹理信息。
-4.  **初始化**:
-    *   Encoder 部分加载预训练权重。
-    *   Head 部分使用 Xavier Uniform 初始化（CoT 的 `reasoning_tokens` 使用正态分布初始化）。
+    *   `DecomposedPatchEmbed` 现已修正为标准卷积，解决了早期版本中间张量过大的问题。
+    *   微调时，`TF_MAE_Classifier` 会主动删除 Encoder 中不需要的组件（如 Decoder），使得在较小显存的 GPU 上也能运行大 Batch 微调。
+
+2.  **输入长度适配**:
+    *   预训练和微调的信号长度可以不同（例如预训练 3000，微调 6000）。模型会自动对位置编码进行插值。但建议长度差异不要过大，以免频域特征分布发生剧烈变化。
+
+3.  **特征选择策略**:
+    *   在微调阶段，分类头**不使用** CLS Token (Index 0)。代码逻辑是 `latent[:, 1:, :]`。这是因为在 MAE 架构中，Patch Tokens 通常保留了更丰富的局部纹理和频率信息，更适合 CoT 头进行查询。
+
+4.  **RoPE 缓存**:
+    *   `RotaryEmbedding` 具有缓存机制。如果推理时的序列长度超过了缓存上限，它会自动重新计算并更新缓存，无需人工干预。
