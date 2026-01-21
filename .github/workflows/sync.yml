@@ -1,0 +1,28 @@
+name: Remote to Remote Sync
+
+on:
+  # 1. 定时触发：每天北京时间上午 8 点 (UTC 0点)
+  schedule:
+    - cron: '0 0 * * *'
+  # 2. 手动触发：允许在 GitHub Actions 页面点击按钮运行
+  workflow_dispatch:
+
+jobs:
+  sync-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Git Sync
+        uses: wei/git-sync@v3
+        with:
+          # --- 源仓库配置 (你的私有仓库) ---
+          # 务必使用 SSH 格式: git@域名:用户名/仓库名.git
+          source_repo: "git@yilvbuhuixiutu.cn:yilv/vit16trans.git"
+          source_branch: "main" # 或 master
+          
+          # --- 目标仓库配置 (GitHub) ---
+          destination_repo: "git@github.com:Dryilv/Wearable-Foundation-Model.git"
+          destination_branch: "main" # 或 master
+          
+          # --- 密钥配置 ---
+          # 对应 GitHub 仓库 Settings -> Secrets -> Actions 中的名字
+          ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}

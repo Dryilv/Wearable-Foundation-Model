@@ -1,0 +1,68 @@
+name: Build Word Doc & Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 仅当推送 v1.0, v1.0.1 等标签时触发
+
+permissions:
+  contents: write # 赋予创建 Release 的权限
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 拉取代码 (深度为2，用于对比差异)
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # 2. 检查 README.md 是否在本次 Tag 的提交中发生了变化
+      - name: Check if README changed
+        id: check_changes
+        run: |
+          # 对比当前版本(HEAD)和上一个版本(HEAD^)的文件差异
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          echo "Changed files: $CHANGED_FILES"
+          
+          # 检查是否包含 README.md (不区分大小写)
+          if echo "$CHANGED_FILES" | grep -i -q "README.md"; then
+            echo "README changed. Proceeding..."
+            echo "readme_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "README not changed. Skipping..."
+            echo "readme_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 3. 安装 Pandoc (仅当 README 变化时)
+      - name: Install Pandoc
+        if: steps.check_changes.outputs.readme_changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+
+      # 4. 获取版本号
+      - name: Get Version
+        if: steps.check_changes.outputs.readme_changed == 'true'
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+      # 5. 生成 Word 文档
+      - name: Convert README to Docx
+        if: steps.check_changes.outputs.readme_changed == 'true'
+        run: |
+          # 将 README.md 转换为 docx，文件名带上版本号
+          pandoc README.md -f markdown -t docx -o Project_Manual_${{ steps.get_version.outputs.VERSION }}.docx
+
+      # 6. 创建 Release 并上传附件
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: steps.check_changes.outputs.readme_changed == 'true'
+        with:
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          body: "Auto-generated documentation for version ${{ steps.get_version.outputs.VERSION }}."
+          files: |
+            Project_Manual_${{ steps.get_version.outputs.VERSION }}.docx
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
