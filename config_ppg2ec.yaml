@@ -11,7 +11,7 @@ train:
   # [学习率]
   # 微调时 LR 应该比预训练小，防止破坏 Encoder 的权重。
   # 预训练是 1.5e-4，这里建议降到 1.0e-4 或 5e-5。
-  base_lr: 1.0e-4         
+  base_lr: 5.0e-5         
   min_lr: 1.0e-6
   warmup_epochs: 3        #以此快速热身
   weight_decay: 0.05      
