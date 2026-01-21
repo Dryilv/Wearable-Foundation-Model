@@ -6,7 +6,7 @@ train:
   
   # [显存] 
   # 保持与预训练一致或略大，因为 Decoder 不需要处理 Mask Token，显存压力稍小。
-  batch_size: 256          
+  batch_size: 128          
   
   # [学习率]
   # 微调时 LR 应该比预训练小，防止破坏 Encoder 的权重。
