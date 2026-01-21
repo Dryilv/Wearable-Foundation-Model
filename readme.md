@@ -1,4 +1,4 @@
-# CWT-MAE-RoPE 模型架构与微调指南 version preview 0.0.4
+# CWT-MAE-RoPE 模型架构与微调指南 version preview 0.0.5
 
 ## 1. 项目概述 (Project Overview)
 
@@ -171,3 +171,51 @@ print(f"Logits shape: {logits.shape}")
 
 4.  **RoPE 缓存**:
     *   `RotaryEmbedding` 具有缓存机制。如果推理时的序列长度超过了缓存上限，它会自动重新计算并更新缓存，无需人工干预。
+
+
+## 6. 相关工作与参考文献 (Related Work & References)
+
+
+### 6.1 掩码自编码器与时频分析 (MAE & Time-Frequency Analysis)
+
+本模型的核心策略是将一维时间序列转化为时频图（Spectrogram）进行处理，这与近期将 MAE 扩展到多模态和频域的研究相呼应。
+
+*   **Masked Autoencoders (MAE)**: He 等人提出的 MAE 证明了通过重建被遮蔽的图像 Patch 可以学习到强大的视觉表征。本项目将这一思想迁移至 CWT 生成的时频图上。
+    *   *He, K., et al. (2022). "Masked Autoencoders Are Scalable Vision Learners." CVPR.*
+*   **时频掩码建模 (TFMAE)**: 类似于本项目，TFMAE 提出了在时域和频域同时进行掩码重建的思想，用于增强模型对异常检测的鲁棒性。
+    *   *Zheng, K., et al. (2023). "Temporal-Frequency Masked Autoencoders for Time Series Anomaly Detection." arXiv preprint.*
+*   **谱掩码自编码器 (SpectralMAE)**: 该工作探索了在光谱维度进行掩码重建的有效性，验证了频域特征在自监督学习中的重要性。
+    *   *Cao, X., et al. (2023). "SpectralMAE: Spectral Masked Autoencoder for Hyperspectral Remote Sensing Image Reconstruction." MDPI Sensors.*
+*   **Ti-MAE**: 证明了在时间序列数据上，基于掩码的生成式任务比对比学习能产生更好的下游分类性能。
+    *   *Li, Z., et al. (2023). "Ti-MAE: Self-Supervised Masked Time Series Autoencoders." arXiv preprint.*
+
+### 6.2 旋转位置编码 (Rotary Positional Embeddings)
+
+为了解决长序列时间序列中的相对位置依赖问题，本项目引入了最初用于语言模型的 RoPE 技术，并将其适配到 Vision Transformer 架构中。
+
+*   **RoFormer (RoPE 原理)**: Su 等人首次提出了通过旋转矩阵将绝对位置编码转化为相对位置依赖的方法，这是本项目 `RotaryEmbedding` 模块的理论基石。
+    *   *Su, J., et al. (2021). "RoFormer: Enhanced Transformer with Rotary Position Embedding." Neurocomputing.*
+*   **RoPE in Vision**: 后续研究验证了 RoPE 在二维视觉任务中的有效性，特别是在处理不同分辨率输入时的外推能力（Extrapolation），这支持了本项目中处理变长信号的设计。
+    *   *Heo, B., et al. (2024). "Rotary Position Embedding for Vision Transformer." ECCV.*
+*   **CyRoPE (多通道时序 RoPE)**: 针对多通道肌电信号（sEMG）提出的柱状旋转位置编码，进一步证明了 RoPE 在复杂时序几何结构中的适用性。
+    *   *Rao, Y., et al. (2024). "Topology-Aware Positional Encoding: Cylindrical Rotary Position Embedding (CyRoPE)." arXiv preprint.*
+
+### 6.3 参数高效微调与张量分解 (Parameter Efficiency & Tensor Decomposition)
+
+为了在保持模型容量的同时降低参数量和过拟合风险，本项目在 MLP 层采用了张量分解技术。
+
+*   **Tensorized Transformer**: Ma 等人提出利用张量分解（如 Tensor-Train Decomposition）来压缩 Transformer 的权重矩阵，实现了在边缘设备上的高效部署。
+    *   *Ma, X., et al. (2019). "A Tensorized Transformer for Language Modeling." NeurIPS.*
+*   **低秩适应 (Low-Rank Adaptation)**: 虽然本项目使用的是全量微调，但 `TensorizedLinear` 的设计思想与 LoRA 异曲同工，即通过低秩矩阵乘法来近似全秩权重更新。
+    *   *Hu, E. J., et al. (2021). "LoRA: Low-Rank Adaptation of Large Language Models." ICLR.*
+
+### 6.4 时间序列推理与思维链 (Reasoning & Chain-of-Thought)
+
+本项目的 `LatentReasoningHead` 尝试在时间序列分类中引入类似 LLM 的“思维链”机制，通过隐式推理令牌来聚合关键特征。
+
+*   **Time-Series Reasoning**: 近期工作开始探索如何让大模型理解时间序列的物理特性（如趋势、周期），并生成可解释的推理步骤。
+    *   *Chow, W., et al. (2024). "Towards Time-Series Reasoning with LLMs." OpenReview.*
+*   **Latent Reasoning Skills (LaRS)**: 该研究提出在潜在空间中学习“推理技能”向量，而非直接生成文本，这与本项目使用可学习的 `reasoning_tokens` 进行 Cross-Attention 的设计思路高度一致。
+    *   *Yang, Y., et al. (2024). "LaRS: Latent Reasoning Skills for Chain-of-Thought Reasoning." EMNLP Findings.*
+*   **Reinforcement Learning for CoT**: 探索了利用强化学习激发模型在时间序列分析任务中的多步推理能力。
+    *   *Parker, F., et al. (2025). "Eliciting Chain-of-Thought Reasoning for Time Series Analysis using Reinforcement Learning." arXiv preprint.*
