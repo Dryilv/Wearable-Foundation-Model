@@ -1,12 +1,9 @@
 name: Build Docs (Word & PPT) & Release
 
 on:
-  # 1. 自动触发：推送 v* 标签
   push:
     tags:
       - 'v*'
-  
-  # 2. 手动触发
   workflow_dispatch:
     inputs:
       manual_version:
@@ -47,10 +44,8 @@ jobs:
         id: check_changes
         run: |
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ inputs.force_build }}" == "true" ]; then
-            echo "readme_changed=true" >> $GITHUB_OUTPUT
-            exit 0
+            echo "readme_changed=true" >> $GITHUB_OUTPUT; exit 0
           fi
-
           CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
           if echo "$CHANGED_FILES" | grep -i -q "README.md"; then
             echo "readme_changed=true" >> $GITHUB_OUTPUT
@@ -58,26 +53,23 @@ jobs:
             echo "readme_changed=false" >> $GITHUB_OUTPUT
           fi
 
-      # 4. 安装 Pandoc
+      # 4. 安装 Pandoc (用于生成 Word)
       - name: Install Pandoc
         if: steps.check_changes.outputs.readme_changed == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pandoc
+        run: sudo apt-get update && sudo apt-get install -y pandoc
 
-      # 5. 生成 Word 文档 (原有功能)
+      # 5. 生成 Word 文档 (保留)
       - name: Generate Word Doc
         if: steps.check_changes.outputs.readme_changed == 'true'
-        run: |
-          pandoc README.md -f markdown -t docx -o Project_Manual_${{ steps.get_version.outputs.VERSION }}.docx
+        run: pandoc README.md -f markdown -t docx -o Project_Manual_${{ steps.get_version.outputs.VERSION }}.docx
 
-      # 6. 【新增】生成 PPT 演示文稿
-      - name: Generate PPT Slides
+      # 6. 【核心】使用 Marp 生成 PPT
+      - name: Generate PPT with Marp
         if: steps.check_changes.outputs.readme_changed == 'true'
         run: |
-          # -t pptx: 指定输出格式为 PowerPoint
-          # --slide-level=2: 指定二级标题(##)作为每页幻灯片的标题
-          pandoc README.md -f markdown -t pptx -o Project_Slides_${{ steps.get_version.outputs.VERSION }}.pptx --slide-level=2
+          # 使用 npx 直接运行 Marp CLI，--allow-local-files 允许读取本地图片
+          # @latest 确保使用最新版本
+          npx @marp-team/marp-cli@latest README.md --pptx --allow-local-files -o Project_Slides_${{ steps.get_version.outputs.VERSION }}.pptx
 
       # 7. 创建 Release 并上传两个文件
       - name: Create Release
@@ -87,9 +79,6 @@ jobs:
           tag_name: ${{ steps.get_version.outputs.VERSION }}
           name: Release ${{ steps.get_version.outputs.VERSION }}
           body: "Auto-generated Manual and Slides for version ${{ steps.get_version.outputs.VERSION }}."
-          draft: false
-          prerelease: false
-          # 这里列出要上传的所有文件
           files: |
             Project_Manual_${{ steps.get_version.outputs.VERSION }}.docx
             Project_Slides_${{ steps.get_version.outputs.VERSION }}.pptx
