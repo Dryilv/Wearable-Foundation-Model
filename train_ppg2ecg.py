@@ -229,12 +229,12 @@ def main():
 
     # 【新增】使用 torch.compile 加速
     # 注意：必须在 DDP 包装之前调用
-    if is_main_process():
-        logger.info("Compiling model with torch.compile() ...")
-    try:
-        model = torch.compile(model)
-    except Exception as e:
-        logger.warning(f"torch.compile failed: {e}")
+    # if is_main_process():
+    #     logger.info("Compiling model with torch.compile() ...")
+    # try:
+    #     model = torch.compile(model)
+    # except Exception as e:
+    #     logger.warning(f"torch.compile failed: {e}")
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False)
     
