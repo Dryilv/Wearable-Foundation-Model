@@ -15,7 +15,7 @@ from torch.cuda.amp import GradScaler
 from torch.amp import autocast 
 
 # 引入自定义模块
-from dataset import BPDataset
+from dataset_regression import BPDataset
 from model_finetune_bp_prediction import TF_MAE_BloodPressure
 try:
     from utils import get_layer_wise_lr
