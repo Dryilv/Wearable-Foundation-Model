@@ -24,50 +24,71 @@ def butter_bandpass_filter(data, lowcut=0.5, highcut=8.0, fs=100, order=4):
 
 def extract_features(signal, fs=100):
     """
-    从一段 PPG 信号中提取手工特征
+    提取 PPG 的形态学特征 (基于单周期分析)
     """
     features = {}
     
-    # 1. 预处理
-    # 滤波
-    ppg_clean = butter_bandpass_filter(signal, fs=fs)
-    # 归一化 (Z-Score)
-    ppg_clean = (ppg_clean - np.mean(ppg_clean)) / (np.std(ppg_clean) + 1e-6)
+    # 1. 寻找波峰和波谷
+    # distance=40 对应心率 150bpm，防止误检
+    peaks, properties = find_peaks(signal, distance=fs*0.4, prominence=0.5)
+    valleys, _ = find_peaks(-signal, distance=fs*0.4, prominence=0.5)
     
-    # 计算一阶导数 (VPG) 和 二阶导数 (APG)
-    vpg = np.gradient(ppg_clean)
-    apg = np.gradient(vpg)
-    
-    # 2. 统计特征 (Statistical Features)
-    # 对 PPG, VPG, APG 分别计算
-    signals = {'ppg': ppg_clean, 'vpg': vpg, 'apg': apg}
-    for name, sig in signals.items():
-        features[f'{name}_mean'] = np.mean(sig)
-        features[f'{name}_std'] = np.std(sig)
-        features[f'{name}_skew'] = skew(sig)
-        features[f'{name}_kurt'] = kurtosis(sig)
-        features[f'{name}_max'] = np.max(sig)
-        features[f'{name}_min'] = np.min(sig)
-        features[f'{name}_energy'] = np.sum(sig**2)
-    
-    # 3. 频域/周期特征 (Frequency/Cycle Features)
-    # 寻找峰值
-    peaks, _ = find_peaks(ppg_clean, distance=fs*0.4) # 假设心率 < 150
-    if len(peaks) > 1:
-        diffs = np.diff(peaks)
-        features['hr_mean'] = (fs * 60) / np.mean(diffs) # 平均心率
-        features['hrv'] = np.std(diffs) # 心率变异性
-    else:
-        features['hr_mean'] = 0
-        features['hrv'] = 0
-        
-    # 4. 频域熵 (Spectral Entropy)
-    # 简单计算功率谱密度
-    freqs, psd =  np.fft.rfft(ppg_clean), np.abs(np.fft.rfft(ppg_clean))**2
-    psd_norm = psd / (np.sum(psd) + 1e-6)
-    features['spectral_entropy'] = entropy(psd_norm)
+    if len(peaks) < 2 or len(valleys) < 2:
+        return {k: 0 for k in ['sys_time', 'dia_time', 'pulse_width_50', 'peak_valley_ratio']}
 
+    # 确保第一个是波谷，最后一个是波峰，方便配对
+    if valleys[0] > peaks[0]: peaks = peaks[1:]
+    if len(peaks) == 0: return {k: 0 for k in ['sys_time', 'dia_time', 'pulse_width_50', 'peak_valley_ratio']}
+    if valleys[-1] < peaks[-1]: peaks = peaks[:-1]
+    
+    # 截取完整周期进行分析
+    num_cycles = min(len(peaks), len(valleys)-1)
+    sys_times = []
+    dia_times = []
+    widths = []
+    
+    for i in range(num_cycles):
+        # 关键点索引
+        idx_start = valleys[i]
+        idx_peak = peaks[i]
+        idx_end = valleys[i+1]
+        
+        # A. 收缩期上升时间 (Systolic Time)
+        t_sys = (idx_peak - idx_start) / fs
+        sys_times.append(t_sys)
+        
+        # B. 舒张期下降时间 (Diastolic Time)
+        t_dia = (idx_end - idx_peak) / fs
+        dia_times.append(t_dia)
+        
+        # C. 半高宽 (Width at 50% height)
+        # 简单的线性插值估算
+        cycle_wave = signal[idx_start:idx_end]
+        cycle_peak_val = signal[idx_peak]
+        cycle_min_val = min(signal[idx_start], signal[idx_end])
+        half_height = (cycle_peak_val + cycle_min_val) / 2
+        
+        # 找左右交点
+        # (这里简化处理，实际可用 scipy.signal.peak_widths)
+        w = 0
+        try:
+            # 左侧交点
+            left_cross = np.where(signal[idx_start:idx_peak] > half_height)[0][0] + idx_start
+            # 右侧交点
+            right_cross = np.where(signal[idx_peak:idx_end] < half_height)[0][0] + idx_peak
+            w = (right_cross - left_cross) / fs
+        except:
+            w = 0.1 # fallback
+        widths.append(w)
+
+    features['sys_time_mean'] = np.mean(sys_times)
+    features['dia_time_mean'] = np.mean(dia_times)
+    features['sys_dia_ratio'] = np.mean(sys_times) / (np.mean(dia_times) + 1e-6)
+    features['pulse_width_mean'] = np.mean(widths)
+    
     return features
+
+# 在 extract_features 主函数中调用它并合并字典
 
 # ==============================================================================
 # 2. 数据加载与构建
