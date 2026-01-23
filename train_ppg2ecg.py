@@ -207,7 +207,7 @@ def main():
         config = yaml.safe_load(f)
 
     # 【强制修改】设置新的学习率
-    NEW_BASE_LR = 5e-5
+    NEW_BASE_LR = 3e-5
     config['train']['base_lr'] = NEW_BASE_LR
     print(f"!!! Forcing Base LR to {NEW_BASE_LR} !!!")
 
