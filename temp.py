@@ -297,9 +297,9 @@ def main():
             logger.info(f"Model weights loaded. Missing keys: {msg.missing_keys}")
         
         # 2. 恢复 Epoch
-        if 'epoch' in checkpoint:
-            start_epoch = checkpoint['epoch'] + 1
-            
+        # if 'epoch' in checkpoint:
+        #     start_epoch = checkpoint['epoch'] + 1
+        start_epoch = 0
         # 3. 【重要】显式跳过优化器加载
         # 即使是 Resume，因为我们更改了 LR 和 Loss 权重策略，
         # 我们希望优化器以新的 LR (3e-5) 从头开始，而不是沿用旧的动量。
