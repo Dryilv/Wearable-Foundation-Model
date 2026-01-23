@@ -27,7 +27,7 @@ torch.set_float32_matmul_precision('high')
 torch._dynamo.config.suppress_errors = True
 
 # -------------------------------------------------------------------
-# 1. 学习率调度器 (Step-based)
+# 1. 学习率调度器 (Step-based Cosine)
 # -------------------------------------------------------------------
 def adjust_learning_rate(optimizer, current_step, total_steps, warmup_steps, base_lr, min_lr):
     """
@@ -144,7 +144,8 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
     
     header = f'Epoch: [{epoch}]'
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    
+    clip_grad = float(config['train'].get('clip_grad', 3.0)) # Config: 3.0
+
     num_steps_per_epoch = len(dataloader)
     end = time.time()
     
@@ -160,6 +161,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
         ecg = ecg.to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=amp_dtype):
+            # model forward 会自动计算 loss (包含 time_loss_weight)
             loss, _, _ = model(ppg, ecg_target=ecg)
         
         if not math.isfinite(loss.item()):
@@ -168,7 +170,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config['train'].get('clip_grad', 1.0))
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
         optimizer.step()
 
         metric_logger['loss'].update(loss.item())
@@ -207,22 +209,30 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
-    # 【强制修改】设置新的学习率
-    NEW_BASE_LR = 3e-5
-    config['train']['base_lr'] = NEW_BASE_LR
-    if is_main_process():
-        print(f"!!! Forcing Base LR to {NEW_BASE_LR} !!!")
+    # 从 Config 读取关键参数
+    base_lr = float(config['train']['base_lr'])       # 3e-5
+    min_lr = float(config['train']['min_lr'])         # 1e-6
+    weight_decay = float(config['train']['weight_decay']) # 0.05
+    time_loss_weight = float(config['model'].get('time_loss_weight', 10.0)) # 10.0
+    signal_len = int(config['data']['signal_len'])    # 3000
+    save_dir = config['train']['save_dir']            # ./checkpoint_ppg2ecg_trans
 
     gpu_id, rank, world_size = init_distributed_mode()
     device = torch.device(f"cuda:{gpu_id}")
     
     if is_main_process():
-        Path(config['train']['save_dir']).mkdir(parents=True, exist_ok=True)
-    logger = setup_logger(config['train']['save_dir'])
+        print(f"Training Config Loaded:")
+        print(f"  - Base LR: {base_lr}")
+        print(f"  - Time Loss Weight: {time_loss_weight}")
+        print(f"  - Signal Len: {signal_len}")
+        print(f"  - Save Dir: {save_dir}")
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        
+    logger = setup_logger(save_dir)
 
     dataset = PairedPhysioDataset(
         index_file=config['data']['index_path'],
-        signal_len=config['data']['signal_len'],
+        signal_len=signal_len,
         mode='train',
         row_ppg=4, # Input
         row_ecg=0  # Target
@@ -241,7 +251,7 @@ def main():
     # 初始化模型
     model = PPG2ECG_Translator(
         pretrained_path=args.pretrained,
-        signal_len=config['data']['signal_len'],
+        signal_len=signal_len,
         cwt_scales=config['model'].get('cwt_scales', 64),
         embed_dim=config['model']['embed_dim'],
         depth=config['model']['depth'],
@@ -249,45 +259,39 @@ def main():
         decoder_embed_dim=config['model']['decoder_embed_dim'],
         decoder_depth=config['model']['decoder_depth'],
         decoder_num_heads=config['model']['decoder_num_heads'],
-        time_loss_weight=config['model'].get('time_loss_weight', 5.0)
+        time_loss_weight=time_loss_weight # 传入 10.0
     )
     model.to(device)
 
-    # 编译模型 (可选)
-    # if is_main_process():
-    #     logger.info("Compiling model with torch.compile() ...")
-    # try:
-    #     model = torch.compile(model)
-    # except Exception as e:
-    #     logger.warning(f"torch.compile failed: {e}")
-
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False)
     
-    # 初始化优化器 (使用新的 LR，且是全新的优化器实例)
+    # 初始化优化器 (使用 Config 中的 LR)
     optimizer = optim.AdamW(model.parameters(), 
-                            lr=NEW_BASE_LR, 
-                            weight_decay=float(config['train']['weight_decay']))
+                            lr=base_lr, 
+                            weight_decay=weight_decay)
     
     # -------------------------------------------------------------------
-    # 断点续训逻辑 (核心修改部分)
+    # 断点续训逻辑
     # -------------------------------------------------------------------
     start_epoch = 0
-    if args.resume and os.path.isfile(args.resume):
+    
+    # 优先使用命令行参数，如果为空则尝试 Config
+    resume_path = args.resume if args.resume else config['train'].get('resume', '')
+    
+    if resume_path and os.path.isfile(resume_path):
         if is_main_process():
-            logger.info(f"Resuming from checkpoint: {args.resume}")
+            logger.info(f"Resuming from checkpoint: {resume_path}")
         
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(resume_path, map_location='cpu')
         
         # 1. 加载模型权重 (处理 DDP 和 Compile 前缀)
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
         new_state_dict = {}
         for k, v in state_dict.items():
             # 同时去除 _orig_mod. (compile) 和 module. (DDP)
-            # 这样无论保存时是否是 DDP，加载到 model.module 都是安全的
             name = k.replace('_orig_mod.', '').replace('module.', '')
             new_state_dict[name] = v
             
-        # 加载到 DDP 内部的 module
         msg = model.module.load_state_dict(new_state_dict, strict=False)
         if is_main_process():
             logger.info(f"Model weights loaded. Missing keys: {msg.missing_keys}")
@@ -297,18 +301,17 @@ def main():
             start_epoch = checkpoint['epoch'] + 1
             
         # 3. 【重要】显式跳过优化器加载
-        # 我们不调用 optimizer.load_state_dict(checkpoint['optimizer'])
-        # 这样优化器就是全新的，Momentum buffer 为空，且使用上面定义的 NEW_BASE_LR
+        # 即使是 Resume，因为我们更改了 LR 和 Loss 权重策略，
+        # 我们希望优化器以新的 LR (3e-5) 从头开始，而不是沿用旧的动量。
         if is_main_process():
-            logger.info(f"!!! OPTIMIZER STATE SKIPPED !!!")
-            logger.info(f"Restarting training from Epoch {start_epoch} with NEW LR: {NEW_BASE_LR}")
+            logger.info(f"!!! OPTIMIZER STATE SKIPPED (Intentional) !!!")
+            logger.info(f"Restarting training from Epoch {start_epoch} with Config LR: {base_lr}")
 
     # 计算总步数用于 Scheduler
     num_steps_per_epoch = len(dataloader)
     total_epochs = config['train']['epochs']
     total_steps = num_steps_per_epoch * total_epochs
     warmup_steps = num_steps_per_epoch * config['train']['warmup_epochs']
-    min_lr = float(config['train']['min_lr'])
 
     # 准备可视化数据
     vis_ppg, vis_ecg = next(iter(dataloader))
@@ -327,24 +330,24 @@ def main():
             model, dataloader, optimizer, epoch, logger, config, device,
             total_steps=total_steps,
             warmup_steps=warmup_steps,
-            base_lr=NEW_BASE_LR,
+            base_lr=base_lr,
             min_lr=min_lr
         )
         
         if is_main_process():
             logger.info(f"Epoch {epoch} done. Avg Loss: {avg_loss:.4f}")
-            save_translation_vis(model, vis_ppg, vis_ecg, epoch, config['train']['save_dir'])
+            save_translation_vis(model, vis_ppg, vis_ecg, epoch, save_dir)
             
             save_dict = {
-                'model': model.module.state_dict(), # 保存时尽量保存 module，方便后续加载
+                'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'config': config
             }
-            torch.save(save_dict, os.path.join(config['train']['save_dir'], "checkpoint_trans_last.pth"))
+            torch.save(save_dict, os.path.join(save_dir, "checkpoint_trans_last.pth"))
             
             if epoch % config['train']['save_freq'] == 0:
-                torch.save(save_dict, os.path.join(config['train']['save_dir'], f"checkpoint_trans_{epoch}.pth"))
+                torch.save(save_dict, os.path.join(save_dir, f"checkpoint_trans_{epoch}.pth"))
 
     total_time = time.time() - total_start_time
     if is_main_process():
