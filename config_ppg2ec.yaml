@@ -55,7 +55,6 @@ model:
   # 我们需要 Encoder 看到完整的 PPG 信号来推断 ECG。
   mask_ratio: 0.0         
   
-model:
   # ... (cwt_scales, embed_dim, etc. 不变) ...
   
   # --- Loss 权重 ---
