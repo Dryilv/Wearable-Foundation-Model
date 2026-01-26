@@ -55,8 +55,15 @@ model:
   # 我们需要 Encoder 看到完整的 PPG 信号来推断 ECG。
   mask_ratio: 0.0         
   
-  # 2. Loss 权重
-  # 翻译任务中，生成的波形形状（R波位置、高度）至关重要。
-  # 建议大幅提高时域 Loss 权重 (预训练是 1.0，这里改为 5.0 或 10.0)
-  # 强迫 Decoder 优先拟合波形，而不是只拟合频谱。
-  time_loss_weight: 10.0
+model:
+  # ... (cwt_scales, embed_dim, etc. 不变) ...
+  
+  # --- Loss 权重 ---
+  # time_loss_weight 控制整个时域 Loss (MSE+Corr) 的权重
+  # 建议设为 1.0 或 2.0
+  time_loss_weight: 1.0
+  
+  # 【新增】Pearson Correlation Loss 权重
+  # 控制 Corr Loss 相对于 MSE Loss 的重要性。
+  # 建议 0.5 - 1.0。这会鼓励模型学习波形形态，而不是死扣相位。
+  corr_loss_weight: 0.75
