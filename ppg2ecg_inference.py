@@ -26,7 +26,7 @@ MODEL_CONFIG = {
     'decoder_num_heads': 16,
     'patch_size_time': 50,
     'patch_size_freq': 4,
-    'mask_ratio': 0.0, # 推理时必须为 0
+    
 }
 
 # 数据行号映射 (根据你之前的修正)
