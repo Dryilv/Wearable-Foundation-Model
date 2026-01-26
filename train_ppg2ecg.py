@@ -47,25 +47,61 @@ def adjust_learning_rate(optimizer, current_step, total_steps, warmup_steps, bas
 # -------------------------------------------------------------------
 # 2. 辅助工具类和函数
 # -------------------------------------------------------------------
+# train_ppg2ecg.py
+
 class SmoothedValue(object):
-    """用于平滑统计各项指标"""
+    """Tracks a series of values and provides smoothed summaries."""
     def __init__(self, window_size=20, fmt=None):
-        if fmt is None: fmt = "{median:.4f} ({global_avg:.4f})"
+        if fmt is None:
+            # Default format string only uses median and global_avg
+            fmt = "{median:.4f} ({global_avg:.4f})"
         self.deque = deque(maxlen=window_size)
         self.total = 0.0
         self.count = 0
         self.fmt = fmt
+
     def update(self, value, n=1):
         self.deque.append(value)
         self.count += n
         self.total += value * n
+
     @property
-    def median(self): return torch.tensor(list(self.deque)).median().item()
+    def median(self):
+        if not self.deque:
+            return 0.0
+        d = torch.tensor(list(self.deque))
+        return d.median().item()
+
     @property
-    def avg(self): return torch.tensor(list(self.deque)).mean().item()
+    def avg(self):
+        if not self.deque:
+            return 0.0
+        d = torch.tensor(list(self.deque))
+        return d.mean().item()
+
     @property
-    def global_avg(self): return self.total / self.count
-    def __str__(self): return self.fmt.format(median=self.median, avg=self.avg, global_avg=self.global_avg)
+    def global_avg(self):
+        if self.count == 0:
+            return 0.0
+        return self.total / self.count
+
+    @property
+    def value(self):
+        if not self.deque:
+            return 0.0
+        return self.deque[-1]
+
+    def __str__(self):
+        # The format string `self.fmt` now dictates which properties are needed.
+        # For example, if fmt="{value:.6f}", it will call self.value.
+        # If fmt="{median:.4f}", it will call self.median.
+        # This is more flexible and avoids the KeyError.
+        return self.fmt.format(
+            median=self.median,
+            avg=self.avg,
+            global_avg=self.global_avg,
+            value=self.value
+        )
 
 def format_time(seconds): return str(datetime.timedelta(seconds=int(seconds)))
 def is_main_process(): return not dist.is_initialized() or dist.get_rank() == 0
