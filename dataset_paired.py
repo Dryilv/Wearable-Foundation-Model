@@ -94,7 +94,7 @@ class PairedPhysioDataset(Dataset):
         return len(self.file_paths)
 
     def __getitem__(self, idx):
-        # 重试机制 (最多尝试 3 次，失败则换一个样本)
+        # 重试机制
         for _ in range(3):
             try:
                 file_path = self.file_paths[idx]
@@ -102,62 +102,53 @@ class PairedPhysioDataset(Dataset):
                 with open(file_path, 'rb') as f:
                     content = pickle.load(f)
                     data = content['data']
-                    # 读取指定行 (PPG 和 ECG)
                     raw_ppg = data[self.row_ppg].astype(np.float32)
                     raw_ecg = data[self.row_ecg].astype(np.float32)
                 
                 # 1. 基础 NaN / Inf 检查
-                if (np.isnan(raw_ppg).any() or np.isinf(raw_ppg).any() or 
-                    np.isnan(raw_ecg).any() or np.isinf(raw_ecg).any()):
+                if not (self._check_basic_validity(raw_ppg) and self._check_basic_validity(raw_ecg)):
                     idx = random.randint(0, len(self.file_paths) - 1)
                     continue
 
                 # ============================================================
-                # 2. 全局质量检查 (Global Quality Check)
+                # 2. 【核心修改】全局质量检查 (Global Quality Check)
+                # 在裁剪之前，先检查整段信号的 STD。
+                # 如果图中那种局部大噪声存在，整段信号的 STD 会显著高于正常值，
+                # 从而在这里被拦截，直接丢弃整个文件。
                 # ============================================================
                 global_std_ppg = np.std(raw_ppg)
                 global_std_ecg = np.std(raw_ecg)
 
-                # 使用类初始化时定义的阈值 (兼容之前的 min/max_std_threshold)
-                # 如果信号整体波动太小(死线)或太大(全是噪声)，直接换文件
-                if (global_std_ppg < self.min_std_threshold or global_std_ppg > self.max_std_threshold or
-                    global_std_ecg < self.min_std_threshold or global_std_ecg > self.max_std_threshold):
+                ppg_bad = global_std_ppg < self.ppg_bounds[0] or global_std_ppg > self.ppg_bounds[1]
+                ecg_bad = global_std_ecg < self.ecg_bounds[0] or global_std_ecg > self.ecg_bounds[1]
+
+                if ppg_bad or ecg_bad:
+                    # 只要整段信号里有“脏东西”拉坏了统计指标，就直接换文件
                     idx = random.randint(0, len(self.file_paths) - 1)
                     continue
 
-                # 3. 同步裁剪 (此时我们确信 raw_ppg/ecg 整体是有效的)
+                # 3. 同步裁剪 (此时我们确信 raw_ppg/ecg 整体是干净的)
                 ppg_proc, ecg_proc = self._process_paired_signal(raw_ppg, raw_ecg)
 
-                # 4. 局部再次检查
-                # 防止刚好裁剪到了一段平坦的死线区域
+                # 4. 局部再次检查 (可选，防止裁剪到了极其平坦的死线区域)
+                # 虽然全局通过了，但为了保险，确保裁剪出的小片段不是死线
                 if np.std(ppg_proc) < 1e-6 or np.std(ecg_proc) < 1e-6:
                     idx = random.randint(0, len(self.file_paths) - 1)
                     continue
                 
-                # 5. 归一化 (Z-Score)
+                # 5. 归一化 (使用局部统计量进行归一化，效果通常更好)
                 ppg_norm = (ppg_proc - np.mean(ppg_proc)) / (np.std(ppg_proc) + 1e-6)
                 ecg_norm = (ecg_proc - np.mean(ecg_proc)) / (np.std(ecg_proc) + 1e-6)
 
-                # ============================================================
-                # 6. 【关键修复】异常值截断 (Clipping)
-                # 解决 Loss 卡在 4.2 的核心：去除 ECG 中的巨大尖峰 (Artifacts)
-                # 正常生理信号的 Z-Score 极少超过 5 (99.9999% 置信区间)
-                # ============================================================
-                ppg_norm = np.clip(ppg_norm, -5.0, 5.0)
-                ecg_norm = np.clip(ecg_norm, -5.0, 5.0)
-
-                # 转 Tensor
                 ppg_tensor = torch.from_numpy(ppg_norm).unsqueeze(0)
                 ecg_tensor = torch.from_numpy(ecg_norm).unsqueeze(0)
                 
                 return ppg_tensor, ecg_tensor
 
             except Exception as e:
-                # print(f"Error loading {file_path}: {e}")
                 idx = random.randint(0, len(self.file_paths) - 1)
                 continue
         
-        # 兜底数据 (防止 DataLoader 崩溃)
         fallback = torch.randn(1, self.signal_len).float() * 1e-3
         return fallback, fallback
 
