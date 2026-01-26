@@ -275,11 +275,11 @@ def main():
             if is_main_process(): logger.info(f"Resumed from epoch {start_epoch}")
 
     # --- Compile and Wrap Model ---
-    if is_main_process(): logger.info("Compiling model with torch.compile() ...")
-    try:
-        model = torch.compile(model)
-    except Exception as e:
-        if is_main_process(): logger.warning(f"torch.compile failed: {e}")
+    # if is_main_process(): logger.info("Compiling model with torch.compile() ...")
+    # try:
+    #     model = torch.compile(model)
+    # except Exception as e:
+    #     if is_main_process(): logger.warning(f"torch.compile failed: {e}")
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False)
     
