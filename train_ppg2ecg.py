@@ -197,9 +197,8 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
             
     return metric_logger['loss'].global_avg
 
-# -------------------------------------------------------------------
-# 4. 主函数
-# -------------------------------------------------------------------
+# train_ppg2ecg.py
+
 def main():
     parser = argparse.ArgumentParser(description="PPG to ECG Translation Training")
     parser.add_argument('--config', default='config.yaml', type=str, help='Path to YAML config file')
@@ -221,16 +220,18 @@ def main():
         index_file=config['data']['index_path'],
         signal_len=config['data']['signal_len'],
         mode='train',
-        row_ppg=4, # 第5行 -> Input
-        row_ecg=0  # 第1行 -> Target
+        row_ppg=4, # Input
+        row_ecg=0  # Target
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     dataloader = DataLoader(dataset, batch_size=config['train']['batch_size'], sampler=sampler,
                             num_workers=config['data']['num_workers'], pin_memory=True, drop_last=True)
 
+    # --- Model Initialization ---
+    # NOTE: We pass pretrained_path=None here because we will handle loading manually
     model = PPG2ECG_Translator(
-        pretrained_path=args.pretrained,
+        pretrained_path=None, 
         corr_loss_weight=config['model'].get('corr_loss_weight', 1.0),
         signal_len=config['data']['signal_len'],
         cwt_scales=config['model'].get('cwt_scales', 64),
@@ -244,6 +245,36 @@ def main():
     )
     model.to(device)
 
+    # --- Manual Weight Loading (The Fix) ---
+    start_epoch = 0
+    # Determine which checkpoint to load: resume takes precedence over pretrained
+    load_path = args.resume if args.resume else args.pretrained
+    
+    if load_path:
+        if is_main_process(): logger.info(f"Loading weights from: {load_path}")
+        checkpoint = torch.load(load_path, map_location='cpu', weights_only=True)
+        state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+        
+        # Create a new state_dict with the correct prefixes for the nested `mae` model
+        # We need to add the `mae.` prefix to the keys from the original MAE checkpoint
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            # Clean up any prefixes from the checkpoint file itself
+            clean_k = k.replace('module.', '').replace('_orig_mod.', '')
+            # Add the `mae.` prefix because we are loading into the nested `mae` attribute
+            new_state_dict[f"mae.{clean_k}"] = v
+            
+        # Load the weights into the top-level model
+        msg = model.load_state_dict(new_state_dict, strict=False)
+        if is_main_process():
+            logger.info(f"Weights loaded. Missing keys: {msg.missing_keys}, Unexpected keys: {msg.unexpected_keys}")
+
+        # If resuming, also load the epoch
+        if args.resume and 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+            if is_main_process(): logger.info(f"Resumed from epoch {start_epoch}")
+
+    # --- Compile and Wrap Model ---
     if is_main_process(): logger.info("Compiling model with torch.compile() ...")
     try:
         model = torch.compile(model)
@@ -255,14 +286,6 @@ def main():
     base_lr = float(config['train']['base_lr'])
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=float(config['train']['weight_decay']))
     
-    start_epoch = 0
-    if args.resume and os.path.isfile(args.resume):
-        if is_main_process(): logger.info(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
-        model.module.load_state_dict(checkpoint['model'])
-        if 'epoch' in checkpoint: start_epoch = checkpoint['epoch'] + 1
-        if is_main_process(): logger.info(f"Resumed weights. Starting from epoch {start_epoch}. Optimizer is reset.")
-
     num_steps_per_epoch = len(dataloader)
     total_epochs = config['train']['epochs']
     total_steps = num_steps_per_epoch * total_epochs
@@ -289,7 +312,8 @@ def main():
             logger.info(f"Epoch {epoch} done. Average Loss: {avg_loss:.4f}")
             save_translation_vis(model, vis_ppg, vis_ecg, epoch, config['train']['save_dir'])
             
-            save_dict = {'model': model.module.state_dict(), 'epoch': epoch, 'config': config}
+            # When saving, we get the state_dict from the DDP-wrapped model
+            save_dict = {'model': model.state_dict(), 'epoch': epoch, 'config': config}
             torch.save(save_dict, os.path.join(config['train']['save_dir'], "checkpoint_translator_last.pth"))
             if (epoch + 1) % config['train']['save_freq'] == 0:
                 torch.save(save_dict, os.path.join(config['train']['save_dir'], f"checkpoint_translator_{epoch}.pth"))
