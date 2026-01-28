@@ -11,7 +11,7 @@ from model import CWT_MAE_RoPE, cwt_wrap
 #    核心思想：使用可学习的 Query 去"查询"信号特征，模拟分步推理
 # ===================================================================
 class LatentReasoningHead(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_classes, num_reasoning_tokens=8, dropout=0.1):
+    def __init__(self, embed_dim, num_heads, num_classes, num_reasoning_tokens=32, dropout=0.1):
         super().__init__()
         self.num_reasoning_tokens = num_reasoning_tokens
         self.embed_dim = embed_dim
