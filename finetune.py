@@ -7,7 +7,8 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+# 【修改 1】引入 classification_report
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report
 from tqdm import tqdm
 import torch.nn.functional as F
 import numpy as np
@@ -150,7 +151,6 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
     local_labels = []
     local_probs = []
     
-    # 验证时通常不需要 scaler，但保持类型一致
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     iterator = tqdm(loader, desc="Validating") if is_main_process() else loader
@@ -170,8 +170,6 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
                 total_loss += loss.item()
             count += 1
             
-            # 【修复 1】强制将 logits 转为 float32 再做 Softmax
-            # 避免 bfloat16 导致的概率和不为 1 的问题
             probs = F.softmax(logits.float(), dim=1)
             
             local_labels.append(y)
@@ -196,25 +194,18 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_labels_np = all_labels.cpu().numpy()
         all_probs_np = all_probs.cpu().numpy()
 
-        # 【修复 2】手动再次归一化，满足 sklearn 的严格检查
-        # 即使是 float32，有时也会出现 1.0000001 的情况
+        # 归一化
         row_sums = all_probs_np.sum(axis=1, keepdims=True)
-        # 防止极少数情况下的除以0（虽然 softmax 不会产生0）
         row_sums[row_sums == 0] = 1.0 
         all_probs_np = all_probs_np / row_sums
 
-        # 计算指标
+        # 计算基础指标
         try:
             if num_classes == 2:
-                # 二分类：取第二列概率
                 auroc = roc_auc_score(all_labels_np, all_probs_np[:, 1])
             else:
-                # 多分类：One-vs-Rest
                 auroc = roc_auc_score(all_labels_np, all_probs_np, multi_class='ovr', average='macro')
-        except Exception as e:
-            print(f"\n[AUC Error] Calculation failed: {e}")
-            # 打印部分数据帮助调试
-            print(f"  - Row sums sample (first 5): {all_probs_np[:5].sum(axis=1)}")
+        except Exception:
             auroc = 0.0
 
         final_preds = np.argmax(all_probs_np, axis=1)
@@ -223,10 +214,16 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         precision = precision_score(all_labels_np, final_preds, average='macro', zero_division=0)
         recall = recall_score(all_labels_np, final_preds, average='macro', zero_division=0)
         
+        # 【新增】生成详细分类报告 (digits=4 保留4位小数，与您图片一致)
+        report_str = classification_report(all_labels_np, final_preds, digits=4)
+        
         avg_loss = total_loss / count
-        return avg_loss, final_acc, precision, recall, final_f1, auroc
+        # 【修改】返回值增加 report_str
+        return avg_loss, final_acc, precision, recall, final_f1, auroc, report_str
     else:
-        return 0, 0, 0, 0, 0, 0
+        # 【修改】非主进程返回 None
+        return 0, 0, 0, 0, 0, 0, None
+
 # -------------------------------------------------------------------
 # 主函数
 # -------------------------------------------------------------------
@@ -266,7 +263,7 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
 
-    # Dataset 初始化 (传入 num_classes)
+    # Dataset 初始化
     train_ds = DownstreamClassificationDataset(
         args.data_root, args.split_file, mode='train', 
         signal_len=args.signal_len, num_classes=args.num_classes
@@ -276,7 +273,6 @@ def main():
         signal_len=args.signal_len, num_classes=args.num_classes
     )
 
-    # 获取验证集真实长度
     val_dataset_len = len(val_ds)
 
     if args.clean_indices_path and os.path.exists(args.clean_indices_path):
@@ -292,7 +288,6 @@ def main():
         clean_test_indices = np.load(args.clean_test_indices_path)
         clean_test_indices = clean_test_indices[clean_test_indices < len(val_ds)]
         val_ds = Subset(val_ds, clean_test_indices)
-        # 更新长度
         val_dataset_len = len(val_ds)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
@@ -333,24 +328,29 @@ def main():
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch, use_amp=True)
 
-        # 传入 val_dataset_len
-        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc = validate(
-            model, val_loader, criterion, device, args.num_classes, 
-            total_len=val_dataset_len, 
-            use_amp=True
+        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report = validate(
+        model, val_loader, criterion, device, args.num_classes, 
+        total_len=val_dataset_len, 
+        use_amp=True
         )
 
         if is_main_process():
             print(f"Train Loss: {train_loss:.4f}")
-            print(f"Val   Loss: {val_loss:.4f}   | Acc: {val_acc:.4f}")
-            print(f"      F1  : {val_f1:.4f}     | AUC: {val_auc:.4f}")
+            print(f"Val   Loss: {val_loss:.4f}")
+            print("-" * 60)
+            print(f"最终测试集准确率 (Accuracy): {val_acc:.4f}")
+            print(f"AUC Score: {val_auc:.4f}")
+            print("-" * 60)
+            print("最终测试集分类报告 (Classification Report):")
+            print(val_report)  # 这里打印详细的表格
+            print("-" * 60)
 
-            metric_to_track = val_f1 if args.num_classes > 2 else val_auc
-            
-            if metric_to_track > best_metric:
-                best_metric = metric_to_track
-                torch.save(model.module.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
-                print(f">>> Best model saved! (Metric: {best_metric:.4f})")
+        metric_to_track = val_f1 if args.num_classes > 2 else val_auc
+        
+        if metric_to_track > best_metric:
+            best_metric = metric_to_track
+            torch.save(model.module.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
+            print(f">>> Best model saved! (Metric: {best_metric:.4f})")
     
     cleanup_distributed()
 
