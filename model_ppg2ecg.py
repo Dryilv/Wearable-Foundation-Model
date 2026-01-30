@@ -649,12 +649,10 @@ class LatentDiffusion1D(nn.Module):
                  time_emb_dim=256, hidden_dim=128, num_groups=8):
         super().__init__()
         
-        # 输入通道 = ECG Latent (D) + PPG Latent (D)
-        # 注意：这里假设 MAE 的 embed_dim 和 decoder_embed_dim 是我们需要的通道数
-        # 如果你的 MAE encoder 和 decoder embed_dim 不同，需要调整
-        # 这里我们使用 decoder_embed_dim 作为 Diffusion Model 的通道数
-        in_channels = mae_decoder_embed_dim * 2 # PPG latent + ECG latent
-        out_channels = mae_decoder_embed_dim # 预测的噪声通道数
+        # 关键修改：使用 mae_embed_dim 而不是 mae_decoder_embed_dim
+        # 因为在训练时，我们从 encode 方法得到的是 embed_dim 维度
+        in_channels = mae_embed_dim * 2  # 从 decoder_embed_dim 改为 embed_dim
+        out_channels = mae_embed_dim     # 从 decoder_embed_dim 改为 embed_dim
         
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
@@ -663,20 +661,15 @@ class LatentDiffusion1D(nn.Module):
             nn.Linear(time_emb_dim * 4, time_emb_dim * 4),
         )
 
-        # U-Net Structure
-        # Downsampling Path
+        # U-Net Structure - 更新通道数
         self.down1 = ResidualBlock1D(in_channels, hidden_dim, time_emb_dim * 4, groups=num_groups)
         self.down2 = ResidualBlock1D(hidden_dim, hidden_dim * 2, time_emb_dim * 4, groups=num_groups)
         
-        # Bottleneck
         self.mid = ResidualBlock1D(hidden_dim * 2, hidden_dim * 2, time_emb_dim * 4, groups=num_groups)
         
-        # Upsampling Path
-        # Skip connections concatenate features, so input channels increase
-        self.up1 = ResidualBlock1D(hidden_dim * 2 + hidden_dim * 2, hidden_dim, time_emb_dim * 4, groups=num_groups) 
-        self.up2 = ResidualBlock1D(hidden_dim + in_channels, out_channels, time_emb_dim * 4, groups=num_groups) 
+        self.up1 = ResidualBlock1D(hidden_dim * 2 + hidden_dim * 2, hidden_dim, time_emb_dim * 4, groups=num_groups)
+        self.up2 = ResidualBlock1D(hidden_dim + in_channels, out_channels, time_emb_dim * 4, groups=num_groups)
         
-        # Final layer to predict noise
         self.final_conv = nn.Conv1d(out_channels, out_channels, kernel_size=1)
 
     def forward(self, x, cond, t):
