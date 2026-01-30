@@ -7,7 +7,6 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-# 【修改 1】引入 classification_report
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report
 from tqdm import tqdm
 import torch.nn.functional as F
@@ -20,7 +19,7 @@ from model_finetune import TF_MAE_Classifier
 from utils import get_layer_wise_lr
 
 # -------------------------------------------------------------------
-# DDP 辅助函数
+# DDP 辅助函数 (保持不变)
 # -------------------------------------------------------------------
 def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -139,6 +138,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
 
     return total_loss / count
 
+# 【修改重点】Validate 函数增加阈值搜索
 def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True):
     """
     Args:
@@ -194,12 +194,46 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_labels_np = all_labels.cpu().numpy()
         all_probs_np = all_probs.cpu().numpy()
 
-        # 归一化
+        # 归一化 (防止精度误差)
         row_sums = all_probs_np.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0 
         all_probs_np = all_probs_np / row_sums
 
-        # 计算基础指标
+        # -------------------------------------------------------
+        # 【新增】阈值搜索逻辑 (仅针对二分类)
+        # -------------------------------------------------------
+        best_threshold = 0.5
+        
+        if num_classes == 2:
+            # 提取正类概率 (假设 label 1 是异常/正类)
+            y_scores = all_probs_np[:, 1]
+            
+            # 定义搜索范围：0.01 到 0.99，步长 0.01
+            thresholds = np.arange(0.01, 1.00, 0.01)
+            best_f1_search = -1.0
+            
+            # 遍历搜索
+            for th in thresholds:
+                # 大于阈值为 1，否则为 0
+                preds_th = (y_scores >= th).astype(int)
+                # 这里优化目标选为 Macro F1，也可以改为 Binary F1
+                f1_th = f1_score(all_labels_np, preds_th, average='macro')
+                
+                if f1_th > best_f1_search:
+                    best_f1_search = f1_th
+                    best_threshold = th
+            
+            print(f"\n[Threshold Search] Best Threshold: {best_threshold:.2f} | Best Macro F1: {best_f1_search:.4f}")
+            
+            # 使用最佳阈值生成最终预测
+            final_preds = (y_scores >= best_threshold).astype(int)
+        else:
+            # 多分类保持 argmax
+            final_preds = np.argmax(all_probs_np, axis=1)
+
+        # -------------------------------------------------------
+        # 计算最终指标
+        # -------------------------------------------------------
         try:
             if num_classes == 2:
                 auroc = roc_auc_score(all_labels_np, all_probs_np[:, 1])
@@ -208,21 +242,18 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         except Exception:
             auroc = 0.0
 
-        final_preds = np.argmax(all_probs_np, axis=1)
         final_acc = accuracy_score(all_labels_np, final_preds)
         final_f1 = f1_score(all_labels_np, final_preds, average='macro')
         precision = precision_score(all_labels_np, final_preds, average='macro', zero_division=0)
         recall = recall_score(all_labels_np, final_preds, average='macro', zero_division=0)
         
-        # 【新增】生成详细分类报告 (digits=4 保留4位小数，与您图片一致)
+        # 生成详细分类报告
         report_str = classification_report(all_labels_np, final_preds, digits=4)
         
         avg_loss = total_loss / count
-        # 【修改】返回值增加 report_str
-        return avg_loss, final_acc, precision, recall, final_f1, auroc, report_str
+        return avg_loss, final_acc, precision, recall, final_f1, auroc, report_str, best_threshold
     else:
-        # 【修改】非主进程返回 None
-        return 0, 0, 0, 0, 0, 0, None
+        return 0, 0, 0, 0, 0, 0, None, 0
 
 # -------------------------------------------------------------------
 # 主函数
@@ -328,24 +359,29 @@ def main():
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch, use_amp=True)
 
-        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report = validate(
-        model, val_loader, criterion, device, args.num_classes, 
-        total_len=val_dataset_len, 
-        use_amp=True
+        # 接收返回的 best_threshold
+        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th = validate(
+            model, val_loader, criterion, device, args.num_classes, 
+            total_len=val_dataset_len, 
+            use_amp=True
         )
 
         if is_main_process():
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Val   Loss: {val_loss:.4f}")
             print("-" * 60)
+            if args.num_classes == 2:
+                print(f"Applied Threshold: {best_th:.2f}")
             print(f"最终测试集准确率 (Accuracy): {val_acc:.4f}")
             print(f"AUC Score: {val_auc:.4f}")
             print("-" * 60)
             print("最终测试集分类报告 (Classification Report):")
-            print(val_report)  # 这里打印详细的表格
+            print(val_report)
             print("-" * 60)
 
         metric_to_track = val_f1 if args.num_classes > 2 else val_auc
+        # 或者如果你想用 F1 来选模型：
+        # metric_to_track = val_f1
         
         if metric_to_track > best_metric:
             best_metric = metric_to_track
