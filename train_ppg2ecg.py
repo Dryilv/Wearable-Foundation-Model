@@ -3,8 +3,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 # 假设 model.py 和 dataset.py 在同一目录下
-from model import CWT_MAE_RoPE, FrozenMAEWrapper, LatentDiffusion1D, get_diffusion_params, train_diffusion_model
-from dataset import PairedPhysioDataset
+from model_ppg2ecg import CWT_MAE_RoPE, FrozenMAEWrapper, LatentDiffusion1D, get_diffusion_params, train_diffusion_model
+from dataset_paired import PairedPhysioDataset
 
 # --- Configuration ---
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
