@@ -18,8 +18,8 @@ DATA_INDEX_FILE = '/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/Shared
 SIGNAL_LEN = 3000
 ROW_PPG = 4  # Index for PPG signal in the pickle file
 ROW_ECG = 0  # Index for ECG signal in the pickle file
-BATCH_SIZE = 64 # Adjust based on your GPU memory
-NUM_WORKERS = 4 # Adjust based on your CPU cores
+BATCH_SIZE = 256 # Adjust based on your GPU memory
+NUM_WORKERS = 8 # Adjust based on your CPU cores
 
 # Diffusion Model Configuration
 NUM_TIMESTEPS = 1000
