@@ -112,7 +112,7 @@ def plot_cdf(data1, data2, label1="Class 0", label2="Class 1"):
     plt.ylabel('Probability')
     plt.legend()
     plt.grid(True)
-    plt.show()
+    plt.savefig("1.png")
 
 # ================= 主程序 =================
 if __name__ == "__main__":
