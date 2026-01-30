@@ -1,3 +1,5 @@
+# --- START OF FILE finetune.py ---
+
 import os
 import argparse
 import torch
@@ -15,12 +17,13 @@ import numpy as np
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast 
 
+# 确保 dataset_cls.py 和 model_finetune.py 在同一目录
 from dataset_cls import DownstreamClassificationDataset
 from model_finetune import TF_MAE_Classifier
 from utils import get_layer_wise_lr
 
 # -------------------------------------------------------------------
-# DDP 辅助函数
+# DDP 辅助函数 (保持不变)
 # -------------------------------------------------------------------
 def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -75,7 +78,7 @@ def gather_tensors(tensor, device):
     return torch.cat(output)
 
 # -------------------------------------------------------------------
-# 训练与验证逻辑
+# 训练与验证逻辑 (保持不变)
 # -------------------------------------------------------------------
 def mixup_data(x, y, alpha=1.0, device='cuda'):
     if alpha > 0:
@@ -139,11 +142,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
 
     return total_loss / count
 
+# -------------------------------------------------------------------
+# 【修改 2】验证逻辑增加 classification_report
+# -------------------------------------------------------------------
 def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True):
-    """
-    Args:
-        total_len: 验证集真实长度，用于去除 DDP padding
-    """
     model.eval()
     total_loss = 0
     count = 0
@@ -186,7 +188,6 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_probs = local_probs
 
     if is_main_process():
-        # 截断多余的 Padding 数据
         if len(all_labels) > total_len:
             all_labels = all_labels[:total_len]
             all_probs = all_probs[:total_len]
@@ -194,17 +195,12 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_labels_np = all_labels.cpu().numpy()
         all_probs_np = all_probs.cpu().numpy()
 
-        # 归一化
         row_sums = all_probs_np.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0 
         all_probs_np = all_probs_np / row_sums
 
-        # 计算基础指标
         try:
-            if num_classes == 2:
-                auroc = roc_auc_score(all_labels_np, all_probs_np[:, 1])
-            else:
-                auroc = roc_auc_score(all_labels_np, all_probs_np, multi_class='ovr', average='macro')
+            auroc = roc_auc_score(all_labels_np, all_probs_np[:, 1]) if num_classes == 2 else roc_auc_score(all_labels_np, all_probs_np, multi_class='ovr', average='macro')
         except Exception:
             auroc = 0.0
 
@@ -214,7 +210,7 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         precision = precision_score(all_labels_np, final_preds, average='macro', zero_division=0)
         recall = recall_score(all_labels_np, final_preds, average='macro', zero_division=0)
         
-        # 【新增】生成详细分类报告 (digits=4 保留4位小数，与您图片一致)
+        # 【新增】生成详细分类报告
         report_str = classification_report(all_labels_np, final_preds, digits=4)
         
         avg_loss = total_loss / count
@@ -225,16 +221,16 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         return 0, 0, 0, 0, 0, 0, None
 
 # -------------------------------------------------------------------
-# 主函数
+# 主函数 (保持不变)
 # -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--split_file', type=str, required=True)
     parser.add_argument('--pretrained_path', type=str, default=None)
-    parser.add_argument('--save_dir', type=str, default="./checkpoints_cls768")
+    parser.add_argument('--save_dir', type=str, default="./checkpoints_cls_dual_stream")
     
-    parser.add_argument('--num_classes', type=int, default=2, help="2 for binary (Normal vs Abnormal), 6 for multi-class")
+    parser.add_argument('--num_classes', type=int, default=2)
     parser.add_argument('--signal_len', type=int, default=1000)
 
     parser.add_argument('--batch_size', type=int, default=32)
@@ -249,9 +245,9 @@ def main():
     parser.add_argument('--cwt_scales', type=int, default=64)
     parser.add_argument('--patch_size_time', type=int, default=50)
     parser.add_argument('--patch_size_freq', type=int, default=4)
-    
     parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
 
+    # 数据清洗相关参数
     parser.add_argument('--clean_indices_path', type=str, default=None)
     parser.add_argument('--clean_test_indices_path', type=str, default=None)
     args = parser.parse_args()
@@ -263,31 +259,19 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
 
-    # Dataset 初始化
-    train_ds = DownstreamClassificationDataset(
-        args.data_root, args.split_file, mode='train', 
-        signal_len=args.signal_len, num_classes=args.num_classes
-    )
-    val_ds = DownstreamClassificationDataset(
-        args.data_root, args.split_file, mode='test', 
-        signal_len=args.signal_len, num_classes=args.num_classes
-    )
-
+    train_ds = DownstreamClassificationDataset(args.data_root, args.split_file, mode='train', signal_len=args.signal_len, num_classes=args.num_classes)
+    val_ds = DownstreamClassificationDataset(args.data_root, args.split_file, mode='test', signal_len=args.signal_len, num_classes=args.num_classes)
     val_dataset_len = len(val_ds)
 
     if args.clean_indices_path and os.path.exists(args.clean_indices_path):
-        if is_main_process():
-            print(f"\n[Data Cleaning] Loading clean indices from {args.clean_indices_path}...")
+        if is_main_process(): print(f"\n[Data Cleaning] Loading clean indices from {args.clean_indices_path}...")
         clean_indices = np.load(args.clean_indices_path)
-        clean_indices = clean_indices[clean_indices < len(train_ds)]
-        train_ds = Subset(train_ds, clean_indices)
+        train_ds = Subset(train_ds, clean_indices[clean_indices < len(train_ds)])
         
     if args.clean_test_indices_path and os.path.exists(args.clean_test_indices_path):
-        if is_main_process():
-            print(f"\n[Test Cleaning] Loading indices from {args.clean_test_indices_path}...")
+        if is_main_process(): print(f"\n[Test Cleaning] Loading indices from {args.clean_test_indices_path}...")
         clean_test_indices = np.load(args.clean_test_indices_path)
-        clean_test_indices = clean_test_indices[clean_test_indices < len(val_ds)]
-        val_ds = Subset(val_ds, clean_test_indices)
+        val_ds = Subset(val_ds, clean_test_indices[clean_test_indices < len(val_ds)])
         val_dataset_len = len(val_ds)
 
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
@@ -296,22 +280,15 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, sampler=val_sampler, num_workers=4, pin_memory=True)
 
-    if is_main_process():
-        print(f"Initializing CWT-MAE Classifier (RoPE + Tensorized)...")
+    if is_main_process(): print(f"Initializing Dual-Stream CWT-MAE Classifier...")
         
     model = TF_MAE_Classifier(
-        pretrained_path=args.pretrained_path,
-        num_classes=args.num_classes,
-        signal_len=args.signal_len,
-        cwt_scales=args.cwt_scales,
-        patch_size_time=args.patch_size_time,
-        patch_size_freq=args.patch_size_freq,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
+        pretrained_path=args.pretrained_path, num_classes=args.num_classes,
+        signal_len=args.signal_len, cwt_scales=args.cwt_scales,
+        patch_size_time=args.patch_size_time, patch_size_freq=args.patch_size_freq,
+        embed_dim=args.embed_dim, depth=args.depth, num_heads=args.num_heads,
         mlp_rank_ratio=args.mlp_rank_ratio
-    )
-    model.to(device)
+    ).to(device)
     
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
@@ -322,35 +299,33 @@ def main():
     best_metric = 0.0
 
     for epoch in range(args.epochs):
-        if is_main_process():
-            print(f"\nEpoch {epoch+1}/{args.epochs}")
+        if is_main_process(): print(f"\nEpoch {epoch+1}/{args.epochs}")
 
-        train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, use_amp=True)
-
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, use_amp=True)
+        
+        # 【修改 3】接收并打印 classification_report
         val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report = validate(
-        model, val_loader, criterion, device, args.num_classes, 
-        total_len=val_dataset_len, 
-        use_amp=True
+            model, val_loader, criterion, device, args.num_classes, 
+            total_len=val_dataset_len, use_amp=True
         )
 
         if is_main_process():
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Val   Loss: {val_loss:.4f}")
             print("-" * 60)
-            print(f"最终测试集准确率 (Accuracy): {val_acc:.4f}")
-            print(f"AUC Score: {val_auc:.4f}")
+            print(f"Accuracy: {val_acc:.4f} | AUC: {val_auc:.4f} | F1 (macro): {val_f1:.4f}")
             print("-" * 60)
-            print("最终测试集分类报告 (Classification Report):")
-            print(val_report)  # 这里打印详细的表格
+            print("Classification Report:")
+            print(val_report) # 这里打印详细的表格
             print("-" * 60)
 
-        metric_to_track = val_f1 if args.num_classes > 2 else val_auc
-        
-        if metric_to_track > best_metric:
-            best_metric = metric_to_track
-            torch.save(model.module.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
-            print(f">>> Best model saved! (Metric: {best_metric:.4f})")
+            metric_to_track = val_f1 if args.num_classes > 2 else val_auc
+            
+            if metric_to_track > best_metric:
+                best_metric = metric_to_track
+                save_path = os.path.join(args.save_dir, "best_model.pth")
+                torch.save(model.module.state_dict(), save_path)
+                print(f">>> Best model saved to {save_path}! (Metric: {best_metric:.4f})")
     
     cleanup_distributed()
 

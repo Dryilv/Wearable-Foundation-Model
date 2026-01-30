@@ -204,7 +204,7 @@ def run_arrhythmia_baseline(data_dir, split_file):
                                scoring='f1_macro', 
                                cv=3, 
                                n_jobs=-1, 
-                               verbose=1)
+                               verbose=2)
     
     print("\n开始训练与超参数搜索...")
     grid_search.fit(X_train, y_train)
