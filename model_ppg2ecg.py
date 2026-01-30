@@ -720,7 +720,7 @@ class LatentDiffusion1D(nn.Module):
 def extract(a, t, x_shape):
     """Extract coefficients and reshape to match input shape."""
     batch_size = t.shape[0]
-    out = a.gather(-1, t.cpu())
+    out = a.gather(-1, t)  # Removed .cpu() - keep on same device
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
 
 def get_diffusion_params(num_timesteps=1000, beta_start=0.0001, beta_end=0.02, device='cuda'):
