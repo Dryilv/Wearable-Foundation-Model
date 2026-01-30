@@ -10,7 +10,10 @@ class PairedPhysioDataset(Dataset):
     def __init__(self, index_file, signal_len=3000, mode='train', 
                  row_ppg=4, row_ecg=0,  # 指定 PPG 和 ECG 的行号
                  min_std_threshold=1e-4,
-                 max_std_threshold=5000.0 
+                 max_std_threshold=5000.0,
+                 use_ratio=0.1,  # 新参数：使用数据的比例 (0.0-1.0)
+                 max_samples=None,  # 新参数：最大样本数（优先级高于use_ratio）
+                 random_seed=42  # 新参数：随机种子，确保可重复性
                  ):
         self.signal_len = signal_len
         self.mode = mode
@@ -26,15 +29,67 @@ class PairedPhysioDataset(Dataset):
         with open(index_file, 'r') as f:
             self.index_data = json.load(f)
         
-        # 过滤逻辑：这里假设 index_data 里的每个文件都包含所需的 PPG 和 ECG 行
-        # 如果你的 index_data 是按单行索引的，这里可能需要去重，只保留文件路径
-        # 为了简单起见，我们假设 index_data 里的每一项代表一个可用的记录文件
-        print(f"Loaded {len(self.index_data)} samples.")
+        # 保存原始数据量
+        self.original_size = len(self.index_data)
+        print(f"Loaded {self.original_size} samples.")
+        
+        # 根据参数限制数据量
+        self.index_data = self._limit_data_size(
+            self.index_data, 
+            use_ratio, 
+            max_samples, 
+            random_seed
+        )
+        
+        # 记录实际使用的数据量
+        self.actual_size = len(self.index_data)
+        print(f"Using {self.actual_size} samples ({(self.actual_size/self.original_size)*100:.1f}% of total).")
+        
+        # 设置随机种子
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+        
+        # 用于记录已使用样本的集合（可选，用于调试）
+        self.used_samples = set()
+
+    def _limit_data_size(self, index_data, use_ratio, max_samples, random_seed):
+        """
+        根据参数限制数据量
+        """
+        # 先复制一份，避免修改原始数据
+        limited_data = index_data.copy()
+        
+        # 随机打乱，确保随机性但可重复
+        random.seed(random_seed)
+        random.shuffle(limited_data)
+        
+        # 计算实际使用的样本数
+        if max_samples is not None:
+            # 使用 max_samples 参数
+            actual_samples = min(len(limited_data), max_samples)
+        elif use_ratio < 1.0:
+            # 使用 use_ratio 参数
+            actual_samples = int(len(limited_data) * use_ratio)
+        else:
+            # 使用全部数据
+            actual_samples = len(limited_data)
+        
+        # 截取前 actual_samples 个样本
+        limited_data = limited_data[:actual_samples]
+        
+        # 再次随机打乱，避免潜在的顺序偏差
+        random.shuffle(limited_data)
+        
+        return limited_data
 
     def __len__(self):
         return len(self.index_data)
 
     def __getitem__(self, idx):
+        # 记录已使用的样本（用于调试）
+        if idx not in self.used_samples:
+            self.used_samples.add(idx)
+        
         # 重试机制
         for _ in range(3):
             try:
@@ -54,6 +109,7 @@ class PairedPhysioDataset(Dataset):
                 # 1. 检查 NaN / Inf (任意一个坏了都要换)
                 if (np.isnan(raw_ppg).any() or np.isinf(raw_ppg).any() or 
                     np.isnan(raw_ecg).any() or np.isinf(raw_ecg).any()):
+                    # 在当前数据集中随机选择另一个样本
                     idx = random.randint(0, len(self.index_data) - 1)
                     continue
 
@@ -66,6 +122,7 @@ class PairedPhysioDataset(Dataset):
                 
                 if (std_ppg < self.min_std_threshold or std_ppg > self.max_std_threshold or
                     std_ecg < self.min_std_threshold or std_ecg > self.max_std_threshold):
+                    # 在当前数据集中随机选择另一个样本
                     idx = random.randint(0, len(self.index_data) - 1)
                     continue
                 
@@ -81,7 +138,9 @@ class PairedPhysioDataset(Dataset):
                 return ppg_tensor, ecg_tensor
 
             except Exception as e:
-                # print(f"Error loading {file_path}: {e}")
+                # 打印错误信息用于调试
+                print(f"Error loading {file_path}: {e}")
+                # 在当前数据集中随机选择另一个样本
                 idx = random.randint(0, len(self.index_data) - 1)
                 continue
         
@@ -114,3 +173,14 @@ class PairedPhysioDataset(Dataset):
             ppg_pad = np.pad(ppg, (0, pad_len), 'constant', constant_values=0)
             ecg_pad = np.pad(ecg, (0, pad_len), 'constant', constant_values=0)
             return ppg_pad, ecg_pad
+
+    def get_data_stats(self):
+        """
+        返回数据集的统计信息
+        """
+        return {
+            "original_size": self.original_size,
+            "actual_size": self.actual_size,
+            "use_percentage": (self.actual_size / self.original_size) * 100,
+            "used_samples_count": len(self.used_samples)
+        }
