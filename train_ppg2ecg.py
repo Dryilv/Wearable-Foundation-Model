@@ -1,11 +1,10 @@
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm  # 导入tqdm
 
 # 假设 model.py 和 dataset.py 在同一目录下
-from model_ppg2ecg import CWT_MAE_RoPE, FrozenMAEWrapper, LatentDiffusion1D, get_diffusion_params, train_diffusion_model
-from dataset_paired import PairedPhysioDataset
+from model import CWT_MAE_RoPE, FrozenMAEWrapper, LatentDiffusion1D, get_diffusion_params, train_diffusion_model
+from dataset import PairedPhysioDataset
 
 # --- Configuration ---
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -101,113 +100,9 @@ train_loader = DataLoader(
     drop_last=True # Drop last batch if it's smaller than batch_size
 )
 
-# --- 修改train_diffusion_model函数以包含tqdm进度条 ---
-# 如果train_diffusion_model函数来自model_ppg2ecg，您需要在该文件中修改函数
-# 或者在这里重新定义它：
-
-def train_diffusion_model_with_tqdm(
-    mae_wrapper,
-    diffusion_model,
-    train_loader,
-    optimizer,
-    num_timesteps,
-    betas,
-    alphas_cumprod,
-    device,
-    epochs
-):
-    """训练扩散模型，带有tqdm进度条"""
-    diffusion_model.train()
-    
-    # 保存损失历史
-    loss_history = []
-    
-    for epoch in range(epochs):
-        # 初始化epoch的进度条
-        epoch_pbar = tqdm(
-            enumerate(train_loader), 
-            total=len(train_loader), 
-            desc=f'Epoch {epoch+1}/{epochs}',
-            leave=True
-        )
-        
-        epoch_loss = 0.0
-        
-        for batch_idx, (ppg_signals, ecg_signals) in epoch_pbar:
-            # 移动数据到设备
-            ppg_signals = ppg_signals.to(device)
-            ecg_signals = ecg_signals.to(device)
-            
-            # 获取ECG的潜在表示
-            with torch.no_grad():
-                ecg_latents = mae_wrapper.get_latent_representation(ecg_signals)
-            
-            # 准备训练扩散模型
-            batch_size = ecg_latents.size(0)
-            
-            # 随机选择时间步
-            t = torch.randint(0, num_timesteps, (batch_size,), device=device).long()
-            
-            # 生成噪声
-            noise = torch.randn_like(ecg_latents)
-            
-            # 计算带噪声的潜在表示
-            sqrt_alpha_cumprod_t = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1)
-            sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alphas_cumprod[t]).view(-1, 1, 1)
-            noisy_latents = sqrt_alpha_cumprod_t * ecg_latents + sqrt_one_minus_alpha_cumprod_t * noise
-            
-            # 获取PPG条件信息
-            with torch.no_grad():
-                ppg_condition = mae_wrapper.get_ppg_condition(ppg_signals)
-            
-            # 预测噪声
-            predicted_noise = diffusion_model(
-                x=noisy_latents, 
-                time=t, 
-                condition=ppg_condition
-            )
-            
-            # 计算损失
-            loss = torch.mean((predicted_noise - noise) ** 2)
-            
-            # 反向传播和优化
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # 更新统计信息
-            epoch_loss += loss.item()
-            
-            # 更新进度条描述
-            epoch_pbar.set_postfix({
-                'batch_loss': f'{loss.item():.6f}',
-                'avg_loss': f'{epoch_loss/(batch_idx+1):.6f}'
-            })
-        
-        # 计算epoch平均损失
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        loss_history.append(avg_epoch_loss)
-        
-        # 打印epoch信息
-        print(f'Epoch {epoch+1}/{epochs} completed. Average Loss: {avg_epoch_loss:.6f}')
-        
-        # 每5个epoch保存一次检查点
-        if (epoch + 1) % 5 == 0:
-            checkpoint_path = f'diffusion_checkpoint_epoch_{epoch+1}.pth'
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': diffusion_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_epoch_loss,
-                'loss_history': loss_history
-            }, checkpoint_path)
-            print(f'Checkpoint saved to {checkpoint_path}')
-    
-    return loss_history
-
-# --- Training with tqdm ---
-print("Starting diffusion model training with tqdm progress bars...")
-loss_history = train_diffusion_model_with_tqdm(
+# --- Training ---
+print("Starting diffusion model training...")
+train_diffusion_model(
     mae_wrapper=mae_wrapper,
     diffusion_model=diffusion_model,
     train_loader=train_loader,
@@ -221,25 +116,27 @@ loss_history = train_diffusion_model_with_tqdm(
 
 # --- Save Trained Diffusion Model ---
 # Save the diffusion model weights after training
-diffusion_model_save_path = './ppg2ecg/trained_diffusion_model.pth'
-torch.save({
-    'model_state_dict': diffusion_model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-    'epochs': EPOCHS,
-    'loss_history': loss_history
-}, diffusion_model_save_path)
+diffusion_model_save_path = 'trained_diffusion_model.pth'
+torch.save(diffusion_model.state_dict(), diffusion_model_save_path)
 print(f"Trained diffusion model saved to {diffusion_model_save_path}")
 
-# 绘制训练损失曲线
-try:
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(loss_history) + 1), loss_history, 'b-', linewidth=2)
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Diffusion Model Training Loss')
-    plt.grid(True, alpha=0.3)
-    plt.savefig('training_loss.png')
-    print("Training loss plot saved as 'training_loss.png'")
-except ImportError:
-    print("Matplotlib not available, skipping loss plot generation")
+# --- Example Inference (Optional) ---
+# Load a sample PPG signal for inference
+# Make sure you have a way to load a single PPG signal for testing
+# For example, load one sample from the dataset or a specific file
+# ppg_sample, _ = train_dataset[0] # Load first sample (PPG only)
+# ppg_sample = ppg_sample.unsqueeze(0).to(DEVICE) # Add batch dimension
+
+# print("\nStarting inference example...")
+# generated_ecg = generate_ecg_from_ppg(
+#     mae_wrapper=mae_wrapper,
+#     diffusion_model=diffusion_model,
+#     ppg_signal=ppg_sample,
+#     num_timesteps=NUM_TIMESTEPS,
+#     betas=betas,
+#     alphas_cumprod=alphas_cumprod,
+#     device=DEVICE
+# )
+
+# print("Inference complete. Generated ECG shape:", generated_ecg.shape)
+# # You can now save or visualize generated_ecg
