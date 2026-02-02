@@ -7,8 +7,8 @@ import math
 from model import CWT_MAE_RoPE, cwt_wrap
 
 # ===================================================================
-# 1. 隐式思维链模块 (Latent Reasoning Head) - 【适配双倍维度】
-#    这个模块基本不变，只是在创建时需要传入 embed_dim * 2
+# 1. 隐式思维链模块 (Latent Reasoning Head)
+#    【改动】支持序列输入 [B, N, D]，保留时间维度信息
 # ===================================================================
 class LatentReasoningHead(nn.Module):
     def __init__(self, embed_dim, num_heads, num_classes, num_reasoning_tokens=32, dropout=0.1):
@@ -16,11 +16,18 @@ class LatentReasoningHead(nn.Module):
         self.num_reasoning_tokens = num_reasoning_tokens
         self.embed_dim = embed_dim
         
+        # 推理 Token (Query)
         self.reasoning_tokens = nn.Parameter(torch.zeros(1, num_reasoning_tokens, embed_dim))
+        
+        # Cross-Attention: Query=Reasoning, Key/Value=Fused_Sequence
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
+        
+        # Self-Attention: 推理 Token 之间的交互
         self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
+        
+        # FFN
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
@@ -28,6 +35,8 @@ class LatentReasoningHead(nn.Module):
             nn.Linear(embed_dim * 4, embed_dim)
         )
         self.norm3 = nn.LayerNorm(embed_dim)
+        
+        # Classifier
         self.classifier = nn.Linear(embed_dim, num_classes)
         
         self._init_weights()
@@ -39,31 +48,33 @@ class LatentReasoningHead(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x_encoder):
-        # 注意：这里的输入 x_encoder 已经是融合后的特征了
-        # 如果使用 CoT，输入应该是 [B, N_fused, D_fused]
-        # 如果是简单的 MLP，输入是 [B, D_fused]
-        # 为了简化，我们先假设输入是 [B, D_fused]，然后通过一个线性层映射回 CoT 的维度
-        
-        # 假设我们对融合后的 CLS token 进行推理
-        # x_encoder shape: [B, embed_dim]
-        
-        # 为了让 CoT 能工作，我们需要一个序列作为 Key 和 Value
-        # 这里我们简单地将融合特征视为一个长度为 1 的序列
-        x_encoder = x_encoder.unsqueeze(1) # -> [B, 1, embed_dim]
-        
+        """
+        Args:
+            x_encoder: 融合后的序列特征 [Batch, N_patches, Fused_Dim]
+        """
         B = x_encoder.shape[0]
-        queries = self.reasoning_tokens.expand(B, -1, -1)
         
+        # 扩展推理 Token 到当前 Batch
+        queries = self.reasoning_tokens.expand(B, -1, -1) # [B, num_reasoning, D]
+        
+        # --- Cross Attention (核心步骤) ---
+        # Query 是推理 Token，Key/Value 是包含时间信息的 PPG+ECG 序列
+        # 模型会自动学习关注序列中的哪些 Patch (时间点) 对诊断最重要
         attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder)
         queries = self.norm1(queries + attn_out)
         
+        # --- Self Attention ---
         attn_out2, _ = self.self_attn(query=queries, key=queries, value=queries)
         queries = self.norm2(queries + attn_out2)
         
+        # --- FFN ---
         queries = self.norm3(queries + self.ffn(queries))
         
+        # --- Classification ---
+        # 对所有推理 Token 取平均，得到最终决策向量
         decision_token = queries.mean(dim=1) 
         logits = self.classifier(decision_token)
+        
         return logits
 
 # ===================================================================
@@ -72,11 +83,10 @@ class LatentReasoningHead(nn.Module):
 class DualEncoder_Classifier(nn.Module):
     def __init__(self, pretrained_path, num_classes, 
                  mlp_rank_ratio=0.5, 
-                 use_cot=False, # 默认使用更简单的 MLP Head
-                 num_reasoning_tokens=8, 
-                 hidden_dim=1024, # 适配双倍输入维度
+                 use_cot=True, # 【建议】开启 CoT 以充分利用时间序列信息
+                 num_reasoning_tokens=16, 
+                 hidden_dim=1024, 
                  dropout_rate=0.2,
-                 num_res_blocks=2,
                  **kwargs):
         super().__init__()
         
@@ -86,7 +96,7 @@ class DualEncoder_Classifier(nn.Module):
         print(">>> Initializing PPG Encoder...")
         self.ppg_encoder = CWT_MAE_RoPE(
             mlp_rank_ratio=mlp_rank_ratio,
-            mask_ratio=0.0, # 微调时关闭 Mask
+            mask_ratio=0.0, 
             **kwargs
         )
         
@@ -94,19 +104,19 @@ class DualEncoder_Classifier(nn.Module):
         print(">>> Initializing ECG Encoder...")
         self.ecg_encoder = CWT_MAE_RoPE(
             mlp_rank_ratio=mlp_rank_ratio,
-            mask_ratio=0.0, # 微调时关闭 Mask
+            mask_ratio=0.0, 
             **kwargs
         )
         
-        # 3. 加载预训练权重到两个 Encoder
+        # 3. 加载预训练权重
         if pretrained_path:
             print("\n--- Loading weights for PPG Encoder ---")
             self._load_and_prepare_encoder(self.ppg_encoder, pretrained_path)
             print("\n--- Loading weights for ECG Encoder ---")
             self._load_and_prepare_encoder(self.ecg_encoder, pretrained_path)
         
-        # 4. 初始化分类头 (Head)
-        fused_dim = self.embed_dim * 2
+        # 4. 初始化分类头
+        fused_dim = self.embed_dim * 2 # 拼接后的维度
         self.use_cot = use_cot
 
         if use_cot:
@@ -133,7 +143,7 @@ class DualEncoder_Classifier(nn.Module):
             self._init_head_weights()
 
     def _delete_decoder_components(self, model):
-        """删除指定模型实例中的 Decoder 部分以节省显存"""
+        """删除 Decoder 以节省显存"""
         del model.decoder_blocks
         del model.decoder_embed
         del model.decoder_pred_spec
@@ -146,7 +156,6 @@ class DualEncoder_Classifier(nn.Module):
             del model.decoder_norm
 
     def _init_head_weights(self):
-        """仅用于 MLP Head 的初始化"""
         for m in self.head.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -156,7 +165,6 @@ class DualEncoder_Classifier(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
 
     def _load_and_prepare_encoder(self, model, path):
-        """加载权重并清理 Decoder 的完整流程"""
         print(f"Loading weights from {path}...")
         checkpoint = torch.load(path, map_location='cpu')
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
@@ -164,16 +172,14 @@ class DualEncoder_Classifier(nn.Module):
         
         encoder_dict = {k: v for k, v in new_state_dict.items() if not any(x in k for x in ["decoder", "mask_token", "time_reducer", "time_pred", "rope_decoder"])}
         
-        # 位置编码插值 (保持不变)
         if hasattr(model, 'pos_embed'):
             self._interpolate_pos_embed(encoder_dict, 'pos_embed', model.pos_embed, model.grid_size)
 
         msg = model.load_state_dict(encoder_dict, strict=False)
-        print(f"Weights loaded. Missing keys (expected decoder keys): {msg.missing_keys}")
+        print(f"Weights loaded. Missing keys: {msg.missing_keys}")
         
-        # 加载完权重后，删除 decoder 组件
         self._delete_decoder_components(model)
-        print("Decoder components removed to save memory.")
+        print("Decoder components removed.")
 
     def _interpolate_pos_embed(self, state_dict, key, new_pos_embed, new_grid_size):
         if key not in state_dict: return
@@ -198,34 +204,43 @@ class DualEncoder_Classifier(nn.Module):
 
     def forward(self, x):
         # x: [B, 2, L] (channel 0: PPG, channel 1: ECG)
-        x_ppg = x[:, 0, :]   # [B, L]
-        x_ecg = x[:, 1, :]   # [B, L]
+        x_ppg = x[:, 0, :].unsqueeze(1)
+        x_ecg = x[:, 1, :].unsqueeze(1)
         
-        # --- 1. CWT & Instance Norm for PPG ---
+        # --- 1. CWT & Instance Norm ---
         imgs_ppg = cwt_wrap(x_ppg.float(), num_scales=self.ppg_encoder.cwt_scales)
         mean_ppg = imgs_ppg.mean(dim=(2, 3), keepdim=True)
         std_ppg = torch.clamp(imgs_ppg.std(dim=(2, 3), keepdim=True), min=1e-5)
         imgs_ppg = (imgs_ppg - mean_ppg) / std_ppg
         
-        # --- 2. CWT & Instance Norm for ECG ---
         imgs_ecg = cwt_wrap(x_ecg.float(), num_scales=self.ecg_encoder.cwt_scales)
         mean_ecg = imgs_ecg.mean(dim=(2, 3), keepdim=True)
         std_ecg = torch.clamp(imgs_ecg.std(dim=(2, 3), keepdim=True), min=1e-5)
         imgs_ecg = (imgs_ecg - mean_ecg) / std_ecg
 
-        # --- 3. Forward Encoders ---
+        # --- 2. Forward Encoders ---
+        # latent shape: [B, N_patches + 1, D]
         latent_ppg, _, _ = self.ppg_encoder.forward_encoder(imgs_ppg)
         latent_ecg, _, _ = self.ecg_encoder.forward_encoder(imgs_ecg)
         
-        # --- 4. Feature Extraction & Fusion ---
-        # 策略：使用每个 encoder 的 CLS token (index 0) 作为该模态的全局特征
-        feat_ppg = latent_ppg[:, 0, :]
-        feat_ecg = latent_ecg[:, 0, :]
+        # --- 3. Feature Fusion (Token-level) ---
+        # 【关键改动】丢弃 CLS token (index 0)，保留所有 Patch tokens
+        # shape: [B, N_patches, D]
+        patches_ppg = latent_ppg[:, 1:, :]
+        patches_ecg = latent_ecg[:, 1:, :]
         
-        # 沿特征维度拼接
-        fused_feat = torch.cat([feat_ppg, feat_ecg], dim=1) # Shape: [B, embed_dim * 2]
+        # 沿特征维度拼接，保留序列长度 N_patches
+        # fused_feat shape: [B, N_patches, D * 2]
+        fused_feat = torch.cat([patches_ppg, patches_ecg], dim=-1) 
         
-        # --- 5. Forward Head ---
-        logits = self.head(fused_feat)
+        # --- 4. Forward Head ---
+        if self.use_cot:
+            # CoT Head 接受序列输入，自动进行 Cross-Attention
+            logits = self.head(fused_feat)
+        else:
+            # MLP Head 只能接受向量，所以需要先做 Global Average Pooling
+            # 这会丢失时间信息，所以推荐使用 CoT
+            global_feat = fused_feat.mean(dim=1) # [B, D*2]
+            logits = self.head(global_feat)
         
         return logits
