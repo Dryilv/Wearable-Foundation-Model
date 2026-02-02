@@ -198,8 +198,8 @@ class DualEncoder_Classifier(nn.Module):
 
     def forward(self, x):
         # x: [B, 2, L] (channel 0: PPG, channel 1: ECG)
-        x_ppg = x[:, 0, :].unsqueeze(1)
-        x_ecg = x[:, 1, :].unsqueeze(1)
+        x_ppg = x[:, 0, :]   # [B, L]
+        x_ecg = x[:, 1, :]   # [B, L]
         
         # --- 1. CWT & Instance Norm for PPG ---
         imgs_ppg = cwt_wrap(x_ppg.float(), num_scales=self.ppg_encoder.cwt_scales)
