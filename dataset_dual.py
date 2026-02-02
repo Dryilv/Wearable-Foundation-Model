@@ -112,6 +112,8 @@ class DualChannelDataset(Dataset):
             clean_ppg = self._ppg_filter(raw_ppg)
             clean_ecg = self._ecg_filter(raw_ecg)
             
+            clean_ppg = np.nan_to_num(clean_ppg, nan=0.0, posinf=0.0, neginf=0.0)
+            clean_ecg = np.nan_to_num(clean_ecg, nan=0.0, posinf=0.0, neginf=0.0)
             # 2. 同步裁剪/填充 (关键步骤，保证对齐)
             processed_ppg, processed_ecg = self._sync_crop_or_pad(clean_ppg, clean_ecg)
             
