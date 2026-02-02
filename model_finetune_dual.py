@@ -204,10 +204,13 @@ class DualEncoder_Classifier(nn.Module):
 
     def forward(self, x):
         # x: [B, 2, L] (channel 0: PPG, channel 1: ECG)
-        x_ppg = x[:, 0, :].unsqueeze(1)
-        x_ecg = x[:, 1, :].unsqueeze(1)
+        
+        # 【修正】不要使用 unsqueeze(1)，cwt_wrap 需要 [Batch, Length] 的 2D 输入
+        x_ppg = x[:, 0, :] # Shape: [B, L]
+        x_ecg = x[:, 1, :] # Shape: [B, L]
         
         # --- 1. CWT & Instance Norm ---
+        # 现在的输入是 2D 的，cwt_wrap 会正常工作并返回 [B, 3, Scales, L]
         imgs_ppg = cwt_wrap(x_ppg.float(), num_scales=self.ppg_encoder.cwt_scales)
         mean_ppg = imgs_ppg.mean(dim=(2, 3), keepdim=True)
         std_ppg = torch.clamp(imgs_ppg.std(dim=(2, 3), keepdim=True), min=1e-5)
@@ -224,7 +227,7 @@ class DualEncoder_Classifier(nn.Module):
         latent_ecg, _, _ = self.ecg_encoder.forward_encoder(imgs_ecg)
         
         # --- 3. Feature Fusion (Token-level) ---
-        # 【关键改动】丢弃 CLS token (index 0)，保留所有 Patch tokens
+        # 丢弃 CLS token (index 0)，保留所有 Patch tokens
         # shape: [B, N_patches, D]
         patches_ppg = latent_ppg[:, 1:, :]
         patches_ecg = latent_ecg[:, 1:, :]
@@ -239,7 +242,6 @@ class DualEncoder_Classifier(nn.Module):
             logits = self.head(fused_feat)
         else:
             # MLP Head 只能接受向量，所以需要先做 Global Average Pooling
-            # 这会丢失时间信息，所以推荐使用 CoT
             global_feat = fused_feat.mean(dim=1) # [B, D*2]
             logits = self.head(global_feat)
         
