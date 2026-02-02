@@ -1,3 +1,4 @@
+
 import os
 import argparse
 import torch
@@ -14,10 +15,10 @@ import numpy as np
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast 
 
-# 【改动】从新的 dataset 和 model 文件导入
-from dataset_dual import DualChannelDataset, collate_fn
-from model_finetune_dual import DualEncoder_Classifier
-from utils import get_layer_wise_lr # 假设这个文件存在且功能正确
+# 【改动】导入 ECG 专用的 Dataset 和 Model
+from dataset_dual import ECGDataset, collate_fn
+from model_finetune_dual import ECG_Classifier
+from utils import get_layer_wise_lr 
 
 # -------------------------------------------------------------------
 # DDP 辅助函数 (保持不变)
@@ -27,7 +28,6 @@ def setup_distributed():
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ["LOCAL_RANK"])
-        
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
         dist.barrier()
@@ -50,32 +50,26 @@ def reduce_tensor(tensor):
     return rt
 
 def gather_tensors(tensor, device):
-    if not dist.is_initialized():
-        return tensor
-    
+    if not dist.is_initialized(): return tensor
     local_size = torch.tensor([tensor.shape[0]], device=device)
     all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
     dist.all_gather(all_sizes, local_size)
     max_size = max([x.item() for x in all_sizes])
-
     size_diff = max_size - local_size.item()
     if size_diff > 0:
         padding = torch.zeros((size_diff, *tensor.shape[1:]), device=device, dtype=tensor.dtype)
         tensor_padded = torch.cat((tensor, padding))
     else:
         tensor_padded = tensor
-
     gathered_tensors = [torch.zeros_like(tensor_padded) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered_tensors, tensor_padded)
-
     output = []
     for i, gathered_tensor in enumerate(gathered_tensors):
         output.append(gathered_tensor[:all_sizes[i].item()])
-    
     return torch.cat(output)
 
 # -------------------------------------------------------------------
-# 训练与验证逻辑 (基本保持不变，Mixup 也能正常工作)
+# 训练与验证逻辑
 # -------------------------------------------------------------------
 def mixup_data(x, y, alpha=1.0, device='cuda'):
     if alpha > 0:
@@ -84,7 +78,6 @@ def mixup_data(x, y, alpha=1.0, device='cuda'):
         lam = 1
     batch_size = x.size(0)
     index = torch.randperm(batch_size).to(device)
-    # Mixup 对多维输入 (B, C, L) 也能正常工作
     mixed_x = lam * x + (1 - lam) * x[index, :]
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
@@ -99,19 +92,15 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
 
     total_loss = 0
     count = 0
-    
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
-
     iterator = tqdm(loader, desc=f"Epoch {epoch} Train") if is_main_process() else loader
     
     for x, y in iterator:
         x, y = x.to(device), y.to(device)
-        
         inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=0.2, device=device)
         
         optimizer.zero_grad()
-        
         with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
             logits = model(inputs)
             loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
@@ -132,11 +121,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
             total_loss += reduced_loss.item()
         else:
             total_loss += loss.item()
-            
         count += 1
-        
-        if is_main_process():
-            iterator.set_postfix({'loss': total_loss / count})
+        if is_main_process(): iterator.set_postfix({'loss': total_loss / count})
 
     return total_loss / count
 
@@ -144,18 +130,14 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
     model.eval()
     total_loss = 0
     count = 0
-    
     local_labels = []
     local_probs = []
-    
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
     iterator = tqdm(loader, desc="Validating") if is_main_process() else loader
 
     with torch.no_grad():
         for x, y in iterator:
             x, y = x.to(device), y.to(device)
-            
             with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 logits = model(x)
                 loss = criterion(logits, y)
@@ -166,9 +148,7 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
             else:
                 total_loss += loss.item()
             count += 1
-            
             probs = F.softmax(logits.float(), dim=1)
-            
             local_labels.append(y)
             local_probs.append(probs) 
 
@@ -189,7 +169,8 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
 
         all_labels_np = all_labels.cpu().numpy()
         all_probs_np = all_probs.cpu().numpy()
-
+        
+        # 归一化概率
         row_sums = all_probs_np.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0 
         all_probs_np = all_probs_np / row_sums
@@ -236,17 +217,16 @@ def main():
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--split_file', type=str, required=True)
     parser.add_argument('--pretrained_path', type=str, default=None)
-    parser.add_argument('--save_dir', type=str, default="./checkpoints_cls_dual") # 【新】修改默认保存目录
+    parser.add_argument('--save_dir', type=str, default="./checkpoints_cls_ecg") # 默认保存目录
     
     parser.add_argument('--num_classes', type=int, default=2)
-    parser.add_argument('--signal_len', type=int, default=3000) # 【新】默认长度改为 3000
-
-    parser.add_argument('--batch_size', type=int, default=16) # 【新】由于模型变大，建议减小 batch size
+    parser.add_argument('--signal_len', type=int, default=3000)
+    parser.add_argument('--batch_size', type=int, default=32) # 单通道显存占用小，可以适当增大 Batch Size
     parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--lr', type=float, default=5e-5) # 【新】微调时建议使用更小的学习率
+    parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=0.05)
 
-    # CWT-MAE 模型参数 (保持不变)
+    # CWT-MAE 模型参数
     parser.add_argument('--embed_dim', type=int, default=768) 
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--num_heads', type=int, default=12)
@@ -255,11 +235,11 @@ def main():
     parser.add_argument('--patch_size_freq', type=int, default=4)
     parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
 
-    # 【新】双编码器分类头参数
-    parser.add_argument('--head_hidden_dim', type=int, default=1024, help="Hidden dimension for the MLP head")
-    parser.add_argument('--head_dropout', type=float, default=0.2, help="Dropout rate for the MLP head")
+    # Head 参数
+    parser.add_argument('--head_hidden_dim', type=int, default=1024)
+    parser.add_argument('--head_dropout', type=float, default=0.2)
 
-    # 数据清洗参数 (保持不变)
+    # 数据清洗参数
     parser.add_argument('--clean_indices_path', type=str, default=None)
     parser.add_argument('--clean_test_indices_path', type=str, default=None)
     args = parser.parse_args()
@@ -271,19 +251,18 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
 
-    # 【改动】使用新的 DualChannelDataset
-    train_ds = DualChannelDataset(
+    # 【改动】使用 ECGDataset
+    train_ds = ECGDataset(
         args.data_root, args.split_file, mode='train', 
         signal_len=args.signal_len, num_classes=args.num_classes
     )
-    val_ds = DualChannelDataset(
+    val_ds = ECGDataset(
         args.data_root, args.split_file, mode='test', 
         signal_len=args.signal_len, num_classes=args.num_classes
     )
 
     val_dataset_len = len(val_ds)
 
-    # 数据清洗逻辑 (保持不变)
     if args.clean_indices_path and os.path.exists(args.clean_indices_path):
         if is_main_process(): print(f"\n[Data Cleaning] Loading clean indices from {args.clean_indices_path}...")
         clean_indices = np.load(args.clean_indices_path)
@@ -300,18 +279,16 @@ def main():
     train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
 
-    # 【改动】在 DataLoader 中使用自定义的 collate_fn
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, sampler=val_sampler, num_workers=4, pin_memory=True, collate_fn=collate_fn)
 
     if is_main_process():
-        print(f"Initializing Dual Encoder Classifier...")
+        print(f"Initializing ECG Classifier...")
         
-    # 【改动】实例化新的 DualEncoder_Classifier 模型
-    model = DualEncoder_Classifier(
+    # 【改动】使用 ECG_Classifier
+    model = ECG_Classifier(
         pretrained_path=args.pretrained_path,
         num_classes=args.num_classes,
-        # Encoder 参数
         signal_len=args.signal_len,
         cwt_scales=args.cwt_scales,
         patch_size_time=args.patch_size_time,
@@ -320,16 +297,14 @@ def main():
         depth=args.depth,
         num_heads=args.num_heads,
         mlp_rank_ratio=args.mlp_rank_ratio,
-        # Head 参数
-        use_cot=False, # 明确使用 MLP Head
+        use_cot=False, 
         hidden_dim=args.head_hidden_dim,
         dropout_rate=args.head_dropout
     )
     model.to(device)
     
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False) # 【新】可以设为 False
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    # 优化器和损失函数 (保持不变)
     param_groups = get_layer_wise_lr(model.module, base_lr=args.lr, layer_decay=0.65)
     optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -355,19 +330,16 @@ def main():
             print("-" * 60)
             if args.num_classes == 2:
                 print(f"Applied Threshold: {best_th:.2f}")
-            print(f"最终测试集准确率 (Accuracy): {val_acc:.4f}")
+            print(f"Accuracy: {val_acc:.4f}")
             print(f"AUC Score: {val_auc:.4f}")
             print("-" * 60)
-            print("最终测试集分类报告 (Classification Report):")
             print(val_report)
             print("-" * 60)
 
-        # 选择 AUC 作为二分类任务的最佳模型保存指标
         metric_to_track = val_auc
         
         if metric_to_track > best_metric:
             best_metric = metric_to_track
-            # 【新】保存模型时，可以加上 metric 分数，方便区分
             save_path = os.path.join(args.save_dir, f"best_model_auc_{best_metric:.4f}.pth")
             torch.save(model.module.state_dict(), save_path)
             print(f">>> Best model saved to {save_path} (Metric: {best_metric:.4f})")
