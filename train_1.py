@@ -388,7 +388,8 @@ def main():
         decoder_num_heads=config['model']['decoder_num_heads'],
         mask_ratio=config['model'].get('mask_ratio', 0.75),
         mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5),
-        time_loss_weight=config['model'].get('time_loss_weight', 1.0)
+        time_loss_weight=config['model'].get('time_loss_weight', 1.0),
+        use_conv_stem=config['model'].get('use_conv_stem', False)
     )
     model.to(device)
 

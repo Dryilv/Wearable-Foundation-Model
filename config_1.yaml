@@ -7,7 +7,7 @@ train:
   # 如果 M 平均为 3-5：
   # - 24G 显存 (3090/4090): 建议 48 - 64
   # - 80G 显存 (A100/H100): 建议 256 - 384
-  batch_size: 768          
+  batch_size: 256          
   
   # 学习率策略
   # Batch Size 较大 (256) 时，LR 可以适当调大
@@ -27,7 +27,7 @@ train:
   # 日志与保存
   log_interval: 50
   save_freq: 5
-  save_dir: "./checkpoint_muti500s"
+  save_dir: "./checkpoint_muti500s_fine"
   
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
@@ -35,9 +35,9 @@ train:
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
-  signal_len: 500         # 5秒 @ 100Hz
+  signal_len: 1000         # 5秒 @ 100Hz
   original_len: 3000      # 原始信号长度 30秒
-  stride: 250             # 滑动步长 2.5秒 (50% 重叠)
+  stride: 500             # 滑动步长 1.0秒 (更细粒度的滑动窗口)
   num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
 
 model:
@@ -45,11 +45,12 @@ model:
   cwt_scales: 64          
   
   # Patch Embedding 配置
-  # Time: 500 / 50 = 10 patches
+  # Time: 500 / 10 = 50 patches (更细的时间分辨率)
   # Freq: 64 / 4 = 16 patches
-  # 单个信号的 Token 数 = 10 * 16 = 160
-  patch_size_time: 50     
+  # 单个信号的 Token 数 = 50 * 16 = 800
+  patch_size_time: 10     
   patch_size_freq: 4      
+  use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
   # --- Transformer Encoder (ViT-Base 规模) ---
   embed_dim: 768          

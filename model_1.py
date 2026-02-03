@@ -125,13 +125,28 @@ class TensorizedLinear(nn.Module):
         return self.u(self.v(x))
 
 class DecomposedPatchEmbed(nn.Module):
-    def __init__(self, img_size=(64, 500), patch_size=(4, 50), in_chans=3, embed_dim=768, norm_layer=None):
+    def __init__(self, img_size=(64, 500), patch_size=(4, 50), in_chans=3, embed_dim=768, norm_layer=None, use_conv_stem=False):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
         self.num_patches = self.grid_size[0] * self.grid_size[1]
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        
+        if use_conv_stem:
+            # 卷积 Stem: 增强局部特征提取
+            # Conv(3x3) -> Conv(3x3) -> Patching
+            self.proj = nn.Sequential(
+                nn.Conv2d(in_chans, embed_dim // 4, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(embed_dim // 4),
+                nn.GELU(),
+                nn.Conv2d(embed_dim // 4, embed_dim // 2, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(embed_dim // 2),
+                nn.GELU(),
+                nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=patch_size, stride=patch_size)
+            )
+        else:
+            self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+            
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
@@ -226,7 +241,8 @@ class CWT_MAE_RoPE(nn.Module):
         mask_ratio=0.75,       
         mlp_rank_ratio=0.5,    
         norm_layer=nn.LayerNorm,
-        time_loss_weight=1.0
+        time_loss_weight=1.0,
+        use_conv_stem=False
     ):
         super().__init__()
         
@@ -241,7 +257,8 @@ class CWT_MAE_RoPE(nn.Module):
             patch_size=(patch_size_freq, patch_size_time),
             in_chans=3,
             embed_dim=embed_dim,
-            norm_layer=norm_layer
+            norm_layer=norm_layer,
+            use_conv_stem=use_conv_stem
         )
         self.num_patches = self.patch_embed.num_patches
         self.grid_size = self.patch_embed.grid_size 
