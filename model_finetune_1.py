@@ -99,6 +99,10 @@ class TF_MAE_Classifier(nn.Module):
         
         self.train_signal_len = train_signal_len
         
+        # Ensure signal_len is not passed twice
+        if 'signal_len' in kwargs:
+            kwargs.pop('signal_len')
+
         # 1. 初始化 Encoder (CWT-MAE-RoPE)
         self.encoder_model = CWT_MAE_RoPE(
             mlp_rank_ratio=mlp_rank_ratio,
