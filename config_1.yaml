@@ -48,7 +48,7 @@ model:
   # Time: 500 / 10 = 50 patches (更细的时间分辨率)
   # Freq: 64 / 4 = 16 patches
   # 单个信号的 Token 数 = 50 * 16 = 800
-  patch_size_time: 10     
+  patch_size_time: 25     
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
