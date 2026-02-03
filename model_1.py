@@ -435,13 +435,15 @@ class CWT_MAE_RoPE(nn.Module):
         
         # 1. CWT & Norm
         imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
-        dtype_orig = imgs.dtype
         imgs_f32 = imgs.float() 
         mean = imgs_f32.mean(dim=(3, 4), keepdim=True)
         std = imgs_f32.std(dim=(3, 4), keepdim=True)
         std = torch.clamp(std, min=1e-5)
         imgs = (imgs_f32 - mean) / std
-        imgs = imgs.to(dtype=dtype_orig)
+        
+        # 确保输入数据类型与模型权重一致
+        target_dtype = next(self.parameters()).dtype
+        imgs = imgs.to(dtype=target_dtype)
 
         # 2. Encoder
         latent, mask, ids, M = self.forward_encoder(imgs)

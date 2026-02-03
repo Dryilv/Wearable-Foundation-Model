@@ -183,14 +183,16 @@ class TF_MAE_Classifier(nn.Module):
         imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0)
         
         # 2. Instance Norm (独立对每个通道、每个样本归一化)
-        dtype_orig = imgs.dtype
         imgs_f32 = imgs.float()
         # mean/std over (H, W) -> (B, M, 3, 1, 1)
         mean = imgs_f32.mean(dim=(3, 4), keepdim=True)
         std = imgs_f32.std(dim=(3, 4), keepdim=True)
         std = torch.clamp(std, min=1e-5)
         imgs = (imgs_f32 - mean) / std
-        imgs = imgs.to(dtype=dtype_orig)
+        
+        # 确保输入数据类型与模型权重一致 (解决 Input type (double) and bias type (BFloat16) 不匹配问题)
+        target_dtype = next(self.encoder_model.parameters()).dtype
+        imgs = imgs.to(dtype=target_dtype)
 
         # 3. Forward Encoder
         # 新版 forward_encoder 返回: x, mask, ids, M
