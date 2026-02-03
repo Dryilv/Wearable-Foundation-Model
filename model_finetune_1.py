@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# 确保 model.py (包含 CWT_MAE_RoPE 和 cwt_wrap) 在同一目录下
-from model_1  import CWT_MAE_RoPE, cwt_wrap
+# 确保 model_1.py (包含 CWT_MAE_RoPE 和 cwt_wrap) 在同一目录下
+from model_1 import CWT_MAE_RoPE, cwt_wrap
 
 # ===================================================================
 # 1. 隐式思维链模块 (Latent Reasoning / Chain-of-Thought Head)
@@ -116,17 +116,17 @@ class TF_MAE_Classifier(nn.Module):
 
     def _delete_decoder_components(self):
         """删除预训练模型中的 Decoder 部分"""
-        del self.encoder_model.decoder_blocks
-        del self.encoder_model.decoder_embed
-        del self.encoder_model.decoder_pred_spec
-        del self.encoder_model.time_reducer
-        del self.encoder_model.time_pred
-        del self.encoder_model.mask_token
-        del self.encoder_model.decoder_pos_embed
-        # del self.encoder_model.decoder_channel_embed # 新模型已移除此属性
-        del self.encoder_model.rope_decoder
-        if hasattr(self.encoder_model, 'decoder_norm'):
-            del self.encoder_model.decoder_norm
+        # 使用 hasattr 检查，避免属性不存在时报错
+        components_to_delete = [
+            'decoder_blocks', 'decoder_embed', 'decoder_pred_spec',
+            'time_reducer', 'time_pred', 'mask_token',
+            'decoder_pos_embed', 'rope_decoder', 'decoder_norm',
+            'decoder_channel_embed', 'channel_embed' # 确保清理旧版本可能存在的组件
+        ]
+        
+        for component in components_to_delete:
+            if hasattr(self.encoder_model, component):
+                delattr(self.encoder_model, component)
 
     def _load_pretrained_weights(self, path):
         print(f"Loading weights from {path}...")
@@ -136,10 +136,14 @@ class TF_MAE_Classifier(nn.Module):
         # 清洗 Key 名称
         new_state_dict = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()}
         
-        # 过滤 Decoder 权重
+        # 过滤 Decoder 权重和不匹配的权重
         encoder_dict = {}
         for k, v in new_state_dict.items():
+            # 过滤 decoder 相关
             if any(x in k for x in ["decoder", "mask_token", "time_reducer", "time_pred", "rope_decoder"]):
+                continue
+            # 过滤 channel_embed 相关 (如果预训练模型是旧版)
+            if "channel_embed" in k:
                 continue
             encoder_dict[k] = v
             
@@ -149,6 +153,7 @@ class TF_MAE_Classifier(nn.Module):
 
         msg = self.encoder_model.load_state_dict(encoder_dict, strict=False)
         print(f"Weights loaded. Missing keys (expected decoder keys): {msg.missing_keys}")
+        print(f"Unexpected keys: {msg.unexpected_keys}")
 
     def _interpolate_pos_embed(self, state_dict, key, new_pos_embed):
         if key not in state_dict: return
@@ -161,6 +166,9 @@ class TF_MAE_Classifier(nn.Module):
         
         grid_h, grid_w_new = self.encoder_model.grid_size
         n_old = patch_tokens.shape[1]
+        
+        # 假设 grid_h (频率维度) 不变，只改变 grid_w (时间维度)
+        # 如果 n_old 不能被 grid_h 整除，说明预训练时的 grid_h 可能不同，这里简单假设 grid_h 兼容
         grid_w_old = n_old // grid_h
         dim = patch_tokens.shape[-1]
         
