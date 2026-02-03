@@ -9,12 +9,14 @@ import pickle
 class PhysioSignalDataset(Dataset):
     def __init__(self, index_file, signal_len=3000, mode='train', 
                  min_std_threshold=1e-4,
-                 max_std_threshold=5000.0 
+                 max_std_threshold=5000.0,
+                 max_abs_value=1e5 # 新增：绝对值上限过滤
                  ):
         self.signal_len = signal_len
         self.mode = mode
         self.min_std_threshold = min_std_threshold
         self.max_std_threshold = max_std_threshold
+        self.max_abs_value = max_abs_value
         
         if not os.path.exists(index_file):
             raise FileNotFoundError(f"Index file not found: {index_file}")
@@ -33,70 +35,66 @@ class PhysioSignalDataset(Dataset):
             try:
                 item_info = self.index_data[idx]
                 file_path = item_info['path']
-                row_idx = item_info['row'] # 这里假设 row_idx 指向一个多通道样本
+                row_idx = item_info['row'] 
+                label = item_info.get('label', 0) # 加载标签，默认为 0
                 
                 with open(file_path, 'rb') as f:
                     content = pickle.load(f)
-                    # 【关键假设】：
-                    # content['data'] 的形状应该是 (Num_Samples, Channels, Length)
-                    # 或者 content['data'][row_idx] 直接返回 (Channels, Length)
                     raw_signal = content['data'][row_idx]
                     
-                    # 如果数据是 (Length,) 或 (1, Length)，统一转为 (M, Length)
                     if raw_signal.ndim == 1:
                         raw_signal = raw_signal[np.newaxis, :]
                     
                     if raw_signal.dtype != np.float32:
                         raw_signal = raw_signal.astype(np.float32)
                 
-                # 1. 检查 NaN / Inf (只要任意通道有坏值，就换一个样本)
+                # 1. 基础检查：NaN/Inf 和 极端异常值 (Sensor Saturation)
                 if np.isnan(raw_signal).any() or np.isinf(raw_signal).any():
                     idx = random.randint(0, len(self.index_data) - 1)
                     continue
+                
+                if np.max(np.abs(raw_signal)) > self.max_abs_value:
+                    idx = random.randint(0, len(self.index_data) - 1)
+                    continue
 
-                # 2. 同步裁剪或填充 (所有通道处理方式必须一致)
-                # processed_signal shape: (M, signal_len)
+                # 2. 同步裁剪或填充
                 processed_signal = self._process_signal(raw_signal)
 
-                # 3. 逐通道计算标准差并过滤
-                # axis=1 表示沿时间轴计算
+                # 3. 逐通道质量检查
                 std_vals = np.std(processed_signal, axis=1, keepdims=True) # (M, 1)
                 
-                # 如果所有通道都太平（可能是脱落）或太剧烈（可能是伪影），则跳过
-                # 这里策略比较宽松：只要有一个通道是好的，就保留样本
-                # 或者你可以改为：必须所有通道都满足条件
-                if np.all(std_vals < self.min_std_threshold) or np.any(std_vals > self.max_std_threshold):
+                # 过滤条件：
+                # - 如果任意通道标准差过大（严重伪影）
+                # - 如果所有通道标准差过小（脱落/平线）
+                # - 如果任意通道只有极少数数值变化（死线检测）
+                if np.any(std_vals > self.max_std_threshold) or np.all(std_vals < self.min_std_threshold):
                     idx = random.randint(0, len(self.index_data) - 1)
                     continue
                 
-                # 4. 逐通道 Z-Score 归一化
-                # 这一步至关重要，消除 ECG/PPG/ACC 之间的量纲差异
+                # 4. 逐通道 Z-Score 归一化 (增加稳定性控制)
                 mean_vals = np.mean(processed_signal, axis=1, keepdims=True)
-                processed_signal = (processed_signal - mean_vals) / (std_vals + 1e-6)
+                # 使用稍大的 epsilon 并在归一化后裁剪
+                processed_signal = (processed_signal - mean_vals) / (std_vals + 1e-5)
+                processed_signal = np.clip(processed_signal, -10, 10) # 限制在 [-10, 10] 标准差范围内
 
                 # 转为 Tensor
-                signal_tensor = torch.from_numpy(processed_signal) # (M, L)
+                signal_tensor = torch.from_numpy(processed_signal) 
 
-                # 5. 【核心修改】通道乱序 (Channel Shuffling)
-                # 仅在训练模式下进行，迫使模型学习 "Bag of Signals"
+                # 5. 通道乱序 (仅训练模式)
                 if self.mode == 'train':
                     M = signal_tensor.shape[0]
-                    # 生成随机排列索引
                     perm_indices = torch.randperm(M)
                     signal_tensor = signal_tensor[perm_indices]
 
-                return signal_tensor
+                return signal_tensor, torch.tensor(label, dtype=torch.long)
 
             except Exception as e:
-                # print(f"[Warning] Error loading {file_path} row {row_idx}: {e}")
                 idx = random.randint(0, len(self.index_data) - 1)
                 continue
         
-        # 兜底信号：生成 (1, L) 的噪声，避免崩溃
-        # 注意：如果你的模型期望 M=5，这里返回 1 可能会报错，
-        # 但由于模型是变长输入的，返回 (1, L) 也是合法的。
-        fallback_signal = np.random.randn(1, self.signal_len).astype(np.float32) * 1e-3
-        return torch.from_numpy(fallback_signal)
+        # 兜底：返回全零信号和 0 标签
+        fallback_signal = torch.zeros((1, self.signal_len), dtype=torch.float32)
+        return fallback_signal, torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal):
         """
