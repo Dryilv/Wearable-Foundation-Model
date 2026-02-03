@@ -9,9 +9,15 @@ from model_1 import CWT_MAE_RoPE, cwt_wrap
 # ===================================================================
 # 1. 隐式思维链模块 (Latent Reasoning / Chain-of-Thought Head)
 # ===================================================================
-class ReasoningBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
+class LatentReasoningHead(nn.Module):
+    def __init__(self, embed_dim, num_heads, num_classes, num_reasoning_tokens=32, dropout=0.1):
         super().__init__()
+        self.num_reasoning_tokens = num_reasoning_tokens
+        self.embed_dim = embed_dim
+        
+        # 推理令牌 (Query)
+        self.reasoning_tokens = nn.Parameter(torch.zeros(1, num_reasoning_tokens, embed_dim))
+        
         # Cross-Attention: Query=Reasoning, Key/Value=Signal Features
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
@@ -28,40 +34,9 @@ class ReasoningBlock(nn.Module):
             nn.Linear(embed_dim * 4, embed_dim)
         )
         self.norm3 = nn.LayerNorm(embed_dim)
-
-    def forward(self, queries, x_encoder):
-        # Cross Attention
-        attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder)
-        queries = self.norm1(queries + attn_out)
-        
-        # Self Attention
-        attn_out2, _ = self.self_attn(query=queries, key=queries, value=queries)
-        queries = self.norm2(queries + attn_out2)
-        
-        # FFN
-        queries = self.norm3(queries + self.ffn(queries))
-        return queries
-
-class LatentReasoningHead(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_classes, num_reasoning_tokens=32, depth=3, dropout=0.1):
-        super().__init__()
-        self.num_reasoning_tokens = num_reasoning_tokens
-        self.embed_dim = embed_dim
-        
-        # 推理令牌 (Query)
-        self.reasoning_tokens = nn.Parameter(torch.zeros(1, num_reasoning_tokens, embed_dim))
-        
-        # Stacking Reasoning Blocks
-        self.blocks = nn.ModuleList([
-            ReasoningBlock(embed_dim, num_heads, dropout) 
-            for _ in range(depth)
-        ])
         
         # Classifier
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, num_classes)
-        )
+        self.classifier = nn.Linear(embed_dim, num_classes)
         
         self._init_weights()
         nn.init.normal_(self.reasoning_tokens, std=0.02)
@@ -73,11 +48,22 @@ class LatentReasoningHead(nn.Module):
 
     def forward(self, x_encoder):
         # x_encoder: (B, Total_Tokens, D)
+        # Total_Tokens = M * N_patches (变长)
+        
         B = x_encoder.shape[0]
         queries = self.reasoning_tokens.expand(B, -1, -1) # (B, N_reason, D)
         
-        for blk in self.blocks:
-            queries = blk(queries, x_encoder)
+        # Cross Attention
+        # 这里的 Key/Value 长度是 M*N，对于 MultiheadAttention 来说没问题
+        attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder)
+        queries = self.norm1(queries + attn_out)
+        
+        # Self Attention
+        attn_out2, _ = self.self_attn(query=queries, key=queries, value=queries)
+        queries = self.norm2(queries + attn_out2)
+        
+        # FFN
+        queries = self.norm3(queries + self.ffn(queries))
         
         # Global Pooling & Classify
         decision_token = queries.mean(dim=1) 
@@ -91,23 +77,15 @@ class TF_MAE_Classifier(nn.Module):
     def __init__(self, pretrained_path, num_classes, 
                  mlp_rank_ratio=0.5, 
                  use_cot=True, 
-                 num_reasoning_tokens=16,
-                 reasoning_depth=3, # 【新增】深度推理
-                 train_signal_len=500, # 【新增】记录训练时的信号长度
+                 num_reasoning_tokens=16, 
                  **kwargs):
         super().__init__()
         
-        self.train_signal_len = train_signal_len
-        
-        # Ensure signal_len is not passed twice
-        if 'signal_len' in kwargs:
-            kwargs.pop('signal_len')
-
         # 1. 初始化 Encoder (CWT-MAE-RoPE)
+        # 注意：不再需要 max_num_channels
         self.encoder_model = CWT_MAE_RoPE(
             mlp_rank_ratio=mlp_rank_ratio,
             mask_ratio=0.0, # 微调时关闭 Mask
-            signal_len=train_signal_len, # 确保 Encoder 也是按训练长度初始化
             **kwargs
         )
         self.embed_dim = kwargs.get('embed_dim', 768)
@@ -121,13 +99,12 @@ class TF_MAE_Classifier(nn.Module):
 
         # 4. 初始化分类头
         if use_cot:
-            print(f">>> Initializing Latent Reasoning Head (CoT) with {num_reasoning_tokens} tokens, depth={reasoning_depth}.")
+            print(f">>> Initializing Latent Reasoning Head (CoT) with {num_reasoning_tokens} tokens.")
             self.head = LatentReasoningHead(
                 embed_dim=self.embed_dim,
                 num_heads=kwargs.get('num_heads', 12),
                 num_classes=num_classes,
                 num_reasoning_tokens=num_reasoning_tokens,
-                depth=reasoning_depth,
                 dropout=0.2
             )
         else:
@@ -209,49 +186,6 @@ class TF_MAE_Classifier(nn.Module):
         # 兼容单通道输入 (B, L) -> (B, 1, L)
         if x.dim() == 2: x = x.unsqueeze(1)
         
-        B, M, L = x.shape
-        
-        # 【新增】滑动窗口推理逻辑
-        # 如果是评估模式，且输入长度超过训练长度，则切片预测并投票
-        if not self.training and L > self.train_signal_len:
-            return self.forward_sliding_window(x)
-
-        return self._forward_impl(x)
-
-    def forward_sliding_window(self, x):
-        """
-        对长序列进行滑动窗口预测，然后聚合结果
-        """
-        B, M, L = x.shape
-        window_size = self.train_signal_len
-        stride = window_size // 2 # 50% 重叠
-        
-        # unfold: (B, M, N_wins, W)
-        # 注意：unfold 作用在最后一维
-        windows = x.unfold(dimension=-1, size=window_size, step=stride)
-        
-        # (B, M, N_wins, W) -> (B, N_wins, M, W)
-        windows = windows.permute(0, 2, 1, 3).contiguous()
-        N_wins = windows.shape[1]
-        
-        # Flatten -> (B * N_wins, M, W)
-        windows_flat = windows.view(B * N_wins, M, window_size)
-        
-        # Forward pass
-        logits_flat = self._forward_impl(windows_flat) # (B * N_wins, Num_Classes)
-        
-        # Reshape & Aggregate
-        logits = logits_flat.view(B, N_wins, -1)
-        
-        # 这里使用 Softmax 平均，比 Logits 平均更稳健（类似于 Voting）
-        probs = F.softmax(logits, dim=-1)
-        avg_probs = probs.mean(dim=1)
-        
-        # 注意：这里返回的是概率分布，或者我们可以返回 log 概率以配合 CrossEntropy
-        # 为了兼容 validate 函数 (expect logits), 我们返回 log(avg_probs)
-        return torch.log(avg_probs + 1e-6)
-
-    def _forward_impl(self, x):
         # 1. CWT 变换 (B, M, L) -> (B, M, 3, Scales, L)
         # 注意：cwt_wrap 现在支持多通道
         imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0)

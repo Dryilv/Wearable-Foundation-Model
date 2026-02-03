@@ -283,8 +283,7 @@ def main():
     parser.add_argument('--save_dir', type=str, default="./checkpoints_cls768")
     
     parser.add_argument('--num_classes', type=int, default=2)
-    parser.add_argument('--signal_len', type=int, default=3000, help="Training signal length (window size)")
-    parser.add_argument('--val_signal_len', type=int, default=None, help="Validation signal length. If None, uses full length or signal_len")
+    parser.add_argument('--signal_len', type=int, default=3000)
 
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=30)
@@ -303,7 +302,6 @@ def main():
     # [新增] CoT 参数
     parser.add_argument('--use_cot', action='store_true', help="Enable Chain-of-Thought Reasoning Head")
     parser.add_argument('--num_reasoning_tokens', type=int, default=16)
-    parser.add_argument('--reasoning_depth', type=int, default=3, help="Depth of Reasoning Head")
 
     parser.add_argument('--clean_indices_path', type=str, default=None)
     parser.add_argument('--clean_test_indices_path', type=str, default=None)
@@ -317,19 +315,13 @@ def main():
         print(f"World Size: {world_size}, Master running on {device}")
 
     # Dataset 初始化
-    # 训练集使用 Random Crop (signal_len)
     train_ds = DownstreamClassificationDataset(
         args.data_root, args.split_file, mode='train', 
         signal_len=args.signal_len, num_classes=args.num_classes
     )
-    
-    # 验证集使用 val_signal_len (通常更长，或者是 1000)
-    # 如果没指定 val_signal_len，默认使用 signal_len (这会导致 Center Crop)
-    # 建议指定 val_signal_len=1000 以触发滑动窗口
-    val_len = args.val_signal_len if args.val_signal_len is not None else args.signal_len
     val_ds = DownstreamClassificationDataset(
         args.data_root, args.split_file, mode='test', 
-        signal_len=val_len, num_classes=args.num_classes
+        signal_len=args.signal_len, num_classes=args.num_classes
     )
 
     val_dataset_len = len(val_ds)
@@ -392,9 +384,7 @@ def main():
         decoder_num_heads=16,
         # CoT 参数
         use_cot=args.use_cot,
-        num_reasoning_tokens=args.num_reasoning_tokens,
-        reasoning_depth=args.reasoning_depth,
-        train_signal_len=args.signal_len # 传入训练长度，用于滑动窗口判断
+        num_reasoning_tokens=args.num_reasoning_tokens
     )
     model.to(device)
     
