@@ -21,9 +21,10 @@ class MultiChannelAugmentor:
         M, L = signal.shape
         
         # 1. 随机翻转 (针对每个通道独立判定)
-        if random.random() < self.p:
-            flip_mask = np.random.choice([-1.0, 1.0], size=(M, 1))
-            signal = signal * flip_mask
+        # 【修改】禁用随机翻转，防止破坏生物信号极性（如 ECG T波倒置）
+        # if random.random() < self.p:
+        #     flip_mask = np.random.choice([-1.0, 1.0], size=(M, 1))
+        #     signal = signal * flip_mask
 
         # 2. 随机缩放 (模拟信号强度波动)
         if random.random() < self.p:
@@ -133,11 +134,12 @@ class DownstreamClassificationDataset(Dataset):
 
             # --- 6. 通道乱序 (Channel Shuffling) ---
             # 关键：微调时也保持 Bag-of-Signals 逻辑，增强对通道顺序的不敏感性
-            if self.mode == 'train':
-                M = signal_tensor.shape[0]
-                if M > 1:
-                    perm_indices = torch.randperm(M)
-                    signal_tensor = signal_tensor[perm_indices]
+            # 【修改】禁用通道乱序，因为下游任务通常依赖固定的通道顺序（空间信息）
+            # if self.mode == 'train':
+            #     M = signal_tensor.shape[0]
+            #     if M > 1:
+            #         perm_indices = torch.randperm(M)
+            #         signal_tensor = signal_tensor[perm_indices]
 
             return signal_tensor, torch.tensor(label, dtype=torch.long)
 
