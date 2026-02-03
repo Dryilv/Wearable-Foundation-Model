@@ -190,7 +190,11 @@ class TF_MAE_Classifier(nn.Module):
         std = torch.clamp(std, min=1e-5)
         imgs = (imgs_f32 - mean) / std
         
-        # 确保输入数据类型与模型权重一致 (解决 Input type (double) and bias type (BFloat16) 不匹配问题)
+        # 数值鲁棒性增强：防止 CWT 产生的极端值引发梯度爆炸
+        imgs = torch.nan_to_num(imgs, nan=0.0, posinf=100.0, neginf=-100.0)
+        imgs = torch.clamp(imgs, min=-100.0, max=100.0)
+
+        # 确保输入数据类型与模型权重一致
         target_dtype = next(self.encoder_model.parameters()).dtype
         imgs = imgs.to(dtype=target_dtype)
 

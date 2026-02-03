@@ -441,6 +441,10 @@ class CWT_MAE_RoPE(nn.Module):
         std = torch.clamp(std, min=1e-5)
         imgs = (imgs_f32 - mean) / std
         
+        # 数值鲁棒性增强
+        imgs = torch.nan_to_num(imgs, nan=0.0, posinf=100.0, neginf=-100.0)
+        imgs = torch.clamp(imgs, min=-100.0, max=100.0)
+
         # 确保输入数据类型与模型权重一致
         target_dtype = next(self.parameters()).dtype
         imgs = imgs.to(dtype=target_dtype)

@@ -63,14 +63,20 @@ class PhysioSignalDataset(Dataset):
                 # 3. 逐通道质量检查
                 std_vals = np.std(processed_signal, axis=1, keepdims=True) # (M, 1)
                 
-                # 过滤条件：
-                # - 如果任意通道标准差过大（严重伪影）
-                # - 如果所有通道标准差过小（脱落/平线）
-                # - 如果任意通道只有极少数数值变化（死线检测）
-                if np.any(std_vals > self.max_std_threshold) or np.all(std_vals < self.min_std_threshold):
+                # 深度过滤逻辑：
+                # 1. 检查 std 是否包含 NaN (np.std 在输入包含 NaN 时会返回 NaN)
+                # 2. 检查是否有任意通道标准差过大 (伪影)
+                # 3. 检查是否有任意通道标准差过小 (死线/脱落) -> 这里改为 np.any，只要有一个通道不行就换
+                if np.isnan(std_vals).any() or \
+                   np.any(std_vals > self.max_std_threshold) or \
+                   np.any(std_vals < self.min_std_threshold):
                     idx = random.randint(0, len(self.index_data) - 1)
                     continue
                 
+                # 检查标签是否合法
+                if not isinstance(label, (int, float)) or np.isnan(label) or np.isinf(label):
+                    label = 0
+
                 # 4. 逐通道 Z-Score 归一化 (增加稳定性控制)
                 mean_vals = np.mean(processed_signal, axis=1, keepdims=True)
                 # 使用稍大的 epsilon 并在归一化后裁剪
