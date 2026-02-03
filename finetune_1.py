@@ -394,7 +394,6 @@ def main():
         use_cot=args.use_cot,
         num_reasoning_tokens=args.num_reasoning_tokens,
         reasoning_depth=args.reasoning_depth,
-        max_num_channels=24, # 【新增】默认支持最多 24 通道 (覆盖常见 ECG/EEG)
         train_signal_len=args.signal_len # 传入训练长度，用于滑动窗口判断
     )
     model.to(device)
