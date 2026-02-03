@@ -115,23 +115,28 @@ def init_distributed_mode():
 def variable_channel_collate_fn(batch):
     """
     处理 Batch 中不同样本通道数不一致的情况。
-    Batch: list of tensors, each shape (M_i, L)
-    Output: (B, Max_M, L)
+    Batch: list of (tensor, label), where tensor shape is (M_i, L)
+    Output: (padded_signals, labels)
     """
-    # 1. 找到当前 Batch 中最大的通道数
-    max_m = max([item.shape[0] for item in batch])
-    signal_len = batch[0].shape[1]
-    batch_size = len(batch)
+    # 1. 解包信号和标签
+    signals = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
     
-    # 2. 初始化全 0 张量
-    padded_batch = torch.zeros((batch_size, max_m, signal_len), dtype=batch[0].dtype)
+    # 2. 找到当前 Batch 中最大的通道数
+    max_m = max([s.shape[0] for s in signals])
+    signal_len = signals[0].shape[1]
+    batch_size = len(signals)
     
-    # 3. 填充数据
-    for i, item in enumerate(batch):
-        m = item.shape[0]
-        padded_batch[i, :m, :] = item
+    # 3. 初始化全 0 张量并填充信号
+    padded_signals = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
+    for i, s in enumerate(signals):
+        m = s.shape[0]
+        padded_signals[i, :m, :] = s
         
-    return padded_batch
+    # 4. 堆叠标签
+    labels = torch.stack(labels)
+        
+    return padded_signals, labels
 
 # -------------------------------------------------------------------
 # 3. 可视化函数 (适配多通道、无 Channel ID)
@@ -254,7 +259,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     # 优先使用 bfloat16
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
-    for step, batch in enumerate(dataloader):
+    for step, (batch, labels) in enumerate(dataloader):
         global_step = epoch * num_steps_per_epoch + step
         
         # 调整 LR
@@ -269,6 +274,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         # batch shape: (B, M, L)
         batch = batch.to(device, non_blocking=True)
+        # labels = labels.to(device, non_blocking=True) # MAE 训练暂不需要标签
 
         # 混合精度前向传播
         with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
@@ -417,7 +423,8 @@ def main():
     vis_batch = None
     if is_main_process():
         try:
-            vis_batch = next(iter(dataloader)).to(device)
+            vis_batch, _ = next(iter(dataloader))
+            vis_batch = vis_batch.to(device)
         except StopIteration:
             pass
 
