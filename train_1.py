@@ -336,6 +336,8 @@ def main():
     dataset = PhysioSignalDataset(
         index_file=config['data']['index_path'],
         signal_len=config['data']['signal_len'],
+        stride=config['data'].get('stride'),
+        original_len=config['data'].get('original_len', 3000),
         mode='train'
     )
 

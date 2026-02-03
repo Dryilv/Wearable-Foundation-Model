@@ -125,7 +125,7 @@ class TensorizedLinear(nn.Module):
         return self.u(self.v(x))
 
 class DecomposedPatchEmbed(nn.Module):
-    def __init__(self, img_size=(64, 3000), patch_size=(4, 50), in_chans=3, embed_dim=768, norm_layer=None):
+    def __init__(self, img_size=(64, 500), patch_size=(4, 50), in_chans=3, embed_dim=768, norm_layer=None):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
@@ -213,7 +213,7 @@ class Block(nn.Module):
 class CWT_MAE_RoPE(nn.Module):
     def __init__(
         self, 
-        signal_len=3000, 
+        signal_len=500, 
         cwt_scales=64,
         patch_size_time=50,
         patch_size_freq=4,
@@ -461,7 +461,7 @@ class CWT_MAE_RoPE(nn.Module):
         
         B, M, N, D = decoder_features.shape
         H_grid, W_grid = self.grid_size
-        feat_2d = decoder_features.view(B * M, N, D).transpose(1, 2).view(B * M, D, H_grid, W_grid)
+        feat_2d = decoder_features.reshape(B * M, N, D).transpose(1, 2).reshape(B * M, D, H_grid, W_grid)
         feat_time_agg = self.time_reducer(feat_2d).squeeze(2).transpose(1, 2)
         pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M, -1)
         

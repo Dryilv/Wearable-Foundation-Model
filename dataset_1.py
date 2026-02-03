@@ -7,16 +7,20 @@ import random
 import pickle
 
 class PhysioSignalDataset(Dataset):
-    def __init__(self, index_file, signal_len=3000, mode='train', 
+    def __init__(self, index_file, signal_len=500, mode='train', 
                  min_std_threshold=1e-4,
                  max_std_threshold=5000.0,
-                 max_abs_value=1e5 # 新增：绝对值上限过滤
+                 max_abs_value=1e5, # 新增：绝对值上限过滤
+                 stride=None,       # 新增：滑动窗口步长
+                 original_len=3000  # 新增：原始信号长度（用于滑动窗口计算）
                  ):
         self.signal_len = signal_len
         self.mode = mode
         self.min_std_threshold = min_std_threshold
         self.max_std_threshold = max_std_threshold
         self.max_abs_value = max_abs_value
+        self.stride = stride
+        self.original_len = original_len
         
         if not os.path.exists(index_file):
             raise FileNotFoundError(f"Index file not found: {index_file}")
@@ -24,19 +28,34 @@ class PhysioSignalDataset(Dataset):
         print(f"Loading index from: {index_file} ...")
         with open(index_file, 'r') as f:
             self.index_data = json.load(f)
-        print(f"Loaded {len(self.index_data)} samples.")
+        
+        # 预生成样本索引
+        self.samples = []
+        if self.stride is not None:
+            for i in range(len(self.index_data)):
+                for start in range(0, self.original_len - self.signal_len + 1, self.stride):
+                    self.samples.append({'idx': i, 'start': start})
+            print(f"Sliding window enabled (stride={stride}). Expanded {len(self.index_data)} samples to {len(self.samples)} windows.")
+        else:
+            for i in range(len(self.index_data)):
+                self.samples.append({'idx': i, 'start': None})
+            print(f"Loaded {len(self.index_data)} samples.")
 
     def __len__(self):
-        return len(self.index_data)
+        return len(self.samples)
 
     def __getitem__(self, idx):
         # 重试机制
         for _ in range(3):
             try:
-                item_info = self.index_data[idx]
+                sample_info = self.samples[idx]
+                original_idx = sample_info['idx']
+                fixed_start = sample_info['start']
+
+                item_info = self.index_data[original_idx]
                 file_path = item_info['path']
                 row_idx = item_info['row'] 
-                label = item_info.get('label', 0) # 加载标签，默认为 0
+                label = item_info.get('label', 0) 
                 
                 with open(file_path, 'rb') as f:
                     content = pickle.load(f)
@@ -48,17 +67,17 @@ class PhysioSignalDataset(Dataset):
                     if raw_signal.dtype != np.float32:
                         raw_signal = raw_signal.astype(np.float32)
                 
-                # 1. 基础检查：NaN/Inf 和 极端异常值 (Sensor Saturation)
+                # 1. 基础检查
                 if np.isnan(raw_signal).any() or np.isinf(raw_signal).any():
-                    idx = random.randint(0, len(self.index_data) - 1)
+                    idx = random.randint(0, len(self.samples) - 1)
                     continue
                 
                 if np.max(np.abs(raw_signal)) > self.max_abs_value:
-                    idx = random.randint(0, len(self.index_data) - 1)
+                    idx = random.randint(0, len(self.samples) - 1)
                     continue
 
-                # 2. 同步裁剪或填充
-                processed_signal = self._process_signal(raw_signal)
+                # 2. 同步裁剪或填充 (使用固定起始位置或随机起始位置)
+                processed_signal = self._process_signal(raw_signal, fixed_start)
 
                 # 3. 逐通道质量检查
                 std_vals = np.std(processed_signal, axis=1, keepdims=True) # (M, 1)
@@ -70,7 +89,7 @@ class PhysioSignalDataset(Dataset):
                 if np.isnan(std_vals).any() or \
                    np.any(std_vals > self.max_std_threshold) or \
                    np.any(std_vals < self.min_std_threshold):
-                    idx = random.randint(0, len(self.index_data) - 1)
+                    idx = random.randint(0, len(self.samples) - 1)
                     continue
                 
                 # 检查标签是否合法
@@ -95,14 +114,14 @@ class PhysioSignalDataset(Dataset):
                 return signal_tensor, torch.tensor(label, dtype=torch.long)
 
             except Exception as e:
-                idx = random.randint(0, len(self.index_data) - 1)
+                idx = random.randint(0, len(self.samples) - 1)
                 continue
         
         # 兜底：返回全零信号和 0 标签
         fallback_signal = torch.zeros((1, self.signal_len), dtype=torch.float32)
         return fallback_signal, torch.tensor(0, dtype=torch.long)
 
-    def _process_signal(self, signal):
+    def _process_signal(self, signal, fixed_start=None):
         """
         输入 signal 形状: (M, Current_Len)
         输出 signal 形状: (M, Target_Len)
@@ -115,7 +134,9 @@ class PhysioSignalDataset(Dataset):
             return signal
 
         if current_len > target_len:
-            if self.mode == 'train':
+            if fixed_start is not None:
+                start = fixed_start
+            elif self.mode == 'train':
                 # 随机裁剪：计算一次 start，应用到所有通道
                 start = np.random.randint(0, current_len - target_len)
             else:
