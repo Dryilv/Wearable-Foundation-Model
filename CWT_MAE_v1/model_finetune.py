@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# 确保 model_1.py (包含 CWT_MAE_RoPE 和 cwt_wrap) 在同一目录下
-from model_1 import CWT_MAE_RoPE, cwt_wrap
+# 确保 model.py (包含 CWT_MAE_RoPE 和 cwt_wrap) 在同一目录下
+from model import CWT_MAE_RoPE, cwt_wrap
 
 # ===================================================================
 # 1. 隐式思维链模块 (Latent Reasoning / Chain-of-Thought Head)

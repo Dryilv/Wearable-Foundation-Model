@@ -10,6 +10,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import autocast 
 
+# 导入 v1 版本的模型定义
 from model_finetune import TF_MAE_Classifier
 
 # ==========================================
@@ -43,18 +44,36 @@ class AdaptivePatientDataset(Dataset):
             try:
                 with open(fp, 'rb') as f:
                     content = pickle.load(f)
-                    raw_data = content['data'] if isinstance(content, dict) else content
-                    if raw_data.ndim == 2: raw_data = raw_data[0]
-                    raw_data = raw_data.astype(np.float32)
+                    # 兼容不同结构的 content
+                    if isinstance(content, dict) and 'data' in content:
+                        raw_data = content['data']
+                    else:
+                        raw_data = content # 假设直接是数据
+                        
+                    if isinstance(raw_data, list):
+                        raw_data = np.array(raw_data)
+
+                    if raw_data.ndim == 1:
+                        raw_data = raw_data[np.newaxis, :] # (1, L)
+                    
+                    raw_data = raw_data.astype(np.float32) # (M, L_raw)
                 
-                n_samples = len(raw_data)
+                # 假设我们只处理第一个通道，或者需要修改这里以支持多通道推理逻辑
+                # 这里为了兼容 v1 的多通道特性，我们可能需要调整逻辑
+                # 但原 inference.py 似乎是针对单通道或已经展平的数据
+                # 如果是多通道模型，输入应该是 (M, L)
+                
+                # 这里假设 raw_data 是 (M, L_raw)
+                M, n_samples = raw_data.shape
                 if n_samples < signal_len: continue
                 
                 for start in range(0, n_samples - signal_len + 1, stride):
-                    segment = raw_data[start : start + signal_len]
+                    segment = raw_data[:, start : start + signal_len] # (M, L)
                     
                     if check_basic_validity(segment):
-                        std_val = np.std(segment)
+                        # 对每个通道计算 std，这里简单取平均或最大作为过滤依据
+                        std_val = np.mean(np.std(segment, axis=1))
+                        
                         raw_segments.append(segment)
                         std_values.append(std_val)
                         self.sqa_stats["total_raw"] += 1
@@ -84,8 +103,17 @@ class AdaptivePatientDataset(Dataset):
                 self.sqa_stats["dropped_high"] += 1
                 continue
             
-            mean = np.mean(segment)
-            segment_norm = (segment - mean) / (std_val + 1e-6)
+            # Robust Normalization per channel
+            # segment: (M, L)
+            median = np.median(segment, axis=1, keepdims=True)
+            q25 = np.percentile(segment, 25, axis=1, keepdims=True)
+            q75 = np.percentile(segment, 75, axis=1, keepdims=True)
+            iqr_val = q75 - q25
+            iqr_val = np.where(iqr_val < 1e-6, 1.0, iqr_val)
+            
+            segment_norm = (segment - median) / iqr_val
+            segment_norm = np.clip(segment_norm, -20.0, 20.0)
+            
             self.windows.append(segment_norm)
             self.sqa_stats["valid_final"] += 1
 
@@ -94,7 +122,7 @@ class AdaptivePatientDataset(Dataset):
 
     def __getitem__(self, idx):
         sig = self.windows[idx]
-        return torch.from_numpy(sig).unsqueeze(0)
+        return torch.from_numpy(sig) # (M, L)
 
 # ==========================================
 # 3. 主推理逻辑 (多分类修改版)
@@ -103,25 +131,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--output_csv', type=str, default="inference_report_multiclass.csv")
+    parser.add_argument('--output_csv', type=str, default="inference_report_v1.csv")
     
     # 模型参数
-    parser.add_argument('--signal_len', type=int, default=1000)
+    parser.add_argument('--signal_len', type=int, default=3000) # v1 默认 3000
     parser.add_argument('--embed_dim', type=int, default=768)
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--num_heads', type=int, default=12)
-    parser.add_argument('--num_classes', type=int, default=6, help="设置为6进行多分类")
+    parser.add_argument('--num_classes', type=int, default=2, help="分类数量")
     parser.add_argument('--cwt_scales', type=int, default=64)
     parser.add_argument('--patch_size_time', type=int, default=50)
     parser.add_argument('--patch_size_freq', type=int, default=4)
     parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
 
     # 推理参数
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--stride', type=int, default=500)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--stride', type=int, default=1500)
     
     # 自适应过滤参数
-    parser.add_argument('--iqr_scale', type=float, default=0.8)
+    parser.add_argument('--iqr_scale', type=float, default=1.5)
 
     args = parser.parse_args()
     
@@ -139,7 +167,8 @@ def main():
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
-        mlp_rank_ratio=args.mlp_rank_ratio
+        mlp_rank_ratio=args.mlp_rank_ratio,
+        use_cot=True # v1 默认开启 CoT
     )
     
     state_dict = torch.load(args.checkpoint, map_location='cpu')
@@ -215,11 +244,6 @@ def main():
         final_pred_class = np.argmax(mean_probs)
         confidence = mean_probs[final_pred_class]
         
-        # 方法 B: Hard Voting (可选，统计每个类别的片段占比)
-        # segment_preds = np.argmax(all_probs, axis=1)
-        # counts = np.bincount(segment_preds, minlength=args.num_classes)
-        # ratios = counts / len(dataset)
-        
         # 构建结果字典
         res_dict = {
             "PatientID": patient_id,
@@ -250,8 +274,6 @@ def main():
     
     df.to_csv(args.output_csv, index=False)
     print(f"\nInference done. Report saved to {args.output_csv}")
-    print(f"Class 0: Sinus Rhythm")
-    print(f"Class 1-5: Arrhythmias (PVC, PAC, VT, SVT, AF)")
 
 if __name__ == "__main__":
     main()

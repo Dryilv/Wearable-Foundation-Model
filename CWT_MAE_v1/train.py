@@ -24,8 +24,8 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
-from model_1 import CWT_MAE_RoPE 
-from dataset_1 import PhysioSignalDataset
+from model import CWT_MAE_RoPE 
+from dataset import PhysioSignalDataset
 
 # 启用 TensorFloat-32 (A100/3090/4090 必备加速)
 torch.set_float32_matmul_precision('high') 

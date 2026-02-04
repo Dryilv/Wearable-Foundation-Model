@@ -5,6 +5,10 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.amp import autocast
+import sys
+import os
+# Default to v2 model for visualization
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../CWT_MAE_v2')))
 
 # 导入你的模型定义和数据集
 from model import CWT_MAE_RoPE , cwt_wrap

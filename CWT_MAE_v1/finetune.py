@@ -14,8 +14,8 @@ import numpy as np
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast 
 
-from dataset_1_f import DownstreamClassificationDataset
-from model_finetune_1 import TF_MAE_Classifier
+from dataset_finetune import DownstreamClassificationDataset
+from model_finetune import TF_MAE_Classifier
 from utils import get_layer_wise_lr
 
 # -------------------------------------------------------------------

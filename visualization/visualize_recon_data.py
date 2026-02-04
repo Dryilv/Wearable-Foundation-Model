@@ -6,6 +6,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pickle
 from torch.amp import autocast
+import sys
+import os
+# Default to v2 model for visualization
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../CWT_MAE_v2')))
 
 # 导入你的模型定义
 # 确保 model_rope_complete.py 在同一目录下
