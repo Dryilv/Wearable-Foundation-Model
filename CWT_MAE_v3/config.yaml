@@ -22,7 +22,7 @@ train:
   log_interval: 50
   save_freq: 5
   save_dir: "./checkpoint_pixel_mae_v3"
-  resume: ""
+  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_pixel_mae_v3/checkpoint_last.pth"
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
@@ -30,6 +30,11 @@ data:
   original_len: 3000      
   stride: null             # v3 默认处理长序列，不切片
   num_workers: 16         
+  
+  # 数据过滤阈值
+  min_std_threshold: 1.0e-4
+  max_std_threshold: 50.0  # 建议根据数据实际分布调整
+  max_abs_value: 10000.0   # 过滤极大的异常值
 
 model:
   # --- Pixel/Point 级别参数 ---

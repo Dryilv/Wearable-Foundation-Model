@@ -316,7 +316,10 @@ def main():
         signal_len=config['data']['signal_len'],
         stride=config['data'].get('stride'),
         original_len=config['data'].get('original_len', 3000),
-        mode='train'
+        mode='train',
+        min_std_threshold=config['data'].get('min_std_threshold', 1e-4),
+        max_std_threshold=config['data'].get('max_std_threshold', 5000.0),
+        max_abs_value=config['data'].get('max_abs_value', 1e5)
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
