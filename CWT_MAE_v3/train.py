@@ -146,7 +146,7 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
     with torch.no_grad():
         # 优先使用 bfloat16
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with autocast(dtype=amp_dtype):
+        with torch.amp.autocast('cuda', dtype=amp_dtype):
             # forward 返回: total_loss, pred_signal, None, x_norm_signal
             loss, pred_signal, _, orig_signal = model(batch)
         
@@ -178,8 +178,8 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
         
         # 调用 model 中的 loss 计算用的 scales
         cwt_scales = 64
-        orig_cwt = cwt_wrap(orig_t, num_scales=cwt_scales)[0, 0, 0].float().cpu().numpy()
-        recon_cwt = cwt_wrap(recon_t, num_scales=cwt_scales)[0, 0, 0].float().cpu().numpy()
+        orig_cwt = cwt_wrap(orig_t, num_scales=cwt_scales)[0, 0].float().cpu().numpy()
+        recon_cwt = cwt_wrap(recon_t, num_scales=cwt_scales)[0, 0].float().cpu().numpy()
         
         plt.subplot(3, 1, 2)
         plt.imshow(orig_cwt, aspect='auto', origin='lower', cmap='jet')
@@ -249,7 +249,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         # labels = labels.to(device, non_blocking=True) # MAE 训练暂不需要标签
 
         # 混合精度前向传播
-        with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
             loss, _, _, _ = model(batch)
         
         loss_value = loss.item()
