@@ -3,64 +3,79 @@ train:
   epochs: 100             
   
   # [显存优化与 Batch Size] 
-  # v3 (1D Pixel-based) 显存占用比 v1/v2 (2D CWT) 低得多。
-  # Token 数量: 3000 / 4 = 750 (远小于 v2 的 960 或 v1 的 800)
-  # 可以开大 Batch Size
-  batch_size: 256          
+  # 注意：现在的输入是 (B, M, L)，显存占用取决于 Batch Size * 平均通道数 M。
+  # 如果 M 平均为 3-5：
+  # - 24G 显存 (3090/4090): 建议 48 - 64
+  # - 80G 显存 (A100/H100): 建议 256 - 384
+  batch_size: 128          
   
   # 学习率策略
+  # Batch Size 较大 (256) 时，LR 可以适当调大
   base_lr: 1.5e-4         
   min_lr: 1.0e-6
   warmup_epochs: 5        
   
   # 正则化
+  # Tensor Decomposition 本身有参数压缩和正则化效果，Weight Decay 可适度降低
   weight_decay: 0.05      
   clip_grad: 3.0          
+  
+  # [必须开启] 混合精度训练
+  # 配合代码中的 bfloat16 使用，防止 RoPE 溢出并加速训练
   use_amp: True           
   
   # 日志与保存
   log_interval: 50
   save_freq: 5
-  save_dir: "./checkpoint_pixel_mae_v3"
-  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_pixel_mae_v3/checkpoint_last.pth"
+  save_dir: "./checkpoint_v3"
+  
+  # 断点续训路径
+  # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
+  resume: ""
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
-  signal_len: 3000         # 30秒 @ 100Hz
-  original_len: 3000      
-  stride: null             # v3 默认处理长序列，不切片
-  num_workers: 16         
-  
-  # 数据过滤阈值
-  min_std_threshold: 1.0e-4
-  max_std_threshold: 50.0  # 建议根据数据实际分布调整
-  max_abs_value: 10000.0   # 过滤极大的异常值
+  signal_len: 1000         # 5秒 @ 100Hz
+  original_len: 3000      # 原始信号长度 30秒
+  stride: 500             # 滑动步长 1.0秒 (更细粒度的滑动窗口)
+  num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
 
 model:
-  # --- Pixel/Point 级别参数 ---
-  # patch_size: 
-  #   - 1: 纯 Pixel 级别 (Sequence Length = 3000)，计算量大但最精细
-  #   - 4: 推荐值 (Sequence Length = 750)，效率与精度的平衡
-  patch_size: 4           
-  
-  # --- CWT Loss 参数 ---
-  # 虽然输入不使用 CWT，但我们用 CWT Loss 约束频域一致性
+  # --- CWT & Patch 参数 ---
   cwt_scales: 64          
-  cwt_loss_weight: 1.0    
+  
+  # Patch Embedding 配置
+  # Time: 500 / 10 = 50 patches (更细的时间分辨率)
+  # Freq: 64 / 4 = 16 patches
+  # 单个信号的 Token 数 = 50 * 16 = 800
+  patch_size_time: 25     
+  patch_size_freq: 4      
+  use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
   # --- Transformer Encoder (ViT-Base 规模) ---
   embed_dim: 768          
   depth: 12               
   num_heads: 12           
   
-  # --- 张量分解参数 ---
+  # --- [关键] 张量分解参数 ---
+  # 控制 MLP 层的低秩近似程度
+  # 0.5: 参数量减少约 40%，显存占用降低，适合大规模预训练
   mlp_rank_ratio: 0.5     
   
-  # --- Decoder ---
+  # --- Decoder (轻量级) ---
   decoder_embed_dim: 512  
   decoder_depth: 8        
   decoder_num_heads: 16   
   
   # --- 训练策略 ---
-  # 1D 信号通常需要高 Mask Ratio
+  # Mask Ratio: 0.75
+  # 生理信号自相关性极强，必须高 Mask 才能迫使模型学习波形特征而非插值
   mask_ratio: 0.75         
+  
+  # --- Loss 权重 ---
+  # 1.0: 强调时域重建质量 (R波尖锐度、相位对齐)
+  time_loss_weight: 1.0
+  
+  # --- V3 新增特性 ---
+  contrastive: True       # 开启对比学习
+  contrastive_loss_weight: 0.1 # 对比学习 Loss 权重

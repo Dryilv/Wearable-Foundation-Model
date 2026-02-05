@@ -1,59 +1,64 @@
-# CWT-MAE v3 (Pixel-based / Point-based)
+# CWT-MAE: Modality-Agnostic CWT-Based Masked Autoencoder
 
-## 简介
-`CWT_MAE_v3` 是 CWT-MAE 系列的最新演进版本，实现了从 **Patch-based (v1/v2)** 到 **Pixel/Point-based (v3)** 的核心架构迁移。
+This repository contains the implementation of a CWT-based Masked Autoencoder (CWT-MAE) designed for self-supervised learning on physiological signals. The model leverages Continuous Wavelet Transform (CWT) to capture time-frequency features and uses a Transformer-based architecture with Rotary Position Embeddings (RoPE) for representation learning.
 
-在此版本中，模型直接处理 **原始 1D 生理信号 (Raw Signal Points)**，不再将 CWT 时频图作为输入。这种设计显著降低了显存占用，并允许模型以极细的粒度（如 4个点甚至1个点）对信号进行建模，同时通过 **Dual-Objective Loss** 保持了对频域特征的敏感性。
+## Project Structure
 
-## 核心变更
+- `model.py`: Defines the core `CWT_MAE_RoPE` model and CWT utility functions.
+- `model_finetune.py`: Defines the `TF_MAE_Classifier` for downstream classification tasks, including an optional Latent Reasoning Head (Chain-of-Thought).
+- `train.py`: Script for pre-training the CWT-MAE model.
+- `finetune.py`: Script for fine-tuning the pre-trained model on downstream classification tasks.
+- `dataset.py`: Defines the `PhysioSignalDataset` for pre-training, handling signal loading, preprocessing, and augmentation.
+- `dataset_finetune.py`: Defines the `DownstreamClassificationDataset` for fine-tuning tasks.
+- `config.yaml`: Configuration file for training parameters.
+- `utils.py`: Utility functions for logging, visualization, and distributed training.
 
-### 1. 架构迁移 (Architecture Shift)
-*   **Input**: `(B, M, 3000)` Raw Signal -> `(B, M, 3, 64, 50)` CWT Spectrogram (v1/v2)
-    *   **v3 Input**: 直接使用 `(B, M, 3000)` 原始信号。
-*   **Embedding**:
-    *   **v1/v2**: 2D Conv Patch Embedding (处理时频图)。
-    *   **v3**: **1D Point Embedding** (使用 `Conv1d`，`patch_size` 可设为 4 甚至 1)。
-*   **Reconstruction**:
-    *   **v1/v2**: 重建 CWT 时频图的 Patch。
-    *   **v3**: 直接重建原始信号的波形点。
+## Requirements
 
-### 2. 双重损失函数 (Dual-Objective Loss)
-为了保留 CWT-MAE 的核心优势（时频分析），v3 引入了双重损失：
-1.  **Time Domain Loss**: `MSE(Pred_Signal, Raw_Signal)` - 确保波形准确。
-2.  **Frequency Domain Loss**: `MSE(CWT(Pred_Signal), CWT(Raw_Signal))` - 确保频域特征（如高频噪声、低频基线）一致。
-    *   注意：CWT 变换仅在 Loss 计算阶段进行，不参与前向推理，大幅提升了训练速度。
+- Python 3.8+
+- PyTorch 2.0+
+- NumPy
+- SciPy
+- Matplotlib
+- PyYAML
+- scikit-learn
+- tqdm
 
-### 3. 性能优势
-*   **显存占用**: 降低约 60%。因为 Sequence Length 从 960 (v2) / 800 (v1) 变为 750 (v3 @ patch_size=4)，且无需存储巨大的 2D 特征图。
-*   **Batch Size**: 在相同硬件下，Batch Size 可翻倍 (e.g., 128 -> 256)。
-*   **精度**: Pixel 级建模通常能捕捉到更微小的形态学异常（如 ECG 的 J 点抬高）。
+## Usage
 
-## 配置文件 (`config.yaml`)
+### Pre-training
 
-关键参数说明：
+To pre-train the model, configure the parameters in `config.yaml` and run:
 
-```yaml
-model:
-  # Patch Size: 控制建模粒度
-  # 1: 纯 Pixel 级别 (Sequence Length = 3000)，计算量大但最精细
-  # 4: 推荐值 (Sequence Length = 750)，效率与精度的平衡
-  patch_size: 4           
-  
-  # CWT Loss 权重
-  cwt_loss_weight: 1.0    
-```
-
-## 使用指南
-
-### 训练
 ```bash
 python train.py --config config.yaml
 ```
 
-### 推理
+Distributed training is supported and automatically detected if run with `torchrun`.
+
+### Fine-tuning
+
+To fine-tune the model on a classification task, run:
+
 ```bash
-python inference.py --data_root /path/to/data --checkpoint checkpoint_pixel_mae_v3/checkpoint_last.pth --num_classes 2
+python finetune.py --data_root /path/to/data --split_file /path/to/split.json --pretrained_path /path/to/checkpoint.pth
 ```
 
-## 迁移指南 (v1 -> v3)
-如果您有 v1 的预训练权重，**无法直接加载** 到 v3，因为 Embedding 层维度完全不同（2D vs 1D）。建议重新预训练。
+Key arguments for fine-tuning:
+- `--num_classes`: Number of target classes.
+- `--use_cot`: Enable the Latent Reasoning Head (Chain-of-Thought).
+- `--embed_dim`: Embedding dimension (default: 768).
+
+## Model Architecture
+
+The CWT-MAE model consists of:
+1. **CWT Module**: Converts 1D physiological signals into 2D time-frequency representations using Ricker wavelets.
+2. **Patch Embedding**: Splits the time-frequency map into patches and projects them into an embedding space.
+3. **Transformer Encoder**: Processes the patch embeddings with RoPE and Tensorized Linear layers for efficient computation.
+4. **Decoder**: Reconstructs the original signal (or its CWT representation) from the latent representation.
+
+For fine-tuning, the decoder is removed, and a classification head (Linear or CoT) is attached to the encoder output.
+
+## License
+
+[Specify License Here]

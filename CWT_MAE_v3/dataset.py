@@ -12,10 +12,12 @@ class PhysioSignalDataset(Dataset):
                  max_std_threshold=5000.0,
                  max_abs_value=1e5, # 新增：绝对值上限过滤
                  stride=None,       # 新增：滑动窗口步长
-                 original_len=3000  # 新增：原始信号长度（用于滑动窗口计算）
+                 original_len=3000, # 新增：原始信号长度（用于滑动窗口计算）
+                 contrastive=False  # 新增：是否启用对比学习模式
                  ):
         self.signal_len = signal_len
         self.mode = mode
+        self.contrastive = contrastive
         self.min_std_threshold = min_std_threshold
         self.max_std_threshold = max_std_threshold
         self.max_abs_value = max_abs_value
@@ -43,6 +45,26 @@ class PhysioSignalDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    def _augment_signal(self, signal):
+        """
+        Apply random augmentations to the signal:
+        1. Amplitude scaling (0.8 - 1.2)
+        2. Gaussian noise
+        """
+        if self.mode != 'train':
+            return signal
+            
+        # Amplitude scaling
+        scale = np.random.uniform(0.8, 1.2)
+        signal = signal * scale
+        
+        # Gaussian noise (scaled by signal std)
+        std = np.std(signal, axis=1, keepdims=True)
+        noise = np.random.normal(0, 0.05, signal.shape).astype(np.float32) * (std + 1e-6)
+        signal = signal + noise
+        
+        return signal
 
     def __getitem__(self, idx):
         # 重试机制
@@ -76,49 +98,80 @@ class PhysioSignalDataset(Dataset):
                     idx = random.randint(0, len(self.samples) - 1)
                     continue
 
-                # 2. 同步裁剪或填充 (使用固定起始位置或随机起始位置)
-                processed_signal = self._process_signal(raw_signal, fixed_start)
+                # 辅助函数：处理单个视图
+                def process_view(signal_data, start_pos):
+                    # 2. 同步裁剪或填充
+                    proc_sig = self._process_signal(signal_data, start_pos)
+                    
+                    # 增强 (仅在对比学习模式下，且是训练阶段)
+                    if self.contrastive and self.mode == 'train':
+                        proc_sig = self._augment_signal(proc_sig)
 
-                # 3. 逐通道质量检查
-                std_vals = np.std(processed_signal, axis=1, keepdims=True) # (M, 1)
+                    # 3. 逐通道质量检查
+                    std_v = np.std(proc_sig, axis=1, keepdims=True)
+                    if np.isnan(std_v).any() or \
+                       np.any(std_v > self.max_std_threshold) or \
+                       np.any(std_v < self.min_std_threshold):
+                        return None, None
+                    
+                    # 4. 逐通道 Z-Score 归一化
+                    mean_v = np.mean(proc_sig, axis=1, keepdims=True)
+                    proc_sig = (proc_sig - mean_v) / (std_v + 1e-5)
+                    proc_sig = np.clip(proc_sig, -10, 10)
+                    
+                    return torch.from_numpy(proc_sig), std_v
+
+                # 如果是对比学习模式，生成两个视图
+                if self.contrastive:
+                    # View 1
+                    sig_tensor1, std1 = process_view(raw_signal, fixed_start)
+                    if sig_tensor1 is None: raise ValueError("Bad signal view 1")
+                    
+                    # View 2 (如果是训练模式，尝试不同的随机裁剪)
+                    # 注意：如果 fixed_start 不为 None，则 View 2 位置也固定，主要靠 augment_signal 增强
+                    sig_tensor2, std2 = process_view(raw_signal, fixed_start)
+                    if sig_tensor2 is None: raise ValueError("Bad signal view 2")
+                    
+                    # 5. 通道乱序 (仅训练模式) - 两个视图保持相同的乱序还是不同？
+                    # 通常对比学习希望视图间有差异，但通道对应关系是否重要？
+                    # 如果通道代表不同的导联，打乱通道顺序可能会破坏语义对应。
+                    # 但在这里的模型是 "Permutation Invariant" (Modality Agnostic)，所以打乱是可以的。
+                    # 为了增加难度，可以让两个视图有不同的通道顺序，或者相同的。
+                    # 暂时保持两个视图使用 相同的 乱序（如果应用的话），或者 不同的？
+                    # 这里的 MAE 实现中，Forward Encoder 混合了所有通道。
+                    # 为了简单起见，如果乱序，对两个视图分别乱序。
+                    if self.mode == 'train':
+                        M = sig_tensor1.shape[0]
+                        perm_indices1 = torch.randperm(M)
+                        sig_tensor1 = sig_tensor1[perm_indices1]
+                        
+                        perm_indices2 = torch.randperm(M)
+                        sig_tensor2 = sig_tensor2[perm_indices2]
+                    
+                    return (sig_tensor1, sig_tensor2), torch.tensor(label, dtype=torch.long)
+
+                else:
+                    # 原始模式
+                    signal_tensor, std_val = process_view(raw_signal, fixed_start)
+                    if signal_tensor is None:
+                        idx = random.randint(0, len(self.samples) - 1)
+                        continue
+                        
+                    if self.mode == 'train':
+                        M = signal_tensor.shape[0]
+                        perm_indices = torch.randperm(M)
+                        signal_tensor = signal_tensor[perm_indices]
+
+                    return signal_tensor, torch.tensor(label, dtype=torch.long)
                 
-                # 深度过滤逻辑：
-                # 1. 检查 std 是否包含 NaN (np.std 在输入包含 NaN 时会返回 NaN)
-                # 2. 检查是否有任意通道标准差过大 (伪影)
-                # 3. 检查是否有任意通道标准差过小 (死线/脱落) -> 这里改为 np.any，只要有一个通道不行就换
-                if np.isnan(std_vals).any() or \
-                   np.any(std_vals > self.max_std_threshold) or \
-                   np.any(std_vals < self.min_std_threshold):
-                    idx = random.randint(0, len(self.samples) - 1)
-                    continue
-                
-                # 检查标签是否合法
-                if not isinstance(label, (int, float)) or np.isnan(label) or np.isinf(label):
-                    label = 0
-
-                # 4. 逐通道 Z-Score 归一化 (增加稳定性控制)
-                mean_vals = np.mean(processed_signal, axis=1, keepdims=True)
-                # 使用稍大的 epsilon 并在归一化后裁剪
-                processed_signal = (processed_signal - mean_vals) / (std_vals + 1e-5)
-                processed_signal = np.clip(processed_signal, -10, 10) # 限制在 [-10, 10] 标准差范围内
-
-                # 转为 Tensor
-                signal_tensor = torch.from_numpy(processed_signal) 
-
-                # 5. 通道乱序 (仅训练模式)
-                if self.mode == 'train':
-                    M = signal_tensor.shape[0]
-                    perm_indices = torch.randperm(M)
-                    signal_tensor = signal_tensor[perm_indices]
-
-                return signal_tensor, torch.tensor(label, dtype=torch.long)
-
             except Exception as e:
                 idx = random.randint(0, len(self.samples) - 1)
                 continue
         
-        # 兜底：返回全零信号和 0 标签
+        # 兜底
         fallback_signal = torch.zeros((1, self.signal_len), dtype=torch.float32)
+        if self.contrastive:
+             return (fallback_signal, fallback_signal), torch.tensor(0, dtype=torch.long)
         return fallback_signal, torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal, fixed_start=None):

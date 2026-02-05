@@ -24,7 +24,7 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
-from model import CWT_MAE_RoPE, cwt_wrap
+from model import CWT_MAE_RoPE 
 from dataset import PhysioSignalDataset
 
 # 启用 TensorFloat-32 (A100/3090/4090 必备加速)
@@ -116,9 +116,40 @@ def variable_channel_collate_fn(batch):
     """
     处理 Batch 中不同样本通道数不一致的情况。
     Batch: list of (tensor, label), where tensor shape is (M_i, L)
+    Or: list of ((v1, v2), label) for contrastive learning
     Output: (padded_signals, labels)
     """
-    # 1. 解包信号和标签
+    # 1. 检查是否是对比学习模式 (Tuple input)
+    elem = batch[0]
+    is_contrastive = isinstance(elem[0], (tuple, list))
+
+    if is_contrastive:
+        # batch: [((v1, v2), label), ...]
+        view1s = [item[0][0] for item in batch]
+        view2s = [item[0][1] for item in batch]
+        labels = [item[1] for item in batch]
+        
+        # 辅助函数：填充信号列表
+        def pad_signals(signals):
+            max_m = max([s.shape[0] for s in signals])
+            signal_len = signals[0].shape[1]
+            batch_size = len(signals)
+            padded = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
+            for i, s in enumerate(signals):
+                m = s.shape[0]
+                padded[i, :m, :] = s
+            return padded
+            
+        padded_v1 = pad_signals(view1s)
+        padded_v2 = pad_signals(view2s)
+        
+        # 拼接: [view1_batch; view2_batch] -> (2B, M, L)
+        padded_signals = torch.cat([padded_v1, padded_v2], dim=0)
+        labels = torch.stack(labels)
+        
+        return padded_signals, labels
+
+    # 2. 原始逻辑
     signals = [item[0] for item in batch]
     labels = [item[1] for item in batch]
     
@@ -139,56 +170,84 @@ def variable_channel_collate_fn(batch):
     return padded_signals, labels
 
 # -------------------------------------------------------------------
-# 3. 可视化函数 (v3: 1D Signal + CWT Spec)
+# 3. 可视化函数 (适配多通道、无 Channel ID)
 # -------------------------------------------------------------------
 def save_reconstruction_images(model, batch, epoch, save_dir):
     model.eval()
     with torch.no_grad():
         # 优先使用 bfloat16
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.amp.autocast('cuda', dtype=amp_dtype):
-            # forward 返回: total_loss, pred_signal, None, x_norm_signal
-            loss, pred_signal, _, orig_signal = model(batch)
+        with autocast(dtype=amp_dtype):
+            # forward 返回: loss, pred_spec, pred_time, imgs
+            loss, pred_spec, pred_time, imgs = model(batch)
         
         # 取 Batch 中的第一个样本 (Index 0)
-        # orig_signal: (B, M, L)
-        # pred_signal: (B, M, L)
+        # batch: (B, M, L)
+        # pred_time: (B, M, L)
+        # imgs: (B, M, 3, H, W)
         
+        # 我们随机选一个非零通道进行可视化 (假设第0个通道总是有数据的)
         sample_idx = 0
         channel_idx = 0 
         
         # --- 1. 时域波形 ---
-        orig_wave = orig_signal[sample_idx, channel_idx].float().cpu().numpy()
-        recon_wave = pred_signal[sample_idx, channel_idx].float().cpu().numpy()
+        orig_signal = batch[sample_idx, channel_idx].float().cpu().numpy()
+        recon_signal = pred_time[sample_idx, channel_idx].float().cpu().numpy()
         
+        # 简单的反归一化用于可视化 (假设模型内部做了 Instance Norm)
+        orig_mean = orig_signal.mean()
+        orig_std = orig_signal.std()
+        recon_signal = recon_signal * (orig_std + 1e-6) + orig_mean
+
         plt.figure(figsize=(15, 12))
         
         plt.subplot(3, 1, 1)
-        plt.plot(orig_wave, label='Original (Norm)', color='black', alpha=0.6, linewidth=1)
-        plt.plot(recon_wave, label='Reconstructed', color='red', alpha=0.6, linewidth=1)
+        plt.plot(orig_signal, label='Original', color='black', alpha=0.6, linewidth=1)
+        plt.plot(recon_signal, label='Reconstructed', color='red', alpha=0.6, linewidth=1)
         plt.title(f"Epoch {epoch} - Time Domain (Sample 0, Channel 0)")
         plt.legend()
         plt.grid(True, alpha=0.3)
 
-        # --- 2. 频域图谱 (手动计算 CWT) ---
-        # 计算 CWT 用于可视化对比
-        # 需要把 tensor 转回 device 计算
-        orig_t = torch.tensor(orig_wave).view(1, 1, -1).to(batch.device)
-        recon_t = torch.tensor(recon_wave).view(1, 1, -1).to(batch.device)
+        # --- 2. 频域图谱 ---
+        if isinstance(model, DDP):
+            patch_embed = model.module.patch_embed
+        else:
+            patch_embed = model.patch_embed
+            
+        p_h, p_w = patch_embed.patch_size
+        # imgs: [B, M, 3, H, W]
+        # pred_spec: [B, M, N_patches, pixels]
         
-        # 调用 model 中的 loss 计算用的 scales
-        cwt_scales = 64
-        orig_cwt = cwt_wrap(orig_t, num_scales=cwt_scales)[0, 0].float().cpu().numpy()
-        recon_cwt = cwt_wrap(recon_t, num_scales=cwt_scales)[0, 0].float().cpu().numpy()
+        # 取原始 CWT (Base Channel = 0)
+        orig_spec = imgs[sample_idx, channel_idx, 0, :, :].float().cpu().numpy()
         
+        # 重建图谱处理
+        # 1. 取出对应样本和通道的预测: (N_patches, pixels)
+        pred_p = pred_spec[sample_idx, channel_idx] 
+        
+        # 2. Reshape 回图像
+        # pixels = 3 * p_h * p_w
+        # Grid size
+        H_grid, W_grid = patch_embed.grid_size
+        C_cwt = 3
+        
+        # (H_grid * W_grid, C * ph * pw) -> (H_grid, W_grid, C, ph, pw)
+        pred_p = pred_p.view(H_grid, W_grid, C_cwt, p_h, p_w)
+        
+        # Permute to image format: (C, H_grid, ph, W_grid, pw) -> (C, H, W)
+        pred_p = pred_p.permute(2, 0, 3, 1, 4)
+        pred_p = pred_p.reshape(C_cwt, H_grid * p_h, W_grid * p_w)
+        
+        recon_spec = pred_p[0].float().cpu().numpy() # 只看 Base Channel
+
         plt.subplot(3, 1, 2)
-        plt.imshow(orig_cwt, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Original CWT")
+        plt.imshow(orig_spec, aspect='auto', origin='lower', cmap='jet')
+        plt.title("Original CWT (Base Component)")
         plt.colorbar()
 
         plt.subplot(3, 1, 3)
-        plt.imshow(recon_cwt, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Reconstructed CWT")
+        plt.imshow(recon_spec, aspect='auto', origin='lower', cmap='jet')
+        plt.title("Reconstructed CWT (Base Component)")
         plt.colorbar()
 
         plt.tight_layout()
@@ -249,8 +308,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         # labels = labels.to(device, non_blocking=True) # MAE 训练暂不需要标签
 
         # 混合精度前向传播
-        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-            loss, _, _, _ = model(batch)
+        with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
+            is_contrastive = config['model'].get('contrastive', False)
+            loss, _, _, _ = model(batch, contrastive=is_contrastive)
         
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -316,10 +376,8 @@ def main():
         signal_len=config['data']['signal_len'],
         stride=config['data'].get('stride'),
         original_len=config['data'].get('original_len', 3000),
-        mode='train',
-        min_std_threshold=config['data'].get('min_std_threshold', 1e-4),
-        max_std_threshold=config['data'].get('max_std_threshold', 5000.0),
-        max_abs_value=config['data'].get('max_abs_value', 1e5)
+        contrastive=config['model'].get('contrastive', False),
+        mode='train'
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -349,10 +407,12 @@ def main():
         logger.info(f"Total Steps: {total_steps}, Warmup Steps: {warmup_steps}")
         logger.info(f"Base LR: {base_lr}, Min LR: {min_lr}")
 
-    # 初始化模型 (v3 Pixel-based 参数)
+    # 初始化模型 (无 max_num_channels)
     model = CWT_MAE_RoPE(
         signal_len=config['data']['signal_len'],
-        patch_size=config['model'].get('patch_size', 4), # 使用 patch_size
+        cwt_scales=config['model'].get('cwt_scales', 64),
+        patch_size_time=config['model'].get('patch_size_time', 50),
+        patch_size_freq=config['model'].get('patch_size_freq', 4),
         embed_dim=config['model']['embed_dim'],
         depth=config['model']['depth'],
         num_heads=config['model']['num_heads'],
@@ -361,8 +421,9 @@ def main():
         decoder_num_heads=config['model']['decoder_num_heads'],
         mask_ratio=config['model'].get('mask_ratio', 0.75),
         mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5),
-        cwt_scales=config['model'].get('cwt_scales', 64),
-        cwt_loss_weight=config['model'].get('cwt_loss_weight', 1.0)
+        time_loss_weight=config['model'].get('time_loss_weight', 1.0),
+        contrastive_loss_weight=config['model'].get('contrastive_loss_weight', 0.1),
+        use_conv_stem=config['model'].get('use_conv_stem', False)
     )
     model.to(device)
 

@@ -8,9 +8,9 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import autocast 
+from torch.amp import autocast 
 
-# 导入 v3 版本的模型定义
+# 导入 v1 版本的模型定义
 from model_finetune import TF_MAE_Classifier
 
 # ==========================================
@@ -59,6 +59,11 @@ class AdaptivePatientDataset(Dataset):
                     raw_data = raw_data.astype(np.float32) # (M, L_raw)
                 
                 # 假设我们只处理第一个通道，或者需要修改这里以支持多通道推理逻辑
+                # 这里为了兼容 v1 的多通道特性，我们可能需要调整逻辑
+                # 但原 inference.py 似乎是针对单通道或已经展平的数据
+                # 如果是多通道模型，输入应该是 (M, L)
+                
+                # 这里假设 raw_data 是 (M, L_raw)
                 M, n_samples = raw_data.shape
                 if n_samples < signal_len: continue
                 
@@ -126,15 +131,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--output_csv', type=str, default="inference_report_v3.csv")
+    parser.add_argument('--output_csv', type=str, default="inference_report_v1.csv")
     
-    # 模型参数 (v3)
-    parser.add_argument('--signal_len', type=int, default=3000)
+    # 模型参数
+    parser.add_argument('--signal_len', type=int, default=3000) # v1 默认 3000
     parser.add_argument('--embed_dim', type=int, default=768)
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--num_heads', type=int, default=12)
     parser.add_argument('--num_classes', type=int, default=2, help="分类数量")
-    parser.add_argument('--patch_size', type=int, default=4) # v3 使用 patch_size
+    parser.add_argument('--cwt_scales', type=int, default=64)
+    parser.add_argument('--patch_size_time', type=int, default=50)
+    parser.add_argument('--patch_size_freq', type=int, default=4)
     parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
 
     # 推理参数
@@ -154,12 +161,14 @@ def main():
         pretrained_path=None,
         num_classes=args.num_classes,
         signal_len=args.signal_len,
-        patch_size=args.patch_size, # v3
+        cwt_scales=args.cwt_scales,
+        patch_size_time=args.patch_size_time,
+        patch_size_freq=args.patch_size_freq,
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
         mlp_rank_ratio=args.mlp_rank_ratio,
-        use_cot=True 
+        use_cot=True # v1 默认开启 CoT
     )
     
     state_dict = torch.load(args.checkpoint, map_location='cpu')
@@ -214,7 +223,7 @@ def main():
         with torch.no_grad():
             for x in loader:
                 x = x.to(device)
-                with autocast(dtype=amp_dtype):
+                with autocast(device_type='cuda', dtype=amp_dtype):
                     logits = model(x)
                     # 强制 float32 保证精度
                     probs = F.softmax(logits.float(), dim=1)

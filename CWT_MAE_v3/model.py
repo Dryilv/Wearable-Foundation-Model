@@ -5,7 +5,7 @@ import numpy as np
 import math
 
 # ===================================================================
-# 1. CWT 模块 (用于 Loss 计算)
+# 1. CWT 模块 (保持不变)
 # ===================================================================
 @torch.compiler.disable
 def create_ricker_wavelets(points, scales):
@@ -41,26 +41,38 @@ def cwt_ricker(x, scales):
 
 @torch.compiler.disable
 def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0):
-    # x: (B, M, L) or (B*M, L)
+    # 支持 (B, M, L) 输入
     if x.dim() == 2:
         x = x.unsqueeze(1) # (B, 1, L)
     
-    # Flatten M into B
-    B_in, M_in, L = x.shape
-    x_flat = x.view(B_in * M_in, L)
+    B, M, L = x.shape
+    x_flat = x.view(B * M, L)
     
-    # CWT Calculation
+    x_pad = F.pad(x_flat, (1, 1), mode='replicate') 
+    d1 = x_pad[:, 1:] - x_pad[:, :-1]
+    d2 = d1[:, 1:] - d1[:, :-1]
+    
+    base = x_flat
+    d1_cut = d1[:, :L]
+    d2_cut = d2[:, :L]
+    
+    signals = torch.stack([base, d1_cut, d2_cut], dim=1) 
+    BM, C, _ = signals.shape
+    signals_flat = signals.view(BM * C, L)
+    
     scales = torch.arange(num_scales, device=x.device) * step + lowest_scale
-    cwt_out = cwt_ricker(x_flat, scales) # (BM, Scales, L)
+    cwt_out = cwt_ricker(signals_flat, scales)
+    _, n_scales, _ = cwt_out.shape
     
-    # Reshape back
-    n_scales = cwt_out.shape[1]
-    cwt_out = cwt_out.view(B_in, M_in, n_scales, L)
+    cwt_out = cwt_out.view(B, M, C, n_scales, L)
     return cwt_out
 
 # ===================================================================
-# 2. RoPE & 基础组件
+# 2. RoPE & 3. 基础组件 (保持不变)
 # ===================================================================
+# ... (RotaryEmbedding, apply_rotary_pos_emb, TensorizedLinear, 
+#      DecomposedPatchEmbed, RoPEAttention, TensorizedBlock, Block 
+#      代码与之前一致，此处省略) ...
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=6000):
@@ -112,27 +124,34 @@ class TensorizedLinear(nn.Module):
     def forward(self, x):
         return self.u(self.v(x))
 
-class PointPatchEmbed(nn.Module):
-    """
-    1D Signal Embedding:
-    Maps 1D signal chunks (Patch Size) to Embedding Dimension.
-    If patch_size=1, this is a Point-wise Linear Projection.
-    """
-    def __init__(self, signal_len=3000, patch_size=4, in_chans=1, embed_dim=768, norm_layer=None):
+class DecomposedPatchEmbed(nn.Module):
+    def __init__(self, img_size=(64, 500), patch_size=(4, 50), in_chans=3, embed_dim=768, norm_layer=None, use_conv_stem=False):
         super().__init__()
-        self.signal_len = signal_len
+        self.img_size = img_size
         self.patch_size = patch_size
-        self.num_patches = signal_len // patch_size
+        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
         
-        # 使用 Conv1d 实现 Patch Embedding
-        # kernel_size=patch_size, stride=patch_size 实现非重叠切片
-        self.proj = nn.Conv1d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        if use_conv_stem:
+            # 卷积 Stem: 增强局部特征提取
+            # Conv(3x3) -> Conv(3x3) -> Patching
+            self.proj = nn.Sequential(
+                nn.Conv2d(in_chans, embed_dim // 4, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(embed_dim // 4),
+                nn.GELU(),
+                nn.Conv2d(embed_dim // 4, embed_dim // 2, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(embed_dim // 2),
+                nn.GELU(),
+                nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=patch_size, stride=patch_size)
+            )
+        else:
+            self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+            
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
-        # x: (B, 1, L)
-        x = self.proj(x) # (B, D, N)
-        x = x.transpose(1, 2) # (B, N, D)
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x
 
@@ -202,15 +221,52 @@ class Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
+class FeatureReweighting(nn.Module):
+    """
+    Feature Reweighting Module to make signal features prominent.
+    Uses a gating mechanism to re-weight feature dimensions.
+    """
+    def __init__(self, dim, reduction=4):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(dim, dim // reduction, bias=False),
+            nn.ReLU(),
+            nn.Linear(dim // reduction, dim, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (B, N, C)
+        # Apply gating element-wise
+        w = self.fc(x)
+        return x * w
+
+class ContrastiveHead(nn.Module):
+    """
+    Projection Head for Contrastive Learning.
+    """
+    def __init__(self, in_dim, out_dim=128, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 # ===================================================================
-# 4. 主模型: Pixel/Point-based CWT-MAE (v3)
+# 4. 主模型: Modality-Agnostic CWT-MAE
 # ===================================================================
 
 class CWT_MAE_RoPE(nn.Module):
     def __init__(
         self, 
-        signal_len=3000, 
-        patch_size=4,          # v3 关键参数: 如果设为1则为纯Pixel级
+        signal_len=500, 
+        cwt_scales=64,
+        patch_size_time=50,
+        patch_size_freq=4,
         embed_dim=768, 
         depth=12, 
         num_heads=12,
@@ -220,36 +276,44 @@ class CWT_MAE_RoPE(nn.Module):
         mask_ratio=0.75,       
         mlp_rank_ratio=0.5,    
         norm_layer=nn.LayerNorm,
-        cwt_scales=64,         # 仅用于 CWT Loss
-        cwt_loss_weight=1.0    # CWT Loss 权重
+        time_loss_weight=1.0,
+        contrastive_loss_weight=0.1,
+        use_conv_stem=False
     ):
         super().__init__()
         
         self.mask_ratio = mask_ratio
-        self.signal_len = signal_len
-        self.patch_size = patch_size
         self.cwt_scales = cwt_scales
-        self.cwt_loss_weight = cwt_loss_weight
+        self.time_loss_weight = time_loss_weight
+        self.contrastive_loss_weight = contrastive_loss_weight
+        self.patch_size_time = patch_size_time
         
-        # 1. 1D Point/Patch Embed
-        self.patch_embed = PointPatchEmbed(
-            signal_len=signal_len,
-            patch_size=patch_size,
-            in_chans=1, # 处理单通道 (多通道在Batch维)
+        # 1. Patch Embed (共享权重，不区分通道)
+        self.patch_embed = DecomposedPatchEmbed(
+            img_size=(cwt_scales, signal_len),
+            patch_size=(patch_size_freq, patch_size_time),
+            in_chans=3,
             embed_dim=embed_dim,
-            norm_layer=norm_layer
+            norm_layer=norm_layer,
+            use_conv_stem=use_conv_stem
         )
         self.num_patches = self.patch_embed.num_patches
+        self.grid_size = self.patch_embed.grid_size 
 
         # 2. Embeddings
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+        # Time Position Embedding (只编码时间，不编码通道)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
         
-        # RoPE
+        # 【关键修改】移除了 channel_embed
+        # 模型现在是 "Permutation Invariant" 的，它只看信号内容
+
+        # RoPE Generators
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
         self.rope_decoder = RotaryEmbedding(dim=decoder_embed_dim // decoder_num_heads)
 
-        # 3. Encoder
+        # 3. Encoder Blocks
         self.blocks = nn.ModuleList([
             TensorizedBlock(
                 embed_dim, num_heads, 
@@ -264,6 +328,7 @@ class CWT_MAE_RoPE(nn.Module):
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, decoder_embed_dim))
+        # 【关键修改】移除了 decoder_channel_embed
         
         self.decoder_blocks = nn.ModuleList([
             Block(decoder_embed_dim, num_heads=decoder_num_heads, norm_layer=norm_layer) 
@@ -271,9 +336,19 @@ class CWT_MAE_RoPE(nn.Module):
         ])
         self.decoder_norm = norm_layer(decoder_embed_dim)
         
-        # 5. Prediction Head
-        # 预测每个 Patch 内的 Pixel 值 (长度为 patch_size)
-        self.pred_head = nn.Linear(decoder_embed_dim, patch_size, bias=True)
+        # 5. Heads
+        self.patch_pixels = 3 * patch_size_freq * patch_size_time
+        self.decoder_pred_spec = nn.Linear(decoder_embed_dim, self.patch_pixels, bias=True)
+
+        self.time_reducer = nn.Sequential(
+            nn.Conv2d(decoder_embed_dim, decoder_embed_dim, kernel_size=(self.grid_size[0], 1)),
+            nn.GELU()
+        )
+        self.time_pred = nn.Linear(decoder_embed_dim, patch_size_time, bias=True)
+
+        # 6. Feature Enhancement & Contrastive Head (New for V3)
+        self.feature_reweighter = FeatureReweighting(embed_dim)
+        self.contrastive_head = ContrastiveHead(embed_dim)
 
         self.initialize_weights()
 
@@ -291,7 +366,7 @@ class CWT_MAE_RoPE(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv1d):
+        elif isinstance(m, nn.Conv2d):
             torch.nn.init.xavier_uniform_(m.weight)
 
     def random_masking(self, x, mask_ratio):
@@ -308,126 +383,186 @@ class CWT_MAE_RoPE(nn.Module):
         return x_masked, mask, ids_restore, ids_keep
 
     def forward_encoder(self, x):
-        # x: (B*M, 1, L) -> (B*M, N, D)
-        x = self.patch_embed(x)
+        # x: (B, M, 3, Scales, Time)
+        B, M, C, H, W = x.shape
         
-        # Add Pos Embed
-        x = x + self.pos_embed[:, 1:, :]
-        
-        # Masking
+        # 1. Patch Embedding (所有通道共享同一个 Embedder)
+        x = x.view(B * M, C, H, W)
+        x = self.patch_embed(x) # (B*M, N_patches, D)
+        x = x.view(B, M, -1, x.shape[-1]) # (B, M, N_patches, D)
+        N_patches = x.shape[2]
+
+        # 2. Add Time Position Embeddings (只加时间，不加通道)
+        # pos_embed: (1, N_patches+1, D)
+        time_pos = self.pos_embed[:, 1:, :]
+        x = x + time_pos.unsqueeze(1) # Broadcast to M
+
+        # 3. Flatten (B, M*N_patches, D)
+        # 这里我们将所有信号混合在一起，模型不知道哪个 Patch 来自哪个信号
+        # 它只能通过 Patch 的内容（波形形状）来判断
+        x = x.view(B, M * N_patches, -1)
+
+        # 4. Masking
         if self.mask_ratio == 0.0:
             x_masked = x
-            mask = torch.zeros(x.shape[0], x.shape[1], device=x.device)
-            ids_restore = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand(x.shape[0], -1)
+            mask = torch.zeros(B, M * N_patches, device=x.device)
+            ids_restore = torch.arange(M * N_patches, device=x.device).unsqueeze(0).expand(B, -1)
             ids_keep = ids_restore
         else:
             x_masked, mask, ids_restore, ids_keep = self.random_masking(x, self.mask_ratio)
 
-        # Append CLS Token
+        # 5. Append CLS Token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
-        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+        cls_tokens = cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x_masked), dim=1)
-        
-        # RoPE IDs
-        B, N_curr, _ = x.shape
-        N_patches = self.num_patches
+
+        # 6. RoPE Position IDs
+        # 关键：不同信号的同一时刻，拥有相同的 RoPE ID
         cls_pos = torch.zeros(B, 1, device=x.device, dtype=torch.long)
-        patch_pos = ids_keep + 1
+        patch_pos_indices = ids_keep % N_patches # 取模，获取时间索引
+        patch_pos = patch_pos_indices + 1
         pos_ids = torch.cat((cls_pos, patch_pos), dim=1)
-        
-        # Transformer
+
+        # 7. Transformer
         rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
         for blk in self.blocks:
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
         x = self.norm(x)
         
-        return x, mask, ids_restore
+        return x, mask, ids_restore, M
 
-    def forward_decoder(self, x, ids_restore):
+    def forward_decoder(self, x, ids_restore, M):
         x = self.decoder_embed(x)
-        mask_tokens = self.mask_token.repeat(x.shape[0], self.num_patches + 1 - x.shape[1], 1)
+        B, _, D_dec = x.shape
+        N_patches = self.num_patches
+        Total_Tokens = M * N_patches
+
+        mask_tokens = self.mask_token.repeat(B, Total_Tokens + 1 - x.shape[1], 1)
         x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D_dec))
         x = torch.cat([x[:, :1, :], x_], dim=1)
-        x = x + self.decoder_pos_embed
+
+        # Add Decoder Time Pos (No Channel Pos)
+        x_patches = x[:, 1:, :].view(B, M, N_patches, D_dec)
+        x_patches = x_patches + self.decoder_pos_embed[:, 1:, :].unsqueeze(1)
+        x_patches = x_patches.view(B, Total_Tokens, D_dec)
+        x = torch.cat([x[:, :1, :], x_patches], dim=1)
+
+        # RoPE
+        patch_pos_indices = torch.arange(Total_Tokens, device=x.device) % N_patches
+        patch_pos = patch_pos_indices + 1
+        patch_pos = patch_pos.unsqueeze(0).expand(B, -1)
+        cls_pos = torch.zeros(B, 1, device=x.device, dtype=torch.long)
+        pos_ids = torch.cat((cls_pos, patch_pos), dim=1)
         
-        B, N, _ = x.shape
-        pos_ids = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
         rope_cos, rope_sin = self.rope_decoder(x, pos_ids)
-        
         for blk in self.decoder_blocks:
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
         x = self.decoder_norm(x)
-        return x[:, 1:, :] # Drop CLS
+        
+        x = x[:, 1:, :].view(B, M, N_patches, D_dec)
+        return x
 
-    def forward_loss_raw(self, x_raw, pred_raw, mask):
-        # x_raw: (B, 1, L)
-        # pred_raw: (B, L)
-        # mask: (B, N_patches) -> expand to pixels
-        
-        B, _, L = x_raw.shape
-        P = self.patch_size
-        
-        # 重塑 target 以匹配 patch
-        target = x_raw.view(B, -1, P) # (B, N, P)
-        pred = pred_raw.view(B, -1, P) # (B, N, P)
-        
+    def forward_loss_spec(self, imgs, pred, mask):
+        B, M, C, H, W = imgs.shape
+        p_h, p_w = self.patch_embed.patch_size
+        target = imgs.view(B, M, C, H // p_h, p_h, W // p_w, p_w)
+        target = target.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
+        target = target.view(B, M, -1, C * p_h * p_w)
+        mask = mask.view(B, M, -1)
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1) # (B, N)
+        loss = loss.mean(dim=-1)
         loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         return loss
 
-    def forward_loss_cwt(self, x_raw, pred_raw):
-        # 计算频域 Loss
-        # x_raw, pred_raw: (B, 1, L)
-        # CWT 是不可学习的，只是一个变换
-        
-        # 归一化输入以确保 Loss 尺度一致
-        x_cwt = cwt_wrap(x_raw, num_scales=self.cwt_scales)
-        pred_cwt = cwt_wrap(pred_raw.unsqueeze(1), num_scales=self.cwt_scales)
-        
-        # 简单的 MSE Loss (Magnitude)
-        # 可以只看幅度
-        loss = F.mse_loss(pred_cwt, x_cwt)
+    def forward_loss_time(self, x_raw, pred_time):
+        x_raw = x_raw.float()
+        mean = x_raw.mean(dim=-1, keepdim=True)
+        std = x_raw.std(dim=-1, keepdim=True)
+        std = torch.clamp(std, min=1e-5)
+        target = (x_raw - mean) / std
+        loss = F.mse_loss(pred_time.float(), target)
         return loss
 
-    def forward(self, x):
+    def info_nce_loss(self, features, temperature=0.1):
+        # features: (2*B, D)
+        B = features.shape[0] // 2
+        features = F.normalize(features, dim=1)
+        similarity_matrix = torch.matmul(features, features.T)
+        
+        # Mask out self-similarity
+        mask = torch.eye(2 * B, device=features.device).bool()
+        similarity_matrix.masked_fill_(mask, -9e15)
+        
+        # Positive pairs: (i, i+B) and (i+B, i)
+        # logits[i, i+B] is the positive logit for i
+        
+        # Denominator: sum of exp(sim / temp)
+        logits = similarity_matrix / temperature
+        
+        # Labels: The index of the positive pair
+        # For i in [0, B-1], positive is i+B
+        # For i in [B, 2B-1], positive is i-B
+        labels = torch.cat([
+            torch.arange(B, 2*B, device=features.device),
+            torch.arange(0, B, device=features.device)
+        ])
+        
+        loss = F.cross_entropy(logits, labels)
+        return loss
+
+    def forward(self, x, contrastive=False):
         """
-        x: (B, M, L) or (B, L)
+        x: (B, M, L) 或 (B, L)
+        If contrastive=True, x is expected to be stacked views (2B, M, L).
         """
         if x.dim() == 2: x = x.unsqueeze(1)
-        B, M, L = x.shape
         
-        # 1. Flatten Channels (Treat each channel as independent sample)
-        x_flat = x.view(B * M, 1, L)
+        # 1. CWT & Norm
+        imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
+        imgs_f32 = imgs.float() 
+        mean = imgs_f32.mean(dim=(3, 4), keepdim=True)
+        std = imgs_f32.std(dim=(3, 4), keepdim=True)
+        std = torch.clamp(std, min=1e-5)
+        imgs = (imgs_f32 - mean) / std
         
-        # 2. Normalize (Instance Norm per channel)
-        mean = x_flat.mean(dim=2, keepdim=True)
-        std = x_flat.std(dim=2, keepdim=True) + 1e-5
-        x_norm = (x_flat - mean) / std
+        # 数值鲁棒性增强
+        imgs = torch.nan_to_num(imgs, nan=0.0, posinf=100.0, neginf=-100.0)
+        imgs = torch.clamp(imgs, min=-100.0, max=100.0)
+
+        # 确保输入数据类型与模型权重一致
+        target_dtype = next(self.parameters()).dtype
+        imgs = imgs.to(dtype=target_dtype)
+
+        # 2. Encoder
+        latent, mask, ids, M = self.forward_encoder(imgs)
         
-        # 3. Encoder & Decoder
-        latent, mask, ids = self.forward_encoder(x_norm)
-        decoder_features = self.forward_decoder(latent, ids)
+        # Feature Prominence Enhancement
+        latent = self.feature_reweighter(latent)
         
-        # 4. Predict
-        # decoder_features: (BM, N, D)
-        # pred_head: (D) -> (P)
-        pred_patches = self.pred_head(decoder_features) # (BM, N, P)
-        pred_raw = pred_patches.view(B * M, L) # Reconstruct 1D signal
+        # Contrastive Loss
+        loss_contrastive = torch.tensor(0.0, device=x.device)
+        if contrastive:
+            # latent: (2B, N_vis+1, D)
+            cls_token = latent[:, 0, :] # (2B, D)
+            proj_features = self.contrastive_head(cls_token) # (2B, 128)
+            loss_contrastive = self.info_nce_loss(proj_features)
+
+        # 3. Decoder
+        decoder_features = self.forward_decoder(latent, ids, M)
         
-        # 5. Loss
-        # 时域 Loss (只计算 Mask 部分)
-        loss_raw = self.forward_loss_raw(x_norm, pred_raw, mask)
+        # 4. Heads
+        pred_spec = self.decoder_pred_spec(decoder_features)
+        loss_spec = self.forward_loss_spec(imgs, pred_spec, mask)
         
-        # 频域 Loss (计算整体，或者也可以只计算 Mask 部分，这里计算整体简单点)
-        # 注意：这里我们强制模型生成的信号不仅时域像，频域也要像
-        loss_cwt = self.forward_loss_cwt(x_norm, pred_raw)
+        B, M, N, D = decoder_features.shape
+        H_grid, W_grid = self.grid_size
+        feat_2d = decoder_features.reshape(B * M, N, D).transpose(1, 2).reshape(B * M, D, H_grid, W_grid)
+        feat_time_agg = self.time_reducer(feat_2d).squeeze(2).transpose(1, 2)
+        pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M, -1)
         
-        total_loss = loss_raw + self.cwt_loss_weight * loss_cwt
+        loss_time = self.forward_loss_time(x, pred_time)
         
-        # 还原形状用于返回
-        pred_signal = pred_raw.view(B, M, L)
-        x_norm_signal = x_norm.view(B, M, L)
+        total_loss = loss_spec + self.time_loss_weight * loss_time + self.contrastive_loss_weight * loss_contrastive
         
-        return total_loss, pred_signal, None, x_norm_signal
+        return total_loss, pred_spec, pred_time, imgs

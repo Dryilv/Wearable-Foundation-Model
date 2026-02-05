@@ -71,7 +71,7 @@ class LatentReasoningHead(nn.Module):
         return logits
 
 # ===================================================================
-# 2. 主分类器模型封装 (v3 Pixel-based)
+# 2. 主分类器模型封装
 # ===================================================================
 class TF_MAE_Classifier(nn.Module):
     def __init__(self, pretrained_path, num_classes, 
@@ -81,18 +81,12 @@ class TF_MAE_Classifier(nn.Module):
                  **kwargs):
         super().__init__()
         
-        # 1. 初始化 Encoder (Pixel-MAE-RoPE)
-        # 注意：不再需要 CWT 相关参数 (除非想保留 CWT Loss 结构用于其他用途，但在分类中不需要)
-        # 我们只传递影响 Encoder 结构的参数
+        # 1. 初始化 Encoder (CWT-MAE-RoPE)
+        # 注意：不再需要 max_num_channels
         self.encoder_model = CWT_MAE_RoPE(
             mlp_rank_ratio=mlp_rank_ratio,
             mask_ratio=0.0, # 微调时关闭 Mask
-            patch_size=kwargs.get('patch_size', 4), # 使用 patch_size
-            signal_len=kwargs.get('signal_len', 3000),
-            embed_dim=kwargs.get('embed_dim', 768),
-            depth=kwargs.get('depth', 12),
-            num_heads=kwargs.get('num_heads', 12),
-            **{k:v for k,v in kwargs.items() if k not in ['patch_size', 'signal_len', 'embed_dim', 'depth', 'num_heads']}
+            **kwargs
         )
         self.embed_dim = kwargs.get('embed_dim', 768)
         
@@ -122,9 +116,12 @@ class TF_MAE_Classifier(nn.Module):
 
     def _delete_decoder_components(self):
         """删除预训练模型中的 Decoder 部分"""
+        # 使用 hasattr 检查，避免属性不存在时报错
         components_to_delete = [
-            'decoder_blocks', 'decoder_embed', 'decoder_pred_spec', 'pred_head',
-            'mask_token', 'decoder_pos_embed', 'rope_decoder', 'decoder_norm'
+            'decoder_blocks', 'decoder_embed', 'decoder_pred_spec',
+            'time_reducer', 'time_pred', 'mask_token',
+            'decoder_pos_embed', 'rope_decoder', 'decoder_norm',
+            'decoder_channel_embed', 'channel_embed' # 确保清理旧版本可能存在的组件
         ]
         
         for component in components_to_delete:
@@ -143,7 +140,10 @@ class TF_MAE_Classifier(nn.Module):
         encoder_dict = {}
         for k, v in new_state_dict.items():
             # 过滤 decoder 相关
-            if any(x in k for x in ["decoder", "mask_token", "pred_head", "rope_decoder"]):
+            if any(x in k for x in ["decoder", "mask_token", "time_reducer", "time_pred", "rope_decoder"]):
+                continue
+            # 过滤 channel_embed 相关 (如果预训练模型是旧版)
+            if "channel_embed" in k:
                 continue
             encoder_dict[k] = v
             
@@ -164,14 +164,17 @@ class TF_MAE_Classifier(nn.Module):
         cls_token = old_pos_embed[:, :1, :]
         patch_tokens = old_pos_embed[:, 1:, :] 
         
-        # 1D 插值
-        # patch_tokens: (1, N_old, D) -> (1, D, N_old)
-        patch_tokens = patch_tokens.transpose(1, 2)
-        N_new = new_pos_embed.shape[1] - 1
+        grid_h, grid_w_new = self.encoder_model.grid_size
+        n_old = patch_tokens.shape[1]
         
-        patch_tokens = F.interpolate(patch_tokens, size=(N_new,), mode='linear', align_corners=False)
-        # -> (1, D, N_new) -> (1, N_new, D)
-        patch_tokens = patch_tokens.transpose(1, 2)
+        # 假设 grid_h (频率维度) 不变，只改变 grid_w (时间维度)
+        # 如果 n_old 不能被 grid_h 整除，说明预训练时的 grid_h 可能不同，这里简单假设 grid_h 兼容
+        grid_w_old = n_old // grid_h
+        dim = patch_tokens.shape[-1]
+        
+        patch_tokens = patch_tokens.transpose(1, 2).reshape(1, dim, grid_h, grid_w_old)
+        patch_tokens = F.interpolate(patch_tokens, size=(grid_h, grid_w_new), mode='bicubic', align_corners=False)
+        patch_tokens = patch_tokens.flatten(2).transpose(1, 2)
         
         new_pos_embed_interpolated = torch.cat((cls_token, patch_tokens), dim=1)
         state_dict[key] = new_pos_embed_interpolated
@@ -182,38 +185,42 @@ class TF_MAE_Classifier(nn.Module):
         """
         # 兼容单通道输入 (B, L) -> (B, 1, L)
         if x.dim() == 2: x = x.unsqueeze(1)
-        B, M, L = x.shape
         
-        # 1. Normalize (Instance Norm per channel)
-        # v3 模型直接接收 1D 信号
-        x_flat = x.view(B * M, 1, L)
-        mean = x_flat.mean(dim=2, keepdim=True)
-        std = x_flat.std(dim=2, keepdim=True) + 1e-5
-        x_norm = (x_flat - mean) / std
+        # 1. CWT 变换 (B, M, L) -> (B, M, 3, Scales, L)
+        # 注意：cwt_wrap 现在支持多通道
+        imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0)
         
+        # 2. Instance Norm (独立对每个通道、每个样本归一化)
+        imgs_f32 = imgs.float()
+        # mean/std over (H, W) -> (B, M, 3, 1, 1)
+        mean = imgs_f32.mean(dim=(3, 4), keepdim=True)
+        std = imgs_f32.std(dim=(3, 4), keepdim=True)
+        std = torch.clamp(std, min=1e-5)
+        imgs = (imgs_f32 - mean) / std
+        
+        # 数值鲁棒性增强：防止 CWT 产生的极端值引发梯度爆炸
+        imgs = torch.nan_to_num(imgs, nan=0.0, posinf=100.0, neginf=-100.0)
+        imgs = torch.clamp(imgs, min=-100.0, max=100.0)
+
         # 确保输入数据类型与模型权重一致
         target_dtype = next(self.encoder_model.parameters()).dtype
-        x_norm = x_norm.to(dtype=target_dtype)
+        imgs = imgs.to(dtype=target_dtype)
 
-        # 2. Forward Encoder
+        # 3. Forward Encoder
+        # 新版 forward_encoder 返回: x, mask, ids, M
+        # x 的形状是 (B, M*N_patches + 1, D)
         self.encoder_model.mask_ratio = 0.0
-        # forward_encoder 返回: x, mask, ids_restore
-        # x 的形状是 (B*M, N_patches + 1, D)
-        latent, _, _ = self.encoder_model.forward_encoder(x_norm)
+        latent, _, _, _ = self.encoder_model.forward_encoder(imgs)
         
-        # 3. 提取特征
+        # 4. 提取特征
         # 丢弃 CLS token (index 0)，保留 Patch tokens
-        # patch_tokens: (B*M, N_patches, D)
-        # 但我们需要 reshape 成 (B, M*N_patches, D) 以保留 M 的结构供 CoT 使用
-        N_patches = latent.shape[1] - 1
-        D = latent.shape[2]
-        
+        # patch_tokens: (B, M*N_patches, D)
         patch_tokens = latent[:, 1:, :] 
-        patch_tokens = patch_tokens.view(B, M * N_patches, D)
         
-        # 4. Forward Head
+        # 5. Forward Head
         if isinstance(self.head, LatentReasoningHead):
             # CoT 模式: 输入所有 Patch Tokens (混合了所有通道的信息)
+            # Cross-Attention 会自动处理 M*N 的长度
             logits = self.head(patch_tokens)
         else:
             # MLP 模式: Global Average Pooling
