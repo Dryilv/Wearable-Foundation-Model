@@ -40,6 +40,9 @@ model:
   
   # --- CWT Loss 参数 ---
   # 虽然输入不使用 CWT，但我们用 CWT Loss 约束频域一致性
+  # [消融实验设置]
+  # - 1.0: 启用 CWT Loss (Dual-Objective)，验证“隐式频域约束”的有效性 (v3 Default)
+  # - 0.0: 禁用 CWT Loss (Pure Time-Domain)，验证 Transformer 纯时域建模能力 (Baseline)
   cwt_scales: 64          
   cwt_loss_weight: 1.0    
   
