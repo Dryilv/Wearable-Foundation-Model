@@ -17,22 +17,24 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.cuda.amp import autocast
+from torch.cuda.amp import autocast, GradScaler
+
+# 允许编译失败时自动回退
 import torch._dynamo
-# 允许编译失败时自动回退到普通模式，而不是直接报错退出
 torch._dynamo.config.suppress_errors = True
-# 【关键修改】导入 RoPE 版本的模型
-# 假设您将上一段代码保存为 model_rope_complete.py
-from model import CWT_MAE_RoPE 
+
+# 导入你的模型和数据集
+from model import CWT_MAE_RoPE, cwt_wrap
 from dataset import PhysioSignalDataset
 
-# 启用 TensorFloat-32 以加速矩阵乘法 (A100/H100/3090/4090)
+# 启用 TensorFloat-32 (A100/3090/4090 必备加速)
 torch.set_float32_matmul_precision('high') 
 
 # -------------------------------------------------------------------
 # 1. 辅助工具类
 # -------------------------------------------------------------------
 class SmoothedValue(object):
+    """用于平滑记录 Loss 和 LR"""
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
             fmt = "{median:.4f} ({global_avg:.4f})"
@@ -108,68 +110,85 @@ def init_distributed_mode():
         return 0, 0, 1
 
 # -------------------------------------------------------------------
-# 2. 可视化函数 (适配新模型输出)
+# 2. 关键：处理变长通道的 Collate Function
+# -------------------------------------------------------------------
+def variable_channel_collate_fn(batch):
+    """
+    处理 Batch 中不同样本通道数不一致的情况。
+    Batch: list of (tensor, label), where tensor shape is (M_i, L)
+    Output: (padded_signals, labels)
+    """
+    # 1. 解包信号和标签
+    signals = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+    
+    # 2. 找到当前 Batch 中最大的通道数
+    max_m = max([s.shape[0] for s in signals])
+    signal_len = signals[0].shape[1]
+    batch_size = len(signals)
+    
+    # 3. 初始化全 0 张量并填充信号
+    padded_signals = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
+    for i, s in enumerate(signals):
+        m = s.shape[0]
+        padded_signals[i, :m, :] = s
+        
+    # 4. 堆叠标签
+    labels = torch.stack(labels)
+        
+    return padded_signals, labels
+
+# -------------------------------------------------------------------
+# 3. 可视化函数 (v3: 1D Signal + CWT Spec)
 # -------------------------------------------------------------------
 def save_reconstruction_images(model, batch, epoch, save_dir):
     model.eval()
     with torch.no_grad():
-        # 优先使用 bfloat16，因为 RoPE 在 fp16 下可能溢出，但 bf16 没问题
+        # 优先使用 bfloat16
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with autocast(dtype=amp_dtype):
-            loss, pred_spec, pred_time, imgs = model(batch)
+            # forward 返回: total_loss, pred_signal, None, x_norm_signal
+            loss, pred_signal, _, orig_signal = model(batch)
         
-        idx = 0 # 取 Batch 中的第一个样本
+        # 取 Batch 中的第一个样本 (Index 0)
+        # orig_signal: (B, M, L)
+        # pred_signal: (B, M, L)
+        
+        sample_idx = 0
+        channel_idx = 0 
         
         # --- 1. 时域波形 ---
-        # batch: [B, 1, L] -> [L]
-        orig_signal = batch[idx].squeeze().float().cpu().numpy()
-        recon_signal = pred_time[idx].float().cpu().numpy()
+        orig_wave = orig_signal[sample_idx, channel_idx].float().cpu().numpy()
+        recon_wave = pred_signal[sample_idx, channel_idx].float().cpu().numpy()
         
-        # 简单的反归一化用于可视化 (假设模型内部做了 Instance Norm)
-        orig_mean = orig_signal.mean()
-        orig_std = orig_signal.std()
-        recon_signal = recon_signal * (orig_std + 1e-6) + orig_mean
-
-        plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(15, 12))
         
         plt.subplot(3, 1, 1)
-        plt.plot(orig_signal, label='Original', color='black', alpha=0.6, linewidth=1)
-        plt.plot(recon_signal, label='Reconstructed', color='red', alpha=0.6, linewidth=1)
-        plt.title(f"Epoch {epoch} - Time Domain Reconstruction")
+        plt.plot(orig_wave, label='Original (Norm)', color='black', alpha=0.6, linewidth=1)
+        plt.plot(recon_wave, label='Reconstructed', color='red', alpha=0.6, linewidth=1)
+        plt.title(f"Epoch {epoch} - Time Domain (Sample 0, Channel 0)")
         plt.legend()
         plt.grid(True, alpha=0.3)
 
-        # --- 2. 频域图谱 ---
-        if isinstance(model, DDP):
-            patch_embed = model.module.patch_embed
-        else:
-            patch_embed = model.patch_embed
-            
-        p_h, p_w = patch_embed.patch_size
-        # imgs: [B, 3, H, W] (3 channels: Base, D1, D2)
-        B, C, H, W = imgs.shape
+        # --- 2. 频域图谱 (手动计算 CWT) ---
+        # 计算 CWT 用于可视化对比
+        # 需要把 tensor 转回 device 计算
+        orig_t = torch.tensor(orig_wave).view(1, 1, -1).to(batch.device)
+        recon_t = torch.tensor(recon_wave).view(1, 1, -1).to(batch.device)
         
-        # 取 Channel 0 (Base Signal) 进行展示
-        orig_spec = imgs[idx, 0, :, :].float().cpu().numpy()
+        # 调用 model 中的 loss 计算用的 scales
+        cwt_scales = 64
+        orig_cwt = cwt_wrap(orig_t, num_scales=cwt_scales)[0, 0, 0].float().cpu().numpy()
+        recon_cwt = cwt_wrap(recon_t, num_scales=cwt_scales)[0, 0, 0].float().cpu().numpy()
         
-        # 重建图谱处理
-        # pred_spec: [B, N, 3 * p_h * p_w]
-        # 需要 reshape 回 [B, 3, H, W]
-        pred_patches = pred_spec[idx].view(H // p_h, W // p_w, C, p_h, p_w)
-        # Permute: [Grid_H, Grid_W, C, P_h, P_w] -> [C, Grid_H, P_h, Grid_W, P_w]
-        pred_patches = pred_patches.permute(2, 0, 3, 1, 4)
-        # Reshape: [C, H, W]
-        recon_img = pred_patches.reshape(C, H, W)
-        recon_spec = recon_img[0].float().cpu().numpy()
-
         plt.subplot(3, 1, 2)
-        plt.imshow(orig_spec, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Original CWT (Channel 0)")
+        plt.imshow(orig_cwt, aspect='auto', origin='lower', cmap='jet')
+        plt.title("Original CWT")
         plt.colorbar()
 
         plt.subplot(3, 1, 3)
-        plt.imshow(recon_spec, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Reconstructed CWT (Channel 0)")
+        plt.imshow(recon_cwt, aspect='auto', origin='lower', cmap='jet')
+        plt.title("Reconstructed CWT")
         plt.colorbar()
 
         plt.tight_layout()
@@ -180,7 +199,7 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
     model.train()
 
 # -------------------------------------------------------------------
-# 3. 学习率调度器
+# 4. 学习率调度器
 # -------------------------------------------------------------------
 def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_steps, base_lr, min_lr):
     if current_step < warmup_steps:
@@ -197,9 +216,9 @@ def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_s
     return lr
 
 # -------------------------------------------------------------------
-# 4. 训练逻辑
+# 5. 训练逻辑
 # -------------------------------------------------------------------
-def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device, start_time_global, 
+def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global, 
                     total_steps, warmup_steps, base_lr, min_lr):
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
@@ -212,9 +231,10 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
     # 优先使用 bfloat16
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
-    for step, batch in enumerate(dataloader):
+    for step, (batch, labels) in enumerate(dataloader):
         global_step = epoch * num_steps_per_epoch + step
         
+        # 调整 LR
         adjust_learning_rate_per_step(
             optimizer, 
             current_step=global_step, 
@@ -224,9 +244,11 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
             min_lr=min_lr
         )
 
+        # batch shape: (B, M, L)
         batch = batch.to(device, non_blocking=True)
+        # labels = labels.to(device, non_blocking=True) # MAE 训练暂不需要标签
 
-        # 混合精度训练
+        # 混合精度前向传播
         with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
             loss, _, _, _ = model(batch)
         
@@ -236,11 +258,16 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
             sys.exit(1)
 
         optimizer.zero_grad()
-        loss.backward()
         
-        # 梯度裁剪 (对于 RoPE 和 Tensor Decomposition 很重要)
+        # 使用 Scaler 处理反向传播 (兼容 fp16)
+        scaler.scale(loss).backward()
+        
+        # Unscale 之后才能 clip grad
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config['train']['clip_grad'])
-        optimizer.step()
+        
+        scaler.step(optimizer)
+        scaler.update()
 
         metric_logger['loss'].update(loss_value)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
@@ -260,7 +287,7 @@ def train_one_epoch(model, dataloader, optimizer, epoch, logger, config, device,
     return metric_logger['loss'].global_avg
 
 # -------------------------------------------------------------------
-# 5. 主函数
+# 6. 主函数
 # -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -283,20 +310,26 @@ def main():
     
     logger = setup_logger(config['train']['save_dir'])
 
+    # Dataset
     dataset = PhysioSignalDataset(
         index_file=config['data']['index_path'],
         signal_len=config['data']['signal_len'],
+        stride=config['data'].get('stride'),
+        original_len=config['data'].get('original_len', 3000),
         mode='train'
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    
+    # DataLoader (使用自定义 collate_fn)
     dataloader = DataLoader(
         dataset,
         batch_size=config['train']['batch_size'],
         sampler=sampler,
         num_workers=config['data']['num_workers'],
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        collate_fn=variable_channel_collate_fn # 关键：处理变长通道
     )
 
     num_steps_per_epoch = len(dataloader)
@@ -313,28 +346,24 @@ def main():
         logger.info(f"Total Steps: {total_steps}, Warmup Steps: {warmup_steps}")
         logger.info(f"Base LR: {base_lr}, Min LR: {min_lr}")
 
-    # 【关键修改】初始化 RoPE 模型
+    # 初始化模型 (v3 Pixel-based 参数)
     model = CWT_MAE_RoPE(
         signal_len=config['data']['signal_len'],
-        cwt_scales=config['model'].get('cwt_scales', 64),
-        patch_size_time=config['model'].get('patch_size_time', 50),
-        # patch_size_freq is ignored in v3 (vertical patching)
+        patch_size=config['model'].get('patch_size', 4), # 使用 patch_size
         embed_dim=config['model']['embed_dim'],
         depth=config['model']['depth'],
         num_heads=config['model']['num_heads'],
         decoder_embed_dim=config['model']['decoder_embed_dim'],
         decoder_depth=config['model']['decoder_depth'],
         decoder_num_heads=config['model']['decoder_num_heads'],
-        
-        # 针对 2w 小时数据的关键参数
-        mask_ratio=config['model'].get('mask_ratio', 0.8),       # 建议 0.8
-        mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5), # 建议 0.5
-        
-        time_loss_weight=config['model'].get('time_loss_weight', 2.0)
+        mask_ratio=config['model'].get('mask_ratio', 0.75),
+        mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5),
+        cwt_scales=config['model'].get('cwt_scales', 64),
+        cwt_loss_weight=config['model'].get('cwt_loss_weight', 1.0)
     )
     model.to(device)
 
-    # 尝试编译模型 (PyTorch 2.0+)
+    # 编译模型
     try:
         model = torch.compile(model)
         if is_main_process():
@@ -348,19 +377,27 @@ def main():
     param_groups = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(param_groups, lr=base_lr, weight_decay=float(config['train']['weight_decay']))
     
+    # GradScaler 用于混合精度
+    scaler = GradScaler(enabled=config['train']['use_amp'])
+    
     start_epoch = 0
     if config['train']['resume'] and os.path.isfile(config['train']['resume']):
         checkpoint = torch.load(config['train']['resume'], map_location='cpu')
         model.module.load_state_dict(checkpoint['model'])
-        # optimizer.load_state_dict(checkpoint['optimizer']) # 视情况恢复优化器
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scaler.load_state_dict(checkpoint['scaler'])
         start_epoch = checkpoint['epoch'] + 1
         if is_main_process():
             logger.info(f"Resumed from epoch {start_epoch}")
 
+    # 获取一个 Batch 用于固定可视化
     vis_batch = None
     if is_main_process():
-        # 获取一个 Batch 用于固定可视化
-        vis_batch = next(iter(dataloader)).to(device)
+        try:
+            vis_batch, _ = next(iter(dataloader))
+            vis_batch = vis_batch.to(device)
+        except StopIteration:
+            pass
 
     start_time_global = time.time()
     
@@ -368,7 +405,7 @@ def main():
         sampler.set_epoch(epoch)
         
         train_one_epoch(
-            model, dataloader, optimizer, epoch, logger, config, device, start_time_global,
+            model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global,
             total_steps=total_steps,
             warmup_steps=warmup_steps,
             base_lr=base_lr,
@@ -376,16 +413,20 @@ def main():
         )
         
         if is_main_process():
-            save_reconstruction_images(
-                model, 
-                vis_batch, 
-                epoch, 
-                config['train']['save_dir']
-            )
+            # 保存可视化
+            if vis_batch is not None:
+                save_reconstruction_images(
+                    model, 
+                    vis_batch, 
+                    epoch, 
+                    config['train']['save_dir']
+                )
             
+            # 保存 Checkpoint
             save_dict = {
                 'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
                 'epoch': epoch,
                 'config': config
             }

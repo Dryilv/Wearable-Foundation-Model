@@ -5,63 +5,7 @@ import numpy as np
 import math
 
 # ===================================================================
-# 0. RevIN (Reversible Instance Normalization)
-# ===================================================================
-class RevIN(nn.Module):
-    def __init__(self, num_features: int, eps=1e-5, affine=True):
-        """
-        :param num_features: the number of features or channels
-        :param eps: a value added for numerical stability
-        :param affine: if True, RevIN has learnable affine parameters
-        """
-        super(RevIN, self).__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.affine = affine
-        if self.affine:
-            self._init_params()
-
-    def _init_params(self):
-        # initialize RevIN params: (C,)
-        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
-        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
-
-    def forward(self, x, mode:str):
-        if mode == 'norm':
-            self._get_statistics(x)
-            x = self._normalize(x)
-        elif mode == 'denorm':
-            x = self._denormalize(x)
-        else: raise NotImplementedError
-        return x
-
-    def _init_statistics(self, x):
-        dim2reduce = tuple(range(1, x.ndim-1))
-        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
-
-    def _get_statistics(self, x):
-        # x: [B, C, L] or [B, L] -> handle dimensions
-        # Assuming input shape [B, C, L] or [B, 1, L]
-        dim2reduce = (2,) # Reduce along time dimension L
-        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
-
-    def _normalize(self, x):
-        x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight.view(1, -1, 1) + self.affine_bias.view(1, -1, 1)
-        return x
-
-    def _denormalize(self, x):
-        if self.affine:
-            x = (x - self.affine_bias.view(1, -1, 1)) / (self.affine_weight.view(1, -1, 1) + 1e-10)
-        x = x * self.stdev + self.mean
-        return x
-
-# ===================================================================
-# 1. CWT 模块 (保持不变)
+# 1. CWT 模块 (用于 Loss 计算)
 # ===================================================================
 @torch.compiler.disable
 def create_ricker_wavelets(points, scales):
@@ -97,25 +41,25 @@ def cwt_ricker(x, scales):
 
 @torch.compiler.disable
 def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0):
-    # x: [B, 1, L]
-    if x.dim() == 3 and x.shape[1] == 1:
-        x = x.squeeze(1) # [B, L]
+    # x: (B, M, L) or (B*M, L)
+    if x.dim() == 2:
+        x = x.unsqueeze(1) # (B, 1, L)
     
-    # 简单的 CWT 包装，不再做多级分解，直接对原始信号做 CWT
-    # 之前 v2 的逻辑是把 base, d1, d2 叠在一起，这里为了符合 Vertical Patching 和 效率，
-    # 我们回归最纯粹的 CWT：只对原始信号变换。
-    # 如果需要处理 d1, d2，可以在外部预处理或增加通道数。
-    # 这里假设输入是单变量时间序列。
+    # Flatten M into B
+    B_in, M_in, L = x.shape
+    x_flat = x.view(B_in * M_in, L)
     
+    # CWT Calculation
     scales = torch.arange(num_scales, device=x.device) * step + lowest_scale
-    cwt_out = cwt_ricker(x, scales) # [B, Scales, L]
+    cwt_out = cwt_ricker(x_flat, scales) # (BM, Scales, L)
     
-    # 增加 Channel 维度以适配 PatchEmbed (B, C, H, W) -> (B, 1, Scales, L)
-    cwt_out = cwt_out.unsqueeze(1)
+    # Reshape back
+    n_scales = cwt_out.shape[1]
+    cwt_out = cwt_out.view(B_in, M_in, n_scales, L)
     return cwt_out
 
 # ===================================================================
-# 2. RoPE (Rotary Positional Embedding) 组件
+# 2. RoPE & 基础组件
 # ===================================================================
 
 class RotaryEmbedding(nn.Module):
@@ -151,10 +95,6 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-# ===================================================================
-# 3. 基础组件
-# ===================================================================
-
 class TensorizedLinear(nn.Module):
     def __init__(self, in_features, out_features, rank_ratio=0.5, bias=True):
         super().__init__()
@@ -172,28 +112,27 @@ class TensorizedLinear(nn.Module):
     def forward(self, x):
         return self.u(self.v(x))
 
-class DecomposedPatchEmbed(nn.Module):
+class PointPatchEmbed(nn.Module):
     """
-    Standard Conv2d Patch Embedding
+    1D Signal Embedding:
+    Maps 1D signal chunks (Patch Size) to Embedding Dimension.
+    If patch_size=1, this is a Point-wise Linear Projection.
     """
-    def __init__(self, img_size=(64, 3000), patch_size=(64, 50), in_chans=1, embed_dim=384, norm_layer=None):
+    def __init__(self, signal_len=3000, patch_size=4, in_chans=1, embed_dim=768, norm_layer=None):
         super().__init__()
-        self.img_size = img_size
+        self.signal_len = signal_len
         self.patch_size = patch_size
-        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-
-        # Vertical Patching: kernel_h = H (64), kernel_w = P_time (50)
-        # Stride = patch_size
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.num_patches = signal_len // patch_size
         
+        # 使用 Conv1d 实现 Patch Embedding
+        # kernel_size=patch_size, stride=patch_size 实现非重叠切片
+        self.proj = nn.Conv1d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
-        # x: (B, 1, 64, 3000)
-        # proj -> (B, embed_dim, 1, 60) -> (B, embed_dim, 60)
-        x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2) # (B, N_patches, embed_dim)
+        # x: (B, 1, L)
+        x = self.proj(x) # (B, D, N)
+        x = x.transpose(1, 2) # (B, N, D)
         x = self.norm(x)
         return x
 
@@ -203,7 +142,6 @@ class RoPEAttention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
-
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -213,16 +151,12 @@ class RoPEAttention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
         if rope_cos is not None and rope_sin is not None:
             q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
-
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-
         x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-        
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -235,7 +169,6 @@ class TensorizedBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = RoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.norm2 = norm_layer(dim)
-        
         hidden_dim = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             TensorizedLinear(dim, hidden_dim, rank_ratio=rank_ratio), 
@@ -270,60 +203,53 @@ class Block(nn.Module):
         return x
 
 # ===================================================================
-# 4. 主模型: CWT-MAE v3 (Thorough Solution)
+# 4. 主模型: Pixel/Point-based CWT-MAE (v3)
 # ===================================================================
 
 class CWT_MAE_RoPE(nn.Module):
     def __init__(
         self, 
         signal_len=3000, 
-        cwt_scales=64,
-        patch_size_time=50,
-        # patch_size_freq is REMOVED/IGNORED, enforced to cwt_scales
-        embed_dim=384,        # Downscaled
+        patch_size=4,          # v3 关键参数: 如果设为1则为纯Pixel级
+        embed_dim=768, 
         depth=12, 
-        num_heads=6,          # Downscaled
-        decoder_embed_dim=256,
-        decoder_depth=4,
-        decoder_num_heads=8,  # Adjusted
-        mask_ratio=0.8,       # Increased
+        num_heads=12,
+        decoder_embed_dim=512,
+        decoder_depth=8,
+        decoder_num_heads=16,
+        mask_ratio=0.75,       
         mlp_rank_ratio=0.5,    
         norm_layer=nn.LayerNorm,
-        time_loss_weight=2.0, # Increased for dual objective
-        **kwargs # consume extra args
+        cwt_scales=64,         # 仅用于 CWT Loss
+        cwt_loss_weight=1.0    # CWT Loss 权重
     ):
         super().__init__()
         
         self.mask_ratio = mask_ratio
+        self.signal_len = signal_len
+        self.patch_size = patch_size
         self.cwt_scales = cwt_scales
-        self.time_loss_weight = time_loss_weight
-        self.patch_size_time = patch_size_time
-        self.patch_size_freq = cwt_scales # Vertical Patching: covers full freq range
+        self.cwt_loss_weight = cwt_loss_weight
         
-        # 0. RevIN
-        self.revin = RevIN(num_features=1, affine=True) # Single channel input processing
-
-        # 1. Patch Embed (Vertical Patching)
-        self.patch_embed = DecomposedPatchEmbed(
-            img_size=(cwt_scales, signal_len),
-            patch_size=(self.patch_size_freq, patch_size_time),
-            in_chans=1, # CWT output has 1 channel (if we ignore d1/d2)
+        # 1. 1D Point/Patch Embed
+        self.patch_embed = PointPatchEmbed(
+            signal_len=signal_len,
+            patch_size=patch_size,
+            in_chans=1, # 处理单通道 (多通道在Batch维)
             embed_dim=embed_dim,
             norm_layer=norm_layer
         )
         self.num_patches = self.patch_embed.num_patches
-        self.grid_size = self.patch_embed.grid_size # (1, W)
-        
-        print(f"Model Config: Vertical Patching (1, {self.grid_size[1]}), Patches={self.num_patches}")
 
-        # 2. RoPE Generator
+        # 2. Embeddings
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
+        
+        # RoPE
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
         self.rope_decoder = RotaryEmbedding(dim=decoder_embed_dim // decoder_num_heads)
 
         # 3. Encoder
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
-        
         self.blocks = nn.ModuleList([
             TensorizedBlock(
                 embed_dim, num_heads, 
@@ -345,14 +271,9 @@ class CWT_MAE_RoPE(nn.Module):
         ])
         self.decoder_norm = norm_layer(decoder_embed_dim)
         
-        # 5. Heads (Dual Objective)
-        # Head A: Reconstruct Spectrogram
-        self.patch_pixels = 1 * self.patch_size_freq * patch_size_time # 1 channel * 64 * 50
-        self.decoder_pred_spec = nn.Linear(decoder_embed_dim, self.patch_pixels, bias=True)
-        
-        # Head B: Reconstruct Raw Signal directly from latent patch
-        # One patch corresponds to `patch_size_time` raw points
-        self.decoder_pred_raw = nn.Linear(decoder_embed_dim, patch_size_time, bias=True)
+        # 5. Prediction Head
+        # 预测每个 Patch 内的 Pixel 值 (长度为 patch_size)
+        self.pred_head = nn.Linear(decoder_embed_dim, patch_size, bias=True)
 
         self.initialize_weights()
 
@@ -370,59 +291,54 @@ class CWT_MAE_RoPE(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv2d):
+        elif isinstance(m, nn.Conv1d):
             torch.nn.init.xavier_uniform_(m.weight)
 
     def random_masking(self, x, mask_ratio):
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
-        
         noise = torch.rand(N, L, device=x.device)
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
-        
         ids_keep = ids_shuffle[:, :len_keep]
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        
         mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
-        
         return x_masked, mask, ids_restore, ids_keep
 
     def forward_encoder(self, x):
-        # 1. Patch Embedding & Position Embedding
+        # x: (B*M, 1, L) -> (B*M, N, D)
         x = self.patch_embed(x)
+        
+        # Add Pos Embed
         x = x + self.pos_embed[:, 1:, :]
         
-        # 2. Masking Logic
+        # Masking
         if self.mask_ratio == 0.0:
             x_masked = x
-            B, N, D = x.shape
-            ids_keep = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
-            ids_restore = ids_keep 
-            mask = torch.zeros(B, N, device=x.device)
+            mask = torch.zeros(x.shape[0], x.shape[1], device=x.device)
+            ids_restore = torch.arange(x.shape[1], device=x.device).unsqueeze(0).expand(x.shape[0], -1)
+            ids_keep = ids_restore
         else:
             x_masked, mask, ids_restore, ids_keep = self.random_masking(x, self.mask_ratio)
-        
-        # 3. Add CLS Token
+
+        # Append CLS Token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x_masked), dim=1)
         
-        # 4. RoPE IDs
-        B = x.shape[0]
+        # RoPE IDs
+        B, N_curr, _ = x.shape
+        N_patches = self.num_patches
         cls_pos = torch.zeros(B, 1, device=x.device, dtype=torch.long)
         patch_pos = ids_keep + 1
         pos_ids = torch.cat((cls_pos, patch_pos), dim=1)
         
-        # 5. RoPE
+        # Transformer
         rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
-        
-        # 6. Transformer Blocks
         for blk in self.blocks:
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
-            
         x = self.norm(x)
         
         return x, mask, ids_restore
@@ -441,67 +357,77 @@ class CWT_MAE_RoPE(nn.Module):
         
         for blk in self.decoder_blocks:
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
-            
         x = self.decoder_norm(x)
-        return x[:, 1:, :]
+        return x[:, 1:, :] # Drop CLS
 
-    def forward_loss_spec(self, imgs, pred, mask):
-        # imgs: [B, 1, Scales, L]
-        p_h, p_w = self.patch_embed.patch_size # (Scales, Patch_Time)
-        B, C, H, W = imgs.shape
+    def forward_loss_raw(self, x_raw, pred_raw, mask):
+        # x_raw: (B, 1, L)
+        # pred_raw: (B, L)
+        # mask: (B, N_patches) -> expand to pixels
         
-        # Vertical Patching: H == p_h, so H // p_h == 1
-        target = imgs.view(B, C, H // p_h, p_h, W // p_w, p_w)
-        target = target.permute(0, 2, 4, 1, 3, 5).contiguous()
-        target = target.view(B, -1, C * p_h * p_w) # [B, N_patches, Pixels]
+        B, _, L = x_raw.shape
+        P = self.patch_size
+        
+        # 重塑 target 以匹配 patch
+        target = x_raw.view(B, -1, P) # (B, N, P)
+        pred = pred_raw.view(B, -1, P) # (B, N, P)
         
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)
+        loss = loss.mean(dim=-1) # (B, N)
         loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         return loss
 
-    def forward_loss_raw(self, x_raw, pred_raw, mask):
-        """
-        x_raw: [B, 1, L] (RevIN normalized)
-        pred_raw: [B, N_patches, Patch_Time]
-        """
-        if x_raw.dim() == 2: x_raw = x_raw.unsqueeze(1)
-        B, C, L = x_raw.shape
-        patch_time = self.patch_size_time
+    def forward_loss_cwt(self, x_raw, pred_raw):
+        # 计算频域 Loss
+        # x_raw, pred_raw: (B, 1, L)
+        # CWT 是不可学习的，只是一个变换
         
-        # Reshape raw signal to patches: [B, N_patches, Patch_Time]
-        # Note: L must be divisible by patch_time
-        target = x_raw.view(B, C, -1, patch_time).transpose(1, 2).squeeze(2) # [B, N, Patch_Time]
+        # 归一化输入以确保 Loss 尺度一致
+        x_cwt = cwt_wrap(x_raw, num_scales=self.cwt_scales)
+        pred_cwt = cwt_wrap(pred_raw.unsqueeze(1), num_scales=self.cwt_scales)
         
-        loss = (pred_raw - target) ** 2
-        loss = loss.mean(dim=-1)
-        loss = (loss * mask).sum() / (mask.sum() + 1e-6)
+        # 简单的 MSE Loss (Magnitude)
+        # 可以只看幅度
+        loss = F.mse_loss(pred_cwt, x_cwt)
         return loss
 
     def forward(self, x):
-        # x: [B, 1, L] or [B, L]
+        """
+        x: (B, M, L) or (B, L)
+        """
         if x.dim() == 2: x = x.unsqueeze(1)
+        B, M, L = x.shape
         
-        # 0. RevIN Normalization (Pre-processing)
-        # Handle normalization statistics per-instance, reversible
-        x = self.revin(x, 'norm') # [B, 1, L]
+        # 1. Flatten Channels (Treat each channel as independent sample)
+        x_flat = x.view(B * M, 1, L)
         
-        # 1. CWT Transformation
-        # No more manual normalization here, handled by RevIN
-        imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
+        # 2. Normalize (Instance Norm per channel)
+        mean = x_flat.mean(dim=2, keepdim=True)
+        std = x_flat.std(dim=2, keepdim=True) + 1e-5
+        x_norm = (x_flat - mean) / std
         
-        # 2. Encoder-Decoder
-        latent, mask, ids = self.forward_encoder(imgs)
+        # 3. Encoder & Decoder
+        latent, mask, ids = self.forward_encoder(x_norm)
         decoder_features = self.forward_decoder(latent, ids)
         
-        # 3. Dual Heads
-        pred_spec = self.decoder_pred_spec(decoder_features)
-        pred_raw = self.decoder_pred_raw(decoder_features)
+        # 4. Predict
+        # decoder_features: (BM, N, D)
+        # pred_head: (D) -> (P)
+        pred_patches = self.pred_head(decoder_features) # (BM, N, P)
+        pred_raw = pred_patches.view(B * M, L) # Reconstruct 1D signal
         
-        # 4. Dual Losses
-        loss_spec = self.forward_loss_spec(imgs, pred_spec, mask)
-        loss_raw = self.forward_loss_raw(x, pred_raw, mask) # Use RevIN-normalized x as target
+        # 5. Loss
+        # 时域 Loss (只计算 Mask 部分)
+        loss_raw = self.forward_loss_raw(x_norm, pred_raw, mask)
         
-        total_loss = loss_spec + self.time_loss_weight * loss_raw
+        # 频域 Loss (计算整体，或者也可以只计算 Mask 部分，这里计算整体简单点)
+        # 注意：这里我们强制模型生成的信号不仅时域像，频域也要像
+        loss_cwt = self.forward_loss_cwt(x_norm, pred_raw)
         
-        return total_loss, pred_spec, pred_raw, imgs
+        total_loss = loss_raw + self.cwt_loss_weight * loss_cwt
+        
+        # 还原形状用于返回
+        pred_signal = pred_raw.view(B, M, L)
+        x_norm_signal = x_norm.view(B, M, L)
+        
+        return total_loss, pred_signal, None, x_norm_signal

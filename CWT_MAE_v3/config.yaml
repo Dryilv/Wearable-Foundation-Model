@@ -1,66 +1,61 @@
 train:
-  # 2w 小时数据量巨大，200 epoch 可能需要训练很久。
-  # 建议先跑 50-100 epoch 看 Loss 收敛曲线。
+  # 2w 小时数据量巨大，建议先跑 100 epoch 观察 Loss 收敛情况
   epochs: 100             
   
-  # [显存优化] 
-  # v3 模型规模缩小，可以适当增加 Batch Size
-  # 24G 显存建议: 128 - 192
-  # 80G 显存建议: 512 - 1024
+  # [显存优化与 Batch Size] 
+  # v3 (1D Pixel-based) 显存占用比 v1/v2 (2D CWT) 低得多。
+  # Token 数量: 3000 / 4 = 750 (远小于 v2 的 960 或 v1 的 800)
+  # 可以开大 Batch Size
   batch_size: 256          
   
-  base_lr: 1.5e-4         # 稍微调大一点，因为 Batch Size 较大且数据量大
+  # 学习率策略
+  base_lr: 1.5e-4         
   min_lr: 1.0e-6
-  warmup_epochs: 5        # 数据量大，Warmup 可以稍微短一点
-  weight_decay: 0.05      # 张量分解本身有正则化效果，WD 可以适当降低 (0.1 -> 0.05)
-  clip_grad: 3.0          
-  use_amp: True           # 必须开启，配合代码中的 bfloat16
+  warmup_epochs: 5        
   
+  # 正则化
+  weight_decay: 0.05      
+  clip_grad: 3.0          
+  use_amp: True           
+  
+  # 日志与保存
   log_interval: 50
   save_freq: 5
-  
-  # 修改保存路径，区分新旧模型
-  save_dir: "./checkpoint_cwt_mae_v3"
-  resume: ""              # 如果是第一次跑新模型，置空；否则填路径
+  save_dir: "./checkpoint_pixel_mae_v3"
+  resume: ""
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
-  signal_len: 3000        # 30秒 @ 100Hz
-  num_workers: 16         # 保持高并发加载
+  signal_len: 3000         # 30秒 @ 100Hz
+  original_len: 3000      
+  stride: null             # v3 默认处理长序列，不切片
+  num_workers: 16         
 
 model:
-  # --- CWT & Patch 参数 ---
+  # --- Pixel/Point 级别参数 ---
+  # patch_size: 
+  #   - 1: 纯 Pixel 级别 (Sequence Length = 3000)，计算量大但最精细
+  #   - 4: 推荐值 (Sequence Length = 750)，效率与精度的平衡
+  patch_size: 4           
+  
+  # --- CWT Loss 参数 ---
+  # 虽然输入不使用 CWT，但我们用 CWT Loss 约束频域一致性
   cwt_scales: 64          
+  cwt_loss_weight: 1.0    
   
-  # [关键] Vertical Patching 配置
-  # 时间轴: 3000 / 50 = 60 patches
-  # 频率轴: 1 (Whole Scale)
-  # 总 Token = 60
-  patch_size_time: 50     
-  # patch_size_freq: Ignored in v3 (Always = cwt_scales)
+  # --- Transformer Encoder (ViT-Base 规模) ---
+  embed_dim: 768          
+  depth: 12               
+  num_heads: 12           
   
-  # --- Transformer 架构 (Small/Medium for Signals) ---
-  embed_dim: 384          # Downscaled from 768
-  depth: 12               # Keep deep for non-linearities
-  num_heads: 6            # Downscaled from 12
-  
-  # --- [新增] 张量分解参数 ---
-  # 控制 MLP 层的秩。
-  # 0.25: 极度压缩，适合小数据防过拟合。
-  # 0.50: 平衡点，适合中大数据 (推荐)。
-  # 0.75-1.0: 高容量，适合超大规模数据。
+  # --- 张量分解参数 ---
   mlp_rank_ratio: 0.5     
   
   # --- Decoder ---
-  decoder_embed_dim: 256  # Downscaled from 512
-  decoder_depth: 4        # Reduced from 8
-  decoder_num_heads: 8    # Adjusted
+  decoder_embed_dim: 512  
+  decoder_depth: 8        
+  decoder_num_heads: 16   
   
   # --- 训练策略 ---
-  # [重要] 针对 ECG/PPG 的高自相关性，必须高 Mask Ratio
-  # 0.8 意味着遮住 80% 的时间步，迫使模型利用极少的上下文恢复全貌
-  mask_ratio: 0.8         
-  
-  # --- Loss 权重 ---
-  # Dual-Objective: Spec + 2.0 * Raw
-  time_loss_weight: 2.0
+  # 1D 信号通常需要高 Mask Ratio
+  mask_ratio: 0.75         
