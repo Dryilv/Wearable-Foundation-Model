@@ -7,6 +7,13 @@ import random
 import pickle
 import hashlib
 from sklearn.model_selection import StratifiedShuffleSplit
+from functools import lru_cache
+
+# 独立的缓存函数，避免实例绑定的序列化问题
+@lru_cache(maxsize=8)
+def load_pickle_file(file_path):
+    with open(file_path, 'rb') as f:
+        return pickle.load(f)
 
 class DataSplitter:
     def __init__(self, index_file, split_ratio=0.1, seed=42):
@@ -127,17 +134,21 @@ class PhysioSignalDataset(Dataset):
                 row_idx = item_info['row'] 
                 label = item_info.get('label', 0) 
                 
-                with open(file_path, 'rb') as f:
-                    content = pickle.load(f)
-                    raw_signal = content['data'][row_idx]
-                    
-                    if raw_signal.ndim == 1:
-                        raw_signal = raw_signal[np.newaxis, :]
+                # 使用缓存加载，避免频繁 IO 和反序列化
+                content = load_pickle_file(file_path)
+                raw_signal = content['data'][row_idx]
+                
+                if raw_signal.ndim == 1:
+                    raw_signal = raw_signal[np.newaxis, :]
                     
                     if raw_signal.dtype != np.float32:
                         raw_signal = raw_signal.astype(np.float32)
                 
                 # 1. 基础检查
+                # 注意：raw_signal 可能是只读的（来自缓存），如果后续有原地修改操作需要 copy
+                # 目前的代码逻辑主要是读取和计算，或者 create new tensor，是安全的。
+                # 但为了保险起见，如果需要修改 raw_signal，建议 raw_signal = raw_signal.copy()
+                
                 if np.isnan(raw_signal).any() or np.isinf(raw_signal).any():
                     idx = random.randint(0, len(self.samples) - 1)
                     continue
