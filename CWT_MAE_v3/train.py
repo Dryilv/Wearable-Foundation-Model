@@ -437,13 +437,13 @@ def main():
     model.to(device)
 
     # 编译模型
-    try:
-        model = torch.compile(model)
-        if is_main_process():
-            logger.info("Model compiled with torch.compile()")
-    except Exception as e:
-        if is_main_process():
-            logger.warning(f"Could not compile model: {e}")
+    # try:
+    #     model = torch.compile(model)
+    #     if is_main_process():
+    #         logger.info("Model compiled with torch.compile()")
+    # except Exception as e:
+    #     if is_main_process():
+    #         logger.warning(f"Could not compile model: {e}")
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False)
 
