@@ -31,7 +31,7 @@ train:
   
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
-  resume: ""
+  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_pixel_mae_v3/checkpoint_last.pth"
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
@@ -68,14 +68,14 @@ model:
   decoder_num_heads: 16   
   
   # --- 训练策略 ---
-  # Mask Ratio: 0.75
+  # Mask Ratio: 0.75 -> 0.6 (降低难度以适应 ACC 信号重建)
   # 生理信号自相关性极强，必须高 Mask 才能迫使模型学习波形特征而非插值
-  mask_ratio: 0.75         
+  mask_ratio: 0.6         
   
   # --- Loss 权重 ---
-  # 1.0: 强调时域重建质量 (R波尖锐度、相位对齐)
-  time_loss_weight: 1.0
+  # 1.0 -> 5.0: 显著增强时域重建权重，解决 ACC 信号波形重建难的问题
+  time_loss_weight: 5.0
   
   # --- V3 新增特性 ---
   contrastive: True       # 开启对比学习
-  contrastive_loss_weight: 0.1 # 对比学习 Loss 权重
+  contrastive_loss_weight: 0.05 # 降低对比学习权重，专注于重建

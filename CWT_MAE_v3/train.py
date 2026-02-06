@@ -178,8 +178,8 @@ def save_reconstruction_images(model, batch, epoch, save_dir):
         # 优先使用 bfloat16
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with autocast(dtype=amp_dtype):
-            # forward 返回: loss, pred_spec, pred_time, imgs
-            loss, pred_spec, pred_time, imgs = model(batch)
+            # forward 返回: loss, loss_dict, pred_spec, pred_time, imgs
+            loss, _, pred_spec, pred_time, imgs = model(batch)
         
         # 取 Batch 中的第一个样本 (Index 0)
         # batch: (B, M, L)
@@ -282,6 +282,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
+    metric_logger['loss_spec'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
+    metric_logger['loss_time'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
+    metric_logger['loss_contra'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     
     header = f'Epoch: [{epoch}/{config["train"]["epochs"]}]'
@@ -310,7 +313,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         # 混合精度前向传播
         with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
             is_contrastive = config['model'].get('contrastive', False)
-            loss, _, _, _ = model(batch, contrastive=is_contrastive)
+            loss, loss_dict, _, _, _ = model(batch, contrastive=is_contrastive)
         
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -330,6 +333,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         scaler.update()
 
         metric_logger['loss'].update(loss_value)
+        metric_logger['loss_spec'].update(loss_dict['spec'].item())
+        metric_logger['loss_time'].update(loss_dict['time'].item())
+        metric_logger['loss_contra'].update(loss_dict['contra'].item())
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
 
         if step % 50 == 0 and is_main_process():
@@ -337,6 +343,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             logger.info(
                 f"{header} Step: [{step}/{num_steps_per_epoch}] "
                 f"Loss: {metric_logger['loss']} "
+                f"Spec: {metric_logger['loss_spec']} "
+                f"Time: {metric_logger['loss_time']} "
+                f"Contra: {metric_logger['loss_contra']} "
                 f"LR: {metric_logger['lr']} "
                 f"Elapsed: {format_time(elapsed)}"
             )

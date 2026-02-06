@@ -565,4 +565,10 @@ class CWT_MAE_RoPE(nn.Module):
         
         total_loss = loss_spec + self.time_loss_weight * loss_time + self.contrastive_loss_weight * loss_contrastive
         
-        return total_loss, pred_spec, pred_time, imgs
+        loss_dict = {
+            'spec': loss_spec,
+            'time': loss_time,
+            'contra': loss_contrastive
+        }
+        
+        return total_loss, loss_dict, pred_spec, pred_time, imgs
