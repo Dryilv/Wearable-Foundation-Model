@@ -26,7 +26,7 @@ def compute_reconstruction_loss(pred_spec, target_spec, pred_time, target_time, 
     # 因此我们主要依赖 Model forward 返回的 Loss
     pass
 
-def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, epochs=5, lr=1e-3):
+def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, epochs=5, lr=1e-3, limit_batches=None):
     """
     在冻结的 Encoder 上训练线性分类头
     """
@@ -57,7 +57,10 @@ def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, e
     # Train Loop
     for ep in range(epochs):
         probe.train()
-        for batch, labels in train_loader:
+        for i, (batch, labels) in enumerate(train_loader):
+            if limit_batches is not None and i >= limit_batches:
+                break
+                
             batch = batch.to(device)
             labels = labels.to(device)
             

@@ -102,7 +102,7 @@ def init_distributed_mode():
         world_size = int(os.environ["WORLD_SIZE"])
         gpu = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(gpu)
-        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank, timeout=datetime.timedelta(minutes=120))
         dist.barrier()
         print(f"| distributed init (rank {rank}): success")
         return gpu, rank, world_size
@@ -553,10 +553,11 @@ def main():
                 # Linear Probe
                 linear_acc = train_linear_probe(
                     model, 
-                    train_dataloader, # Use subset for speed? No, full train for linear probe usually
+                    train_dataloader, 
                     val_dataloader, 
                     device, 
-                    num_classes=2 # 假设二分类，或者从 dataset 获取
+                    num_classes=2,
+                    limit_batches=500 # 限制 Batch 数防止超时
                 )
                 # Clustering
                 sil_score, db_score = evaluate_features_quality(
