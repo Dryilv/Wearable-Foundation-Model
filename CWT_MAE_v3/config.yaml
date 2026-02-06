@@ -31,7 +31,7 @@ train:
   
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
-  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_pixel_mae_v3/checkpoint_last.pth"
+  resume: ""
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
@@ -44,11 +44,7 @@ model:
   # --- CWT & Patch 参数 ---
   cwt_scales: 64          
   
-  # Patch Embedding 配置
-  # Time: 500 / 10 = 50 patches (更细的时间分辨率)
-  # Freq: 64 / 4 = 16 patches
-  # 单个信号的 Token 数 = 50 * 16 = 800
-  patch_size_time: 25     
+  patch_size_time: 50     
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
