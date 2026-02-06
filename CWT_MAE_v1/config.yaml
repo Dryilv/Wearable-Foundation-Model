@@ -36,8 +36,6 @@ train:
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
   signal_len: 1000         # 5秒 @ 100Hz
-  original_len: 3000      # 原始信号长度 30秒
-  stride: 500             # 滑动步长 1.0秒 (更细粒度的滑动窗口)
   num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
 
 model:

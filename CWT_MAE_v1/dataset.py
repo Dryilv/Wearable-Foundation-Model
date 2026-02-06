@@ -11,16 +11,12 @@ class PhysioSignalDataset(Dataset):
                  min_std_threshold=1e-4,
                  max_std_threshold=5000.0,
                  max_abs_value=1e5, # 新增：绝对值上限过滤
-                 stride=None,       # 新增：滑动窗口步长
-                 original_len=3000  # 新增：原始信号长度（用于滑动窗口计算）
                  ):
         self.signal_len = signal_len
         self.mode = mode
         self.min_std_threshold = min_std_threshold
         self.max_std_threshold = max_std_threshold
         self.max_abs_value = max_abs_value
-        self.stride = stride
-        self.original_len = original_len
         
         if not os.path.exists(index_file):
             raise FileNotFoundError(f"Index file not found: {index_file}")
@@ -31,15 +27,9 @@ class PhysioSignalDataset(Dataset):
         
         # 预生成样本索引
         self.samples = []
-        if self.stride is not None:
-            for i in range(len(self.index_data)):
-                for start in range(0, self.original_len - self.signal_len + 1, self.stride):
-                    self.samples.append({'idx': i, 'start': start})
-            print(f"Sliding window enabled (stride={stride}). Expanded {len(self.index_data)} samples to {len(self.samples)} windows.")
-        else:
-            for i in range(len(self.index_data)):
-                self.samples.append({'idx': i, 'start': None})
-            print(f"Loaded {len(self.index_data)} samples.")
+        for i in range(len(self.index_data)):
+            self.samples.append({'idx': i, 'start': None})
+        print(f"Loaded {len(self.index_data)} samples.")
 
     def __len__(self):
         return len(self.samples)
