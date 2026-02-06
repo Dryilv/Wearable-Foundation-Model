@@ -35,7 +35,7 @@ train:
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
-  signal_len: 1000         # 5秒 @ 100Hz
+  signal_len: 3000         # 5秒 @ 100Hz
   num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
 
 model:
@@ -46,7 +46,7 @@ model:
   # Time: 500 / 10 = 50 patches (更细的时间分辨率)
   # Freq: 64 / 4 = 16 patches
   # 单个信号的 Token 数 = 50 * 16 = 800
-  patch_size_time: 25     
+  patch_size_time: 50     
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
