@@ -82,6 +82,12 @@ class ArcFaceHead(nn.Module):
         self.m = m
         self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
         nn.init.xavier_uniform_(self.weight)
+        
+        # Pre-compute constants for ArcFace
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
 
     def forward(self, input, label=None):
         # input: (B, D)
@@ -91,9 +97,16 @@ class ArcFaceHead(nn.Module):
         if label is None:
             return cosine * self.s
         
-        # Add margin to ground truth class
-        # cos(theta + m)
-        phi = cosine - self.m 
+        # ---------------------------
+        # Standard ArcFace Implementation
+        # ---------------------------
+        # cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
+        sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        
+        # Handle numerical stability where theta + m > pi
+        # Keep the function monotonically decreasing
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
         
         # One-hot encoding
         one_hot = torch.zeros(cosine.size(), device=input.device)
