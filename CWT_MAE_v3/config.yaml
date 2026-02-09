@@ -83,4 +83,4 @@ model:
 
   # --- Data Ratio ---
   # 控制训练使用的样本比例 (0.0 - 1.0)，用于快速实验验证
-  data_ratio: 0.1
+  data_ratio: 1.5
