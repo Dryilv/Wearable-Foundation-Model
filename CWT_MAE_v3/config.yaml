@@ -39,27 +39,28 @@ train:
 
 data:
   index_path: "train_index_new.json"
-  signal_len: 1000         # 10秒 @ 100Hz (更集中的注意力范围，利于 PTT 捕捉)
+  signal_len: 500          # 5秒 @ 100Hz (方案2：精细细节捕获)
   num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
   use_sliding_window: False # [新增] 是否启用滑动窗口读取数据
-  window_stride: 500       # [新增] 滑动窗口步长 (500点 = 5秒重叠)
+  window_stride: 250       # 步长随长度调整
 
 model:
   # --- CWT & Patch 参数 ---
   cwt_scales: 64          
   
   # Patch Embedding 配置
-  # Time: 1000 / 25 = 40 patches
+  # Time: 500 / 25 = 20 patches
   # Freq: 64 / 4 = 16 patches
-  # 单个信号的 Token 数 = 40 * 16 = 640
+  # 单个信号的 Token 数 = 20 * 16 = 320
+  # 5 通道总 Token 数 = 320 * 5 + 1 = 1601
   patch_size_time: 25     
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
-  # --- Transformer Encoder (ViT-Small 规模) ---
-  embed_dim: 384          
+  # --- Transformer Encoder (中等规模) ---
+  embed_dim: 512          
   depth: 12               
-  num_heads: 6           
+  num_heads: 8            # 512 / 64 = 8
   use_factorized_attn: True  # [新增] 开启因子化多变量注意力，利用时间对齐信息
   
   # --- [关键] 张量分解参数 ---
@@ -68,9 +69,9 @@ model:
   mlp_rank_ratio: 0.5     
   
   # --- Decoder (轻量级) ---
-  decoder_embed_dim: 192  
+  decoder_embed_dim: 256  
   decoder_depth: 8        
-  decoder_num_heads: 6   
+  decoder_num_heads: 8   
   
   # --- 训练策略 ---
   # Mask Ratio: 0.75

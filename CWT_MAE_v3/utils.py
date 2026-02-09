@@ -215,7 +215,7 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         plt.suptitle(f"Epoch {epoch} Reconstruction (5 Channels)", fontsize=16)
         
         # 通道名称示例 (根据实际情况调整)
-        channel_names = ["ECG", "PPG_RED", "PPG_IR", "ABP", "RESP"]
+        channel_names = ["ECG", "ACC1", "ACC2", "ACC3", "PPG"]
         if M != 5:
             channel_names = [f"Ch {i}" for i in range(M)]
 
