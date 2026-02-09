@@ -170,7 +170,24 @@ class PhysioSignalDataset(Dataset):
                 
                 # 使用缓存加载，避免频繁 IO 和反序列化
                 content = load_pickle_file(file_path)
-                raw_signal = content['data'][row_idx]
+                
+                # [Robustness] 兼容多种数据结构
+                if isinstance(content, dict):
+                    if 'data' in content:
+                        raw_signal = content['data'][row_idx]
+                    else:
+                        # 尝试直接使用 content 作为数据源 (如果它表现得像字典但其实是数据容器?)
+                        # 或者抛出更详细的错误
+                        keys = list(content.keys())
+                        raise KeyError(f"Key 'data' not found in pickle. Available keys: {keys}")
+                elif isinstance(content, (list, np.ndarray, torch.Tensor)):
+                    # 如果内容直接是列表或数组，直接使用 row_idx 索引
+                    raw_signal = content[row_idx]
+                else:
+                    raise TypeError(f"Unexpected content type: {type(content)}")
+                
+                if isinstance(raw_signal, torch.Tensor):
+                    raw_signal = raw_signal.numpy()
                 
                 if raw_signal.ndim == 1:
                     raw_signal = raw_signal[np.newaxis, :]
