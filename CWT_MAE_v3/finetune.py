@@ -11,8 +11,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from tqdm import tqdm
 import torch.nn.functional as F
 import numpy as np
-from torch.cuda.amp import GradScaler
-from torch.amp import autocast 
+from torch.amp import autocast, GradScaler
 
 from dataset_finetune import DownstreamClassificationDataset
 from model_finetune import TF_MAE_Classifier

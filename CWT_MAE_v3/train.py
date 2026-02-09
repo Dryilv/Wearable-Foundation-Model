@@ -17,7 +17,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # 允许编译失败时自动回退
 import torch._dynamo
@@ -27,6 +27,7 @@ torch._dynamo.config.suppress_errors = True
 from model import CWT_MAE_RoPE 
 from dataset import PhysioSignalDataset, DataSplitter, fixed_channel_collate_fn
 from utils_metrics import ExperimentTracker, train_linear_probe, evaluate_features_quality
+from utils import save_reconstruction_images
 
 # 启用 TensorFloat-32 (A100/3090/4090 必备加速)
 torch.set_float32_matmul_precision('high') 
@@ -120,93 +121,7 @@ def init_distributed_mode():
 #     """
 #     pass
 
-# -------------------------------------------------------------------
-# 3. 可视化函数 (适配多通道、无 Channel ID)
-# -------------------------------------------------------------------
-def save_reconstruction_images(model, batch, epoch, save_dir):
-    model.eval()
-    with torch.no_grad():
-        # 优先使用 bfloat16
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with autocast(dtype=amp_dtype):
-            # forward 返回: loss, pred_spec, pred_time, imgs
-            loss, pred_spec, pred_time, imgs = model(batch)
-        
-        # 取 Batch 中的第一个样本 (Index 0)
-        # batch: (B, M, L)
-        # pred_time: (B, M, L)
-        # imgs: (B, M, 3, H, W)
-        
-        # 我们随机选一个非零通道进行可视化 (假设第0个通道总是有数据的)
-        sample_idx = 0
-        channel_idx = 0 
-        
-        # --- 1. 时域波形 ---
-        orig_signal = batch[sample_idx, channel_idx].float().cpu().numpy()
-        recon_signal = pred_time[sample_idx, channel_idx].float().cpu().numpy()
-        
-        # 简单的反归一化用于可视化 (假设模型内部做了 Instance Norm)
-        orig_mean = orig_signal.mean()
-        orig_std = orig_signal.std()
-        recon_signal = recon_signal * (orig_std + 1e-6) + orig_mean
 
-        plt.figure(figsize=(15, 12))
-        
-        plt.subplot(3, 1, 1)
-        plt.plot(orig_signal, label='Original', color='black', alpha=0.6, linewidth=1)
-        plt.plot(recon_signal, label='Reconstructed', color='red', alpha=0.6, linewidth=1)
-        plt.title(f"Epoch {epoch} - Time Domain (Sample 0, Channel 0)")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-
-        # --- 2. 频域图谱 ---
-        if isinstance(model, DDP):
-            patch_embed = model.module.patch_embed
-        else:
-            patch_embed = model.patch_embed
-            
-        p_h, p_w = patch_embed.patch_size
-        # imgs: [B, M, 3, H, W]
-        # pred_spec: [B, M, N_patches, pixels]
-        
-        # 取原始 CWT (Base Channel = 0)
-        orig_spec = imgs[sample_idx, channel_idx, 0, :, :].float().cpu().numpy()
-        
-        # 重建图谱处理
-        # 1. 取出对应样本和通道的预测: (N_patches, pixels)
-        pred_p = pred_spec[sample_idx, channel_idx] 
-        
-        # 2. Reshape 回图像
-        # pixels = 3 * p_h * p_w
-        # Grid size
-        H_grid, W_grid = patch_embed.grid_size
-        C_cwt = 3
-        
-        # (H_grid * W_grid, C * ph * pw) -> (H_grid, W_grid, C, ph, pw)
-        pred_p = pred_p.view(H_grid, W_grid, C_cwt, p_h, p_w)
-        
-        # Permute to image format: (C, H_grid, ph, W_grid, pw) -> (C, H, W)
-        pred_p = pred_p.permute(2, 0, 3, 1, 4)
-        pred_p = pred_p.reshape(C_cwt, H_grid * p_h, W_grid * p_w)
-        
-        recon_spec = pred_p[0].float().cpu().numpy() # 只看 Base Channel
-
-        plt.subplot(3, 1, 2)
-        plt.imshow(orig_spec, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Original CWT (Base Component)")
-        plt.colorbar()
-
-        plt.subplot(3, 1, 3)
-        plt.imshow(recon_spec, aspect='auto', origin='lower', cmap='jet')
-        plt.title("Reconstructed CWT (Base Component)")
-        plt.colorbar()
-
-        plt.tight_layout()
-        save_path = os.path.join(save_dir, f"epoch_{epoch}_vis.png")
-        plt.savefig(save_path)
-        plt.close()
-        
-    model.train()
 
 # -------------------------------------------------------------------
 # 4. 学习率调度器
@@ -240,7 +155,7 @@ def validate(model, dataloader, device, config):
         for batch, labels in dataloader:
             batch = batch.to(device, non_blocking=True)
             
-            with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
+            with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
                 loss, _, _, _, _ = model(batch)
             metric_logger['loss'].update(loss.item())
             
@@ -293,7 +208,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         # labels = labels.to(device, non_blocking=True) # MAE 训练暂不需要标签
 
         # 混合精度前向传播
-        with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
+        with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
             loss, _, _, _, _ = model(batch)
         
         loss_value = loss.item()
@@ -488,7 +403,7 @@ def main():
         if is_main_process():
             logger.warning(f"Could not compile model: {e}")
 
-    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False)
+    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True)
 
     param_groups = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(param_groups, lr=base_lr, weight_decay=float(config['train']['weight_decay']))
