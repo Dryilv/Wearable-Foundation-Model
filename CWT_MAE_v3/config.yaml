@@ -34,7 +34,7 @@ train:
   resume: ""
 
 data:
-  index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
+  index_path: "train_index_new.json"
   signal_len: 1000         # 10秒 @ 100Hz (更集中的注意力范围，利于 PTT 捕捉)
   num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
   use_sliding_window: False # [新增] 是否启用滑动窗口读取数据
