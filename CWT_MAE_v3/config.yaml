@@ -35,17 +35,19 @@ train:
 
 data:
   index_path: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/model/SharedPhysioTFMAE/train_index.json"
-  signal_len: 3000         # 5秒 @ 100Hz
+  signal_len: 1000         # 10秒 @ 100Hz (更集中的注意力范围，利于 PTT 捕捉)
   num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
+  use_sliding_window: False # [新增] 是否启用滑动窗口读取数据
+  window_stride: 500       # [新增] 滑动窗口步长 (500点 = 5秒重叠)
 
 model:
   # --- CWT & Patch 参数 ---
   cwt_scales: 64          
   
   # Patch Embedding 配置
-  # Time: 3000 / 25 = 120 patches (更高的分辨率以捕捉 PTT 等相位特征)
+  # Time: 1000 / 25 = 40 patches
   # Freq: 64 / 4 = 16 patches
-  # 单个信号的 Token 数 = 120 * 16 = 1920
+  # 单个信号的 Token 数 = 40 * 16 = 640
   patch_size_time: 25     
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
@@ -74,3 +76,7 @@ model:
   # --- Loss 权重 ---
   # 1.0: 强调时域重建质量 (R波尖锐度、相位对齐)
   time_loss_weight: 1.0
+
+  # --- Data Ratio ---
+  # 控制训练使用的样本比例 (0.0 - 1.0)，用于快速实验验证
+  data_ratio: 1.0

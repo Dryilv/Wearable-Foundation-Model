@@ -364,7 +364,7 @@ def main():
     seed = 42 + rank
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.benchmark = True 
+    torch.backends.cudnn.benchmark = True # 开启 cudnn.benchmark 以加速固定输入尺寸的卷积
 
     if is_main_process():
         Path(config['train']['save_dir']).mkdir(parents=True, exist_ok=True)
@@ -402,14 +402,20 @@ def main():
         index_file=config['data']['index_path'], # 实际上 Dataset 内部会再次加载 full index，优化空间：传入 index_data
         indices=train_indices,
         signal_len=config['data']['signal_len'],
-        mode='train'
+        mode='train',
+        data_ratio=config['model'].get('data_ratio', 1.0), # 传入 data_ratio
+        use_sliding_window=config['data'].get('use_sliding_window', False),
+        window_stride=config['data'].get('window_stride', 500)
     )
     
     val_dataset = PhysioSignalDataset(
         index_file=config['data']['index_path'],
         indices=val_indices,
         signal_len=config['data']['signal_len'],
-        mode='test' # Val use test mode (deterministic crop)
+        mode='test', # Val use test mode (deterministic crop)
+        data_ratio=config['model'].get('data_ratio', 1.0), # 传入 data_ratio (通常 Val 也要采样吗？这里假设是)
+        use_sliding_window=config['data'].get('use_sliding_window', False),
+        window_stride=config['data'].get('window_stride', 500)
     )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -472,13 +478,16 @@ def main():
     model.to(device)
 
     # 编译模型
-    # try:
-    #     model = torch.compile(model)
-    #     if is_main_process():
-    #         logger.info("Model compiled with torch.compile()")
-    # except Exception as e:
-    #     if is_main_process():
-    #         logger.warning(f"Could not compile model: {e}")
+    try:
+         # 尝试使用 JIT script 编译 Time Attention 部分 (如果可行)
+         # 或者整个模型使用 torch.compile (PyTorch 2.0+)
+         # 这里演示 torch.compile，它是比 JIT 更现代的方案
+        model = torch.compile(model)
+        if is_main_process():
+            logger.info("Model compiled with torch.compile()")
+    except Exception as e:
+        if is_main_process():
+            logger.warning(f"Could not compile model: {e}")
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False)
 

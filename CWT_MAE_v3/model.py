@@ -161,6 +161,8 @@ class RoPEAttention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
+        
+        # 优化 2: 融合线性层 (保持不变，原代码已是 qkv 融合)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
@@ -168,14 +170,37 @@ class RoPEAttention(nn.Module):
 
     def forward(self, x, rope_cos=None, rope_sin=None):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        # 优化 1: Memory Layout 优化
+        # qkv: (B, N, 3, num_heads, head_dim)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        
+        # Split Q, K, V
+        # q, k, v: (B, N, num_heads, head_dim)
+        q = qkv[:, :, 0]
+        k = qkv[:, :, 1]
+        v = qkv[:, :, 2]
+
+        # RoPE Application
         if rope_cos is not None and rope_sin is not None:
-            q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
-        q = q.transpose(1, 2)
+             # apply_rotary_pos_emb 需要 q, k 为 (B, N, num_heads, head_dim)
+             # 但为了高效，我们可以先不转置，直接在最后一维操作
+             # 现在的 apply_rotary_pos_emb 期望输入形状兼容广播
+             q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
+        
+        # 优化 1: Flash Attention (SDPA)
+        # F.scaled_dot_product_attention 期望输入: (B, H, N, D)
+        q = q.transpose(1, 2) # (B, H, N, D)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        
+        # 使用 PyTorch 内置的 Flash Attention 实现
+        # dropout_p 仅在训练时启用
+        x = F.scaled_dot_product_attention(
+            q, k, v, 
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=False
+        )
+        
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)

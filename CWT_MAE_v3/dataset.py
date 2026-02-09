@@ -85,7 +85,10 @@ class PhysioSignalDataset(Dataset):
                  min_std_threshold=1e-4,
                  max_std_threshold=5000.0,
                  max_abs_value=1e5,
-                 expected_channels=5  # 1) 将默认通道数参数设为 5
+                 expected_channels=5,  # 1) 将默认通道数参数设为 5
+                 data_ratio=1.0,  # 新增: 数据使用比例 (0.0 - 1.0)
+                 use_sliding_window=False, # 新增: 是否启用滑动窗口
+                 window_stride=500        # 新增: 滑动窗口步长
                  ):
         self.signal_len = signal_len
         self.mode = mode
@@ -93,6 +96,8 @@ class PhysioSignalDataset(Dataset):
         self.max_std_threshold = max_std_threshold
         self.max_abs_value = max_abs_value
         self.expected_channels = expected_channels # 保存期望通道数
+        self.use_sliding_window = use_sliding_window
+        self.window_stride = window_stride
         
         # 支持直接传入 data_source (list) 和 indices (list) 以避免重复加载
         if data_source is not None:
@@ -112,10 +117,37 @@ class PhysioSignalDataset(Dataset):
         else:
             self.active_indices = list(range(len(self.index_data)))
             
+        # 根据 data_ratio 进行采样
+        if 0.0 < data_ratio < 1.0:
+            total_samples = len(self.active_indices)
+            keep_num = int(total_samples * data_ratio)
+            # 使用固定 seed 确保可复现性，或者根据 mode 决定
+            # 这里简单做顺序截断，或者随机采样
+            if mode == 'train':
+                 random.seed(42)
+                 self.active_indices = random.sample(self.active_indices, keep_num)
+            else:
+                 self.active_indices = self.active_indices[:keep_num]
+            print(f"[{mode.upper()}] Data Ratio: {data_ratio:.2f} | Using {len(self.active_indices)}/{total_samples} samples.")
+            
         # 预生成样本索引 (Mapping local_idx -> global_idx)
         self.samples = []
         for i in self.active_indices:
-            self.samples.append({'idx': i, 'start': None}) # idx points to global index in self.index_data
+            item_info = self.index_data[i]
+            
+            # 如果开启滑动窗口且 index 中包含长度信息
+            if self.use_sliding_window and 'len' in item_info:
+                total_len = item_info['len']
+                if total_len > self.signal_len:
+                    # 计算窗口起始点
+                    starts = range(0, total_len - self.signal_len + 1, self.window_stride)
+                    for s in starts:
+                        self.samples.append({'idx': i, 'start': s})
+                else:
+                    self.samples.append({'idx': i, 'start': 0})
+            else:
+                # 默认行为：每个条目作为一个样本，start 为 None (触发随机或中心裁剪)
+                self.samples.append({'idx': i, 'start': None})
             
         print(f"[{mode.upper()}] Dataset initialized with {len(self.samples)} samples.")
 
