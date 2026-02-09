@@ -27,7 +27,7 @@ train:
   # 日志与保存
   log_interval: 50
   save_freq: 5
-  save_dir: "./checkpoint_muti500s_fine_384"
+  save_dir: "./checkpoint_512_5channel"
   
   # 评估频率与限制
   eval_freq: 20           # 每 20 个 Epoch 跑一次 Linear Probe & Clustering
