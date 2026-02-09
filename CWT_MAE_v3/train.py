@@ -448,12 +448,13 @@ def main():
         # Validation
         val_loss = validate(model, val_dataloader, device, config)
         
-        # Feature Evaluation (every 5 epochs)
+        # Feature Evaluation
         linear_acc = -1.0
         sil_score = -1.0
         db_score = -1.0
         
-        if epoch % 5 == 0:
+        eval_freq = config['train'].get('eval_freq', 20)
+        if epoch % eval_freq == 0 and epoch > 0:
             if is_main_process():
                 logger.info("Running Feature Evaluation (Linear Probe & Clustering)...")
                 # Linear Probe
@@ -463,7 +464,7 @@ def main():
                     val_dataloader, 
                     device, 
                     num_classes=2,
-                    limit_batches=500 # 限制 Batch 数防止超时
+                    limit_batches=config['train'].get('linear_probe_limit', 100)
                 )
                 # Clustering
                 sil_score, db_score = evaluate_features_quality(

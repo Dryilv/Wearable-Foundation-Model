@@ -29,6 +29,10 @@ train:
   save_freq: 5
   save_dir: "./checkpoint_muti500s_fine_384"
   
+  # 评估频率与限制
+  eval_freq: 20           # 每 20 个 Epoch 跑一次 Linear Probe & Clustering
+  linear_probe_limit: 100 # 限制 Linear Probe 使用的 Batch 数 (加速评估)
+
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
   resume: ""
