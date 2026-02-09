@@ -233,24 +233,28 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
             # 这里的 mask 是基于 Patch 的，我们需要将其映射回时间点
             # 由于 CWT-MAE 的 Patch 包含频率维度，简单 repeat 可能会有重合，
             # 但在时间轴上，它是 patch_size_time 的倍数。
-            # 这里做简化处理，只展示时间轴上的 Mask 效果
-            m_mask_expanded = np.repeat(m_mask, patch_size)[:L]
             
-            masked_signal = orig_signal[m].copy()
-            # 如果该时间点对应的任一频率 Patch 被 Mask，则视为 Mask (简化逻辑)
-            # 实际上 mask_val 是 (M * N_time * N_freq)
             # 我们需要重新整理 mask 形状
             N_time = L // patch_size
             N_freq = N_patches // N_time
             m_mask_2d = m_mask.reshape(N_freq, N_time)
-            m_mask_time = m_mask_2d.any(axis=0) # 只要任一频率被 Mask，该时间段就标记为 Mask
+            
+            # 【修复】Mask 可视化逻辑优化
+            # 之前使用 any(axis=0) 导致高 Mask Ratio (0.75) 下几乎所有时间步都被标记为 Mask
+            # 现在的逻辑：如果该时间步的频率 Patch 中有超过 60% 被 Mask，才视为 Mask
+            # 这样可以看到那些 "部分可见" 的波形，而不是全白
+            m_mask_time = (m_mask_2d.sum(axis=0) / N_freq) > 0.6
+            
             m_mask_time_expanded = np.repeat(m_mask_time, patch_size)[:L]
             
+            masked_signal = orig_signal[m].copy()
             masked_signal[m_mask_time_expanded == 1] = np.nan
             
-            axs[m, 1].plot(orig_signal[m], 'lightgray', alpha=0.5)
-            axs[m, 1].plot(masked_signal, 'b', lw=1)
-            if m == 0: axs[m, 1].set_title("Masked Input")
+            axs[m, 1].plot(orig_signal[m], 'lightgray', alpha=0.5, label='Original')
+            axs[m, 1].plot(masked_signal, 'b', lw=1, label='Visible')
+            if m == 0: 
+                axs[m, 1].set_title("Masked Input (Blue=Visible)")
+                axs[m, 1].legend(loc='upper right', fontsize='small')
             axs[m, 1].grid(True, alpha=0.3)
 
             # --- Column 3: Reconstruction Overlay ---
