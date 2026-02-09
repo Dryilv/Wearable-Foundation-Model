@@ -199,6 +199,10 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         # 3. 数据后处理 (取第一个样本 idx=0)
         idx = 0
         orig_signal = x_time[idx].cpu().numpy()      # (M, L)
+        
+        # Log statistics for debugging
+        print(f"[Vis Epoch {epoch}] Orig Signal Stats: Mean={orig_signal.mean():.4e}, Std={orig_signal.std():.4e}, Max={orig_signal.max():.4e}, Min={orig_signal.min():.4e}")
+        
         recon_signal = pred_time[idx].cpu().numpy()    # (M, L)
         mask_val = mask[idx].cpu().numpy()            # (M * N_patches,)
         

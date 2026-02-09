@@ -211,6 +211,7 @@ class PhysioSignalDataset(Dataset):
                 if np.isnan(std_vals).any() or \
                    np.any(std_vals > self.max_std_threshold) or \
                    np.any(std_vals < self.min_std_threshold):
+                    # print(f"Skipping sample {original_idx}: std_vals={std_vals.flatten()}")
                     idx = random.randint(0, len(self.samples) - 1)
                     continue
                 
@@ -224,6 +225,11 @@ class PhysioSignalDataset(Dataset):
                 processed_signal = (processed_signal - mean_vals) / (std_vals + 1e-5)
                 processed_signal = np.clip(processed_signal, -10, 10) # 限制在 [-10, 10] 标准差范围内
 
+                # Double check for flat signal after normalization (should not happen if std check passed)
+                if np.abs(processed_signal).max() < 1e-6:
+                     idx = random.randint(0, len(self.samples) - 1)
+                     continue
+
                 # 转为 Tensor
                 signal_tensor = torch.from_numpy(processed_signal) 
 
@@ -236,11 +242,13 @@ class PhysioSignalDataset(Dataset):
                 return signal_tensor, torch.tensor(label, dtype=torch.long)
 
             except Exception as e:
+                print(f"Error loading sample {idx}: {e}")
                 idx = random.randint(0, len(self.samples) - 1)
                 continue
         
         # 兜底：返回全零信号和 0 标签
-        fallback_signal = torch.zeros((1, self.signal_len), dtype=torch.float32)
+        print(f"Warning: Fallback triggered for idx {idx}. Returning zeros.")
+        fallback_signal = torch.zeros((self.expected_channels, self.signal_len), dtype=torch.float32)
         return fallback_signal, torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal, fixed_start=None):

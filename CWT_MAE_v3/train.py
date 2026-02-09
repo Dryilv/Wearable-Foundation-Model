@@ -1,4 +1,5 @@
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE' # Fix OpenMP warning
 import sys
 import argparse
 import yaml
