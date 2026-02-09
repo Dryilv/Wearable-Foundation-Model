@@ -241,8 +241,7 @@ def validate(model, dataloader, device, config):
             batch = batch.to(device, non_blocking=True)
             
             with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, _, _, _ = model(batch)
-            
+                loss, _, _, _, _ = model(batch)
             metric_logger['loss'].update(loss.item())
             
     # Gather metrics from all processes
@@ -295,7 +294,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         # 混合精度前向传播
         with autocast(dtype=amp_dtype, enabled=config['train']['use_amp']):
-            loss, _, _, _ = model(batch)
+            loss, _, _, _, _ = model(batch)
         
         loss_value = loss.item()
         if not math.isfinite(loss_value):

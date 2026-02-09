@@ -98,10 +98,11 @@ class TestDatasetUpdate(unittest.TestCase):
         # 构造 5 通道输入 (B, 5, 1000)
         batch = torch.randn(2, 5, 1000).to(device)
         with torch.no_grad():
-            loss, pred_spec, pred_time, imgs = model(batch)
+            loss, pred_spec, pred_time, imgs, mask = model(batch)
             
         print(f"Loss: {loss.item()}")
         print(f"Reconstructed image shape: {imgs.shape}")
+        print(f"Mask shape: {mask.shape}")
         # imgs shape: (B, 5, C, H, W) -> (2, 5, 3, 64, 1000)
         self.assertEqual(imgs.shape, (2, 5, 3, 64, 1000))
 

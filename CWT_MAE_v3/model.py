@@ -619,4 +619,4 @@ class CWT_MAE_RoPE(nn.Module):
         
         loss_time = self.forward_loss_time(x, pred_time)
         
-        return loss_spec + self.time_loss_weight * loss_time, pred_spec, pred_time, imgs
+        return loss_spec + self.time_loss_weight * loss_time, pred_spec, pred_time, imgs, mask

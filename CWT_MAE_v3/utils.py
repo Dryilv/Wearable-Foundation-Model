@@ -176,11 +176,11 @@ def get_layer_wise_lr(model, base_lr, layer_decay):
         param_groups['default']['params'].extend(list(ungrouped_params))
 
     return list(param_groups.values())
-# Visualization (已修改：支持反归一化)
+# Visualization (已修改：支持 5 通道多变量可视化)
 # -------------------------------------------------------------------
-def save_reconstruction_images(model, x_time, epoch, save_dir, patch_size):
+def save_reconstruction_images(model, x_time, epoch, save_dir):
     """
-    Time-Only Visualization with Denormalization
+    5-Channel Visualization for CWT-MAE-v3
     """
     model.eval()
     vis_dir = os.path.join(save_dir, "vis_results")
@@ -192,68 +192,70 @@ def save_reconstruction_images(model, x_time, epoch, save_dir, patch_size):
         if hasattr(real_model, '_orig_mod'):
             real_model = real_model._orig_mod
         
-        # 2. 计算统计量并归一化 (用于模型输入)
-        # x_time 是原始数据 [B, 1, L]
-        mean = x_time.mean(dim=-1, keepdim=True)
-        std = x_time.std(dim=-1, keepdim=True)
-        x_norm = (x_time - mean) / (std + 1e-6)
-
-        # 3. 模型推理 (输入归一化数据)
-        latent, mask, ids_restore = real_model.forward_encoder(x_norm)
-        pred_norm = real_model.forward_decoder(latent, ids_restore)
+        # 2. 模型推理 (直接使用原始信号，模型内部处理 CWT 和归一化)
+        # x_time shape: (B, 5, L)
+        loss, pred_spec, pred_time, imgs, mask = real_model(x_time)
         
-        # 4. 数据后处理 (取第一个样本 idx=0)
+        # 3. 数据后处理 (取第一个样本 idx=0)
         idx = 0
+        orig_signal = x_time[idx].cpu().numpy()      # (M, L)
+        recon_signal = pred_time[idx].cpu().numpy()    # (M, L)
+        mask_val = mask[idx].cpu().numpy()            # (M * N_patches,)
         
-        # 获取该样本的 Mean 和 Std (用于反归一化)
-        sample_mean = mean[idx, 0, 0].cpu().numpy()
-        sample_std = std[idx, 0, 0].cpu().numpy()
+        M, L = orig_signal.shape
+        N_patches = real_model.num_patches
+        patch_size = real_model.patch_size_time
         
-        # A. 获取原始信号 (Raw Signal)
-        orig_signal_raw = x_time[idx, 0].cpu().numpy()
+        # 4. 绘图 (M 行, 3 列)
+        fig, axs = plt.subplots(M, 3, figsize=(18, 3 * M), squeeze=False)
+        plt.suptitle(f"Epoch {epoch} Reconstruction (5 Channels)", fontsize=16)
         
-        # B. 获取重建信号 (Normalized -> Denormalized)
-        rec_signal_norm = pred_norm[idx].flatten().cpu().numpy()
-        # *** 关键步骤：反归一化 ***
-        rec_signal_denorm = (rec_signal_norm * sample_std) + sample_mean
-        
-        # C. 获取 Mask
-        mask_np = mask[idx].cpu().numpy()
+        # 通道名称示例 (根据实际情况调整)
+        channel_names = ["ECG", "PPG_RED", "PPG_IR", "ABP", "RESP"]
+        if M != 5:
+            channel_names = [f"Ch {i}" for i in range(M)]
 
-        # 5. 对齐长度 (处理 Patch 整除问题)
-        L = len(orig_signal_raw)
-        
-        # 扩展 Mask
-        mask_expanded = np.repeat(mask_np, patch_size)
-        mask_expanded = mask_expanded[:L]
-        
-        # 截断重建信号
-        rec_signal_denorm = rec_signal_denorm[:L]
+        for m in range(M):
+            # --- Column 1: Original Signal ---
+            axs[m, 0].plot(orig_signal[m], 'k', lw=1)
+            axs[m, 0].set_ylabel(channel_names[m] if m < len(channel_names) else f"Ch {m}")
+            if m == 0: axs[m, 0].set_title("Original")
+            axs[m, 0].grid(True, alpha=0.3)
 
-        # 6. 绘图
-        fig, axs = plt.subplots(1, 3, figsize=(18, 5))
-        plt.suptitle(f"Epoch {epoch} Reconstruction (Original Scale)", fontsize=16)
+            # --- Column 2: Masked Input ---
+            # 提取该通道对应的 mask 片段
+            # 注意：mask 的顺序是所有通道拼接在一起的
+            m_mask = mask_val[m * N_patches : (m + 1) * N_patches]
+            # 这里的 mask 是基于 Patch 的，我们需要将其映射回时间点
+            # 由于 CWT-MAE 的 Patch 包含频率维度，简单 repeat 可能会有重合，
+            # 但在时间轴上，它是 patch_size_time 的倍数。
+            # 这里做简化处理，只展示时间轴上的 Mask 效果
+            m_mask_expanded = np.repeat(m_mask, patch_size)[:L]
+            
+            masked_signal = orig_signal[m].copy()
+            # 如果该时间点对应的任一频率 Patch 被 Mask，则视为 Mask (简化逻辑)
+            # 实际上 mask_val 是 (M * N_time * N_freq)
+            # 我们需要重新整理 mask 形状
+            N_time = L // patch_size
+            N_freq = N_patches // N_time
+            m_mask_2d = m_mask.reshape(N_freq, N_time)
+            m_mask_time = m_mask_2d.any(axis=0) # 只要任一频率被 Mask，该时间段就标记为 Mask
+            m_mask_time_expanded = np.repeat(m_mask_time, patch_size)[:L]
+            
+            masked_signal[m_mask_time_expanded == 1] = np.nan
+            
+            axs[m, 1].plot(orig_signal[m], 'lightgray', alpha=0.5)
+            axs[m, 1].plot(masked_signal, 'b', lw=1)
+            if m == 0: axs[m, 1].set_title("Masked Input")
+            axs[m, 1].grid(True, alpha=0.3)
 
-        # --- Subplot 1: 原始信号 (Raw) ---
-        axs[0].plot(orig_signal_raw, 'k', alpha=0.8, lw=1)
-        axs[0].set_title(f"Original Raw Signal\n(Mean={sample_mean:.2f}, Std={sample_std:.2f})")
-        axs[0].grid(True, alpha=0.3)
-
-        # --- Subplot 2: Masked Input (Raw Scale) ---
-        masked_view = orig_signal_raw.copy()
-        masked_view[mask_expanded == 1] = np.nan # 被 Mask 的部分设为 NaN
-        
-        axs[1].plot(orig_signal_raw, 'lightgray', alpha=0.5) # 背景灰线
-        axs[1].plot(masked_view, 'b', lw=1) # 蓝色实线 (可见部分)
-        axs[1].set_title("Masked Input (Visible Parts)")
-        axs[1].grid(True, alpha=0.3)
-
-        # --- Subplot 3: 重建对比 (Raw Scale) ---
-        axs[2].plot(orig_signal_raw, 'gray', alpha=0.5, label='Original')
-        axs[2].plot(rec_signal_denorm, 'r', alpha=0.8, lw=1, label='Reconstructed')
-        axs[2].set_title("Reconstruction Overlay")
-        axs[2].legend()
-        axs[2].grid(True, alpha=0.3)
+            # --- Column 3: Reconstruction Overlay ---
+            axs[m, 2].plot(orig_signal[m], 'gray', alpha=0.5, label='Original')
+            axs[m, 2].plot(recon_signal[m], 'r', alpha=0.8, lw=1, label='Reconstructed')
+            if m == 0: 
+                axs[m, 2].set_title("Reconstruction")
+                axs[m, 2].legend(loc='upper right', fontsize='small')
+            axs[m, 2].grid(True, alpha=0.3)
 
         plt.tight_layout()
         plt.savefig(os.path.join(vis_dir, f"epoch_{epoch}.png"))
