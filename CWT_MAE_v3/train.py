@@ -25,7 +25,7 @@ torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
 from model import CWT_MAE_RoPE 
-from dataset import PhysioSignalDataset, DataSplitter
+from dataset import PhysioSignalDataset, DataSplitter, fixed_channel_collate_fn
 from utils_metrics import ExperimentTracker, train_linear_probe, evaluate_features_quality
 
 # 启用 TensorFloat-32 (A100/3090/4090 必备加速)
@@ -113,31 +113,12 @@ def init_distributed_mode():
 # -------------------------------------------------------------------
 # 2. 关键：处理变长通道的 Collate Function
 # -------------------------------------------------------------------
-def variable_channel_collate_fn(batch):
-    """
-    处理 Batch 中不同样本通道数不一致的情况。
-    Batch: list of (tensor, label), where tensor shape is (M_i, L)
-    Output: (padded_signals, labels)
-    """
-    # 1. 解包信号和标签
-    signals = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
-    
-    # 2. 找到当前 Batch 中最大的通道数
-    max_m = max([s.shape[0] for s in signals])
-    signal_len = signals[0].shape[1]
-    batch_size = len(signals)
-    
-    # 3. 初始化全 0 张量并填充信号
-    padded_signals = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
-    for i, s in enumerate(signals):
-        m = s.shape[0]
-        padded_signals[i, :m, :] = s
-        
-    # 4. 堆叠标签
-    labels = torch.stack(labels)
-        
-    return padded_signals, labels
+# def variable_channel_collate_fn(batch):
+#     """
+#     [Deprecated] 处理 Batch 中不同样本通道数不一致的情况。
+#     现在使用 dataset.py 中的 fixed_channel_collate_fn
+#     """
+#     pass
 
 # -------------------------------------------------------------------
 # 3. 可视化函数 (适配多通道、无 Channel ID)
@@ -442,7 +423,7 @@ def main():
         num_workers=config['data']['num_workers'],
         pin_memory=True,
         drop_last=True,
-        collate_fn=variable_channel_collate_fn
+        collate_fn=fixed_channel_collate_fn
     )
     
     val_dataloader = DataLoader(
@@ -452,7 +433,7 @@ def main():
         num_workers=config['data']['num_workers'],
         pin_memory=True,
         drop_last=False,
-        collate_fn=variable_channel_collate_fn
+        collate_fn=fixed_channel_collate_fn
     )
 
     num_steps_per_epoch = len(train_dataloader)
@@ -485,7 +466,8 @@ def main():
         mask_ratio=config['model'].get('mask_ratio', 0.75),
         mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5),
         time_loss_weight=config['model'].get('time_loss_weight', 1.0),
-        use_conv_stem=config['model'].get('use_conv_stem', False)
+        use_conv_stem=config['model'].get('use_conv_stem', False),
+        use_factorized_attn=config['model'].get('use_factorized_attn', True)
     )
     model.to(device)
 

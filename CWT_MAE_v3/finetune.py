@@ -308,6 +308,7 @@ def main():
     parser.add_argument('--patch_size_time', type=int, default=50)
     parser.add_argument('--patch_size_freq', type=int, default=4)
     parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
+    parser.add_argument('--use_factorized_attn', action='store_true', default=True, help="Enable Factorized Sync-Attention")
     
     # [新增] CoT 参数
     parser.add_argument('--use_cot', action='store_true', help="Enable Chain-of-Thought Reasoning Head")

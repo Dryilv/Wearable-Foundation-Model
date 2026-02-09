@@ -43,10 +43,10 @@ model:
   cwt_scales: 64          
   
   # Patch Embedding 配置
-  # Time: 500 / 10 = 50 patches (更细的时间分辨率)
+  # Time: 3000 / 25 = 120 patches (更高的分辨率以捕捉 PTT 等相位特征)
   # Freq: 64 / 4 = 16 patches
-  # 单个信号的 Token 数 = 50 * 16 = 800
-  patch_size_time: 50     
+  # 单个信号的 Token 数 = 120 * 16 = 1920
+  patch_size_time: 25     
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
@@ -54,6 +54,7 @@ model:
   embed_dim: 384          
   depth: 12               
   num_heads: 6           
+  use_factorized_attn: True  # [新增] 开启因子化多变量注意力，利用时间对齐信息
   
   # --- [关键] 张量分解参数 ---
   # 控制 MLP 层的低秩近似程度

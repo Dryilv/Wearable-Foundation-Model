@@ -85,12 +85,14 @@ class PhysioSignalDataset(Dataset):
                  min_std_threshold=1e-4,
                  max_std_threshold=5000.0,
                  max_abs_value=1e5,
+                 expected_channels=5  # 1) 将默认通道数参数设为 5
                  ):
         self.signal_len = signal_len
         self.mode = mode
         self.min_std_threshold = min_std_threshold
         self.max_std_threshold = max_std_threshold
         self.max_abs_value = max_abs_value
+        self.expected_channels = expected_channels # 保存期望通道数
         
         # 支持直接传入 data_source (list) 和 indices (list) 以避免重复加载
         if data_source is not None:
@@ -149,6 +151,13 @@ class PhysioSignalDataset(Dataset):
                 # 目前的代码逻辑主要是读取和计算，或者 create new tensor，是安全的。
                 # 但为了保险起见，如果需要修改 raw_signal，建议 raw_signal = raw_signal.copy()
                 
+                # [新增] 验证通道数是否符合预期 (5通道)
+                if raw_signal.shape[0] != self.expected_channels:
+                     # 严重错误，数据不匹配
+                     # print(f"Skipping sample {original_idx}: Expected {self.expected_channels} channels, got {raw_signal.shape[0]}")
+                     idx = random.randint(0, len(self.samples) - 1)
+                     continue
+
                 if np.isnan(raw_signal).any() or np.isinf(raw_signal).any():
                     idx = random.randint(0, len(self.samples) - 1)
                     continue
@@ -186,11 +195,11 @@ class PhysioSignalDataset(Dataset):
                 # 转为 Tensor
                 signal_tensor = torch.from_numpy(processed_signal) 
 
-                # 5. 通道乱序 (仅训练模式)
-                if self.mode == 'train':
-                    M = signal_tensor.shape[0]
-                    perm_indices = torch.randperm(M)
-                    signal_tensor = signal_tensor[perm_indices]
+                # 2) 移除原有通道对齐/重排操作 (保持 5 通道固定顺序)
+                # if self.mode == 'train':
+                #     M = signal_tensor.shape[0]
+                #     perm_indices = torch.randperm(M)
+                #     signal_tensor = signal_tensor[perm_indices]
 
                 return signal_tensor, torch.tensor(label, dtype=torch.long)
 
@@ -232,3 +241,21 @@ class PhysioSignalDataset(Dataset):
             # np.pad 格式: ((top, bottom), (left, right))
             # 我们只在时间轴 (axis 1) 的右侧填充
             return np.pad(signal, ((0, 0), (0, pad_len)), 'constant', constant_values=0)
+
+def fixed_channel_collate_fn(batch):
+    """
+    针对 5 通道对齐数据的 Collate Function。
+    不再进行 padding，而是断言所有样本通道数一致。
+    Output: (B, 5, L), (B,)
+    """
+    signals = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+    
+    # 验证维度一致性
+    # 假设 __getitem__ 已经保证了是 5 通道
+    # 但为了保险，可以在这里再次断言，或者假设它是安全的
+    
+    padded_signals = torch.stack(signals) # (B, 5, L)
+    labels = torch.stack(labels)
+    
+    return padded_signals, labels
