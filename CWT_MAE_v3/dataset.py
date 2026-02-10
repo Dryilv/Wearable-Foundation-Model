@@ -249,10 +249,21 @@ class PhysioSignalDataset(Dataset):
                 idx = random.randint(0, len(self.samples) - 1)
                 continue
         
-        # 兜底：返回全零信号和 0 标签
-        print(f"Warning: Fallback triggered for idx {idx}. Returning zeros.")
-        fallback_signal = torch.zeros((self.expected_channels, self.signal_len), dtype=torch.float32)
-        return fallback_signal, torch.tensor(0, dtype=torch.long)
+        # 兜底：如果重试 3 次依然失败，尝试从数据集开头找一个可能有效的样本
+        # 避免返回全零信号导致模型梯度冲击
+        print(f"Warning: Fallback triggered for idx {idx} after 3 retries. Attempting to return a safe sample.")
+        try:
+            # 尝试返回第一个样本（通常是经过预处理验证的）
+            sample_info = self.samples[0]
+            content = load_pickle_file(self.index_data[sample_info['idx']]['path'])
+            safe_signal = content['data'][:, :self.signal_len]
+            # 简单的归一化
+            safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
+            return torch.from_numpy(safe_signal).float(), torch.tensor(0, dtype=torch.long)
+        except:
+            # 极度兜底：返回全一信号而非全零，全一信号在 Z-Score 后会变成全零，但至少带有一个微小的 epsilon std
+            fallback_signal = torch.ones((self.expected_channels, self.signal_len), dtype=torch.float32) * 0.01
+            return fallback_signal, torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal, fixed_start=None):
         """

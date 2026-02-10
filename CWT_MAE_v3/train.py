@@ -1,5 +1,6 @@
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE' # Fix OpenMP warning
+os.environ['MKL_THREADING_LAYER'] = 'GNU'   # Prevent Intel/LLVM OpenMP conflict
 import sys
 import argparse
 import yaml
