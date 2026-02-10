@@ -185,52 +185,88 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     
     header = f'Epoch: [{epoch}/{config["train"]["epochs"]}]'
     num_steps_per_epoch = len(dataloader)
+    accum_iter = config['train'].get('accum_iter', 1)
     
     # 优先使用 bfloat16
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     start_time = time.time()
     
+    optimizer.zero_grad() # Initialize gradients
+
     for step, (batch, labels) in enumerate(dataloader):
         step_start_time = time.time()
         global_step = epoch * num_steps_per_epoch + step
         
-        # 调整 LR
-        adjust_learning_rate_per_step(
-            optimizer, 
-            current_step=global_step, 
-            total_steps=total_steps, 
-            warmup_steps=warmup_steps, 
-            base_lr=base_lr, 
-            min_lr=min_lr
-        )
+        # 调整 LR (按 step 调整，考虑 accum_iter)
+        if step % accum_iter == 0:
+            adjust_learning_rate_per_step(
+                optimizer, 
+                current_step=global_step // accum_iter, 
+                total_steps=total_steps // accum_iter, 
+                warmup_steps=warmup_steps // accum_iter, 
+                base_lr=base_lr, 
+                min_lr=min_lr
+            )
 
         # batch shape: (B, M, L)
         batch = batch.to(device, non_blocking=True)
         # labels = labels.to(device, non_blocking=True) # MAE 训练暂不需要标签
 
         # 混合精度前向传播
-        with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-            loss, _, _, _, _ = model(batch)
+        # 在 DDP 模式下，如果不是最后一次累积，使用 no_sync 上下文以减少通信
+        do_sync = (step + 1) % accum_iter == 0 or (step + 1) == len(dataloader)
         
-        loss_value = loss.item()
-        if not math.isfinite(loss_value):
-            print(f"Loss is {loss_value}, stopping training")
-            sys.exit(1)
+        # 处理 DDP no_sync
+        my_context = model.no_sync if (isinstance(model, DDP) and not do_sync) else (lambda: contextlib.nullcontext())
+        
+        # 注意：python < 3.7 可能不支持这种 lambda 写法，但这里环境通常较高。
+        # 为了保险，直接写逻辑：
+        if isinstance(model, DDP) and not do_sync:
+             context_manager = model.no_sync()
+        else:
+             import contextlib
+             context_manager = contextlib.nullcontext()
 
-        optimizer.zero_grad()
+        with context_manager:
+            with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
+                loss, _, _, _, _ = model(batch)
+                loss = loss / accum_iter # Normalize loss for accumulation
+
+            loss_value = loss.item() * accum_iter # Restore for logging
+            
+            if not math.isfinite(loss_value):
+                print(f"Loss is {loss_value}, stopping training")
+                sys.exit(1)
+
+            # 使用 Scaler 处理反向传播 (兼容 fp16)
+            scaler.scale(loss).backward()
         
-        # 使用 Scaler 处理反向传播 (兼容 fp16)
-        scaler.scale(loss).backward()
-        
-        # Unscale 之后才能 clip grad
-        scaler.unscale_(optimizer)
-        
-        # 计算 Gradient Norm
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['train']['clip_grad'])
-        
-        scaler.step(optimizer)
-        scaler.update()
+        if do_sync:
+            # Unscale 之后才能 clip grad
+            scaler.unscale_(optimizer)
+            
+            # 计算 Gradient Norm (在 clip 之前计算，用于监控)
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.detach().data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            
+            # Clip Grad
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['train']['clip_grad'])
+            
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            
+            metric_logger['grad_norm'].update(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+        else:
+            # 如果没有 sync，grad_norm 暂不更新或保持上一次的值
+            pass
+
+        # Metrics Update
 
         # Metrics Update
         batch_size = batch.shape[0]
@@ -244,6 +280,22 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         if step % 50 == 0 and is_main_process():
             elapsed = time.time() - start_time_global
+            
+            # [新增] 详细梯度监控日志
+            # 记录各层梯度的统计信息，帮助定位异常层
+            grad_stats = []
+            weight_stats = []
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    g_norm = p.grad.detach().norm(2).item()
+                    w_std = p.detach().std().item()
+                    # 只记录异常大或关键层的梯度
+                    if g_norm > 1.0 or 'cls_token' in name or 'patch_embed' in name:
+                         grad_stats.append(f"{name}: g={g_norm:.2f}, w_std={w_std:.4f}")
+            
+            if grad_stats:
+                logger.info(f"High Grads (>1.0) & Key Layers:\n" + "\n".join(grad_stats[:10])) # 限制输出行数
+            
             logger.info(
                 f"{header} Step: [{step}/{num_steps_per_epoch}] "
                 f"Loss: {metric_logger['loss']} "
@@ -412,6 +464,12 @@ def main():
     
     # GradScaler 用于混合精度
     scaler = GradScaler(enabled=config['train']['use_amp'])
+    
+    # [新增] 梯度累积参数
+    accum_iter = config['train'].get('accum_iter', 1)
+    if is_main_process():
+        logger.info(f"Gradient Accumulation Steps: {accum_iter}")
+        logger.info(f"Effective Batch Size: {config['train']['batch_size'] * accum_iter * world_size}")
     
     start_epoch = 0
     if config['train']['resume'] and os.path.isfile(config['train']['resume']):

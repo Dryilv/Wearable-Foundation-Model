@@ -18,7 +18,11 @@ train:
   # 正则化
   # Tensor Decomposition 本身有参数压缩和正则化效果，Weight Decay 可适度降低
   weight_decay: 0.05      
-  clip_grad: 3.0          
+  clip_grad: 1.0
+  
+  # [新增] 梯度累积步数 (1 = 不累积)
+  # 增大 Effective Batch Size 以稳定梯度
+  accum_iter: 1
   
   # [必须开启] 混合精度训练
   # 配合代码中的 bfloat16 使用，防止 RoPE 溢出并加速训练

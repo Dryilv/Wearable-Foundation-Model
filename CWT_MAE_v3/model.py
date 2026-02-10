@@ -117,8 +117,9 @@ class TensorizedLinear(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.v.weight)
-        nn.init.xavier_uniform_(self.u.weight)
+        # 修正初始化：使用 kaiming_normal 避免方差叠加导致的梯度爆炸
+        nn.init.kaiming_normal_(self.v.weight, mode='fan_out', nonlinearity='linear')
+        nn.init.kaiming_normal_(self.u.weight, mode='fan_in', nonlinearity='linear')
         if self.u.bias is not None: nn.init.constant_(self.u.bias, 0)
 
     def forward(self, x):
@@ -135,12 +136,14 @@ class DecomposedPatchEmbed(nn.Module):
         if use_conv_stem:
             # 卷积 Stem: 增强局部特征提取
             # Conv(3x3) -> Conv(3x3) -> Patching
+            # 优化: 替换 BatchNorm 为 GroupNorm 或 LayerNorm 以增强稳定性
+            # 这里选择 GroupNorm (num_groups=4)，对小 batch size 更友好
             self.proj = nn.Sequential(
                 nn.Conv2d(in_chans, embed_dim // 4, kernel_size=3, stride=1, padding=1, bias=False),
-                nn.BatchNorm2d(embed_dim // 4),
+                nn.GroupNorm(4, embed_dim // 4),
                 nn.GELU(),
                 nn.Conv2d(embed_dim // 4, embed_dim // 2, kernel_size=3, stride=1, padding=1, bias=False),
-                nn.BatchNorm2d(embed_dim // 2),
+                nn.GroupNorm(8, embed_dim // 2),
                 nn.GELU(),
                 nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=patch_size, stride=patch_size)
             )
@@ -443,13 +446,14 @@ class CWT_MAE_RoPE(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
+            torch.nn.init.trunc_normal_(m.weight, std=.02)
             if m.bias is not None: nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
         elif isinstance(m, nn.Conv2d):
-            torch.nn.init.xavier_uniform_(m.weight)
+            torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
 
     def random_masking(self, x, mask_ratio):
         N, L, D = x.shape
@@ -565,7 +569,8 @@ class CWT_MAE_RoPE(nn.Module):
         mean = x_raw.mean(dim=-1, keepdim=True)
         std = x_raw.std(dim=-1, keepdim=True)
         std = torch.clamp(std, min=1e-5)
-        target = (x_raw - mean) / std
+        # 防御性 Clamp，避免除以 std 后数值爆炸
+        target = torch.clamp((x_raw - mean) / std, min=-100.0, max=100.0)
         loss = F.mse_loss(pred_time.float(), target)
         return loss
 
@@ -585,9 +590,8 @@ class CWT_MAE_RoPE(nn.Module):
         imgs = (imgs_f32 - mean) / std
         
         # 数值鲁棒性增强
-        # [优化] 将截断范围从 [-100, 100] 收紧到 [-20, 20]，防止极端异常值导致的梯度爆炸
-        imgs = torch.nan_to_num(imgs, nan=0.0, posinf=20.0, neginf=-20.0)
-        imgs = torch.clamp(imgs, min=-20.0, max=20.0)
+        imgs = torch.nan_to_num(imgs, nan=0.0, posinf=100.0, neginf=-100.0)
+        imgs = torch.clamp(imgs, min=-100.0, max=100.0)
 
         # 确保输入数据类型与模型权重一致
         target_dtype = next(self.parameters()).dtype
