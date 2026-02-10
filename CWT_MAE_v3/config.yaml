@@ -39,13 +39,13 @@ train:
 
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
-  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_512_5channel/checkpoint_last.pth"
+  resume: ""
 
 data:
   index_path: "train_index_cleaned.json"
   signal_len: 500          # 5秒 @ 100Hz (方案2：精细细节捕获)
   num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
-  use_sliding_window: True # [新增] 是否启用滑动窗口读取数据
+  use_sliding_window: False # [新增] 是否启用滑动窗口读取数据
   window_stride: 250       # 步长随长度调整
 
 model:
