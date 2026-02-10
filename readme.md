@@ -1,4 +1,4 @@
-# CWT-MAE 模型版本对比说明
+# CWT-MAE 模型版本对比说明111
 
 本项目包含两个版本的 CWT-MAE (Continuous Wavelet Transform Masked Autoencoder) 模型实现。以下是 `CWT_MAE_v1` 和 `CWT_MAE_v2` 的详细区别对比。
 
