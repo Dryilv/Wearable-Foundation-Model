@@ -446,16 +446,13 @@ def main():
     model.to(device)
 
     # 编译模型
-    try:
-         # 尝试使用 JIT script 编译 Time Attention 部分 (如果可行)
-         # 或者整个模型使用 torch.compile (PyTorch 2.0+)
-         # 这里演示 torch.compile，它是比 JIT 更现代的方案
-        model = torch.compile(model)
-        if is_main_process():
-            logger.info("Model compiled with torch.compile()")
-    except Exception as e:
-        if is_main_process():
-            logger.warning(f"Could not compile model: {e}")
+    # try:
+    #     model = torch.compile(model)
+    #     if is_main_process():
+    #         logger.info("Model compiled with torch.compile()")
+    # except Exception as e:
+    #     if is_main_process():
+    #         logger.warning(f"Could not compile model: {e}")
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True)
 
