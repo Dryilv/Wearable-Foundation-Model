@@ -31,7 +31,7 @@ train:
   # 日志与保存
   log_interval: 50
   save_freq: 5
-  save_dir: "./checkpoint_512_5channel"
+  save_dir: "./checkpoint_768_5channel"
   
   # 评估频率与限制
   eval_freq: 20           # 每 20 个 Epoch 跑一次 Linear Probe & Clustering
@@ -39,7 +39,7 @@ train:
 
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
-  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_512_5channel/checkpoint_last.pth"
+  resume: null
 
 data:
   index_path: "train_index_cleaned.json"
@@ -61,11 +61,11 @@ model:
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
-  # --- Transformer Encoder (中等规模) ---
-  embed_dim: 512          
+  # --- Transformer Encoder (ViT-Base 规模) ---
+  embed_dim: 768          
   depth: 12               
-  num_heads: 8            # 512 / 64 = 8
-  use_factorized_attn: True  # [新增] 开启因子化多变量注意力，利用时间对齐信息
+  num_heads: 12           # 768 / 64 = 12
+  use_factorized_attn: False  # [修改] 关闭因子化注意力，回退到标准的 Global Attention (同 v1)，减少冗余
   
   # --- [关键] 张量分解参数 ---
   # 控制 MLP 层的低秩近似程度
@@ -73,9 +73,9 @@ model:
   mlp_rank_ratio: 0.5     
   
   # --- Decoder (轻量级) ---
-  decoder_embed_dim: 256  
+  decoder_embed_dim: 512  
   decoder_depth: 8        
-  decoder_num_heads: 8   
+  decoder_num_heads: 16   
   
   # --- 训练策略 ---
   # Mask Ratio: 0.75
