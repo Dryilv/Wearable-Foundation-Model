@@ -455,10 +455,18 @@ class CWT_MAE_RoPE(nn.Module):
             torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None: nn.init.constant_(m.bias, 0)
 
-    def random_masking(self, x, mask_ratio):
+    def random_masking(self, x, mask_ratio, num_channels=1):
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
-        noise = torch.rand(N, L, device=x.device)
+        
+        if num_channels > 1:
+            # Synchronized masking: Generate noise for one channel and replicate
+            N_patches = L // num_channels
+            noise = torch.rand(N, N_patches, device=x.device)
+            noise = noise.repeat(1, num_channels)
+        else:
+            noise = torch.rand(N, L, device=x.device)
+            
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
         ids_keep = ids_shuffle[:, :len_keep]
@@ -495,7 +503,7 @@ class CWT_MAE_RoPE(nn.Module):
             ids_restore = torch.arange(M * N_patches, device=x.device).unsqueeze(0).expand(B, -1)
             ids_keep = ids_restore
         else:
-            x_masked, mask, ids_restore, ids_keep = self.random_masking(x, self.mask_ratio)
+            x_masked, mask, ids_restore, ids_keep = self.random_masking(x, self.mask_ratio, num_channels=M)
 
         # 5. Append CLS Token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
