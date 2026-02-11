@@ -486,7 +486,11 @@ class CWT_MAE_RoPE(nn.Module):
         std = x_raw.std(dim=-1, keepdim=True)
         std = torch.clamp(std, min=1e-5)
         # 防御性 Clamp，避免除以 std 后数值爆炸
-        target = torch.clamp((x_raw - mean) / std, min=-100.0, max=100.0)
+        target = (x_raw - mean) / std
+        # v3 原始逻辑有 clamp(-100, 100)，这可能截断了高频 R 波的尖峰
+        # 导致模型无法拟合真实的高振幅区域，从而 Loss 无法继续下降
+        # 尝试放宽限制或移除
+        # target = torch.clamp(target, min=-100.0, max=100.0) 
         loss = F.mse_loss(pred_time.float(), target)
         return loss
 
