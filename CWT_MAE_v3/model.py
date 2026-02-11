@@ -459,13 +459,22 @@ class CWT_MAE_RoPE(nn.Module):
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
         
+        # 回退到随机掩码（但保持通道同步）
+        # Tube Masking (整列遮挡) 确实太难了，会导致 Loss 难以收敛
+        # 这里我们允许频域上的随机遮挡，让模型可以利用同时间点的其他频率信息进行插值
+        
+        N_patches_per_channel = L // num_channels
+        
+        # 1. 生成单通道的随机噪声 (N, N_patches)
+        # 这里包含 Time * Freq 所有 Patch，是完全随机的
+        noise_single = torch.rand(N, N_patches_per_channel, device=x.device)
+        
+        # 2. 广播到所有通道
+        # 确保不同通道的同一位置 (Time, Freq) 掩码状态一致，防止通道间泄漏
         if num_channels > 1:
-            # Synchronized masking: Generate noise for one channel and replicate
-            N_patches = L // num_channels
-            noise = torch.rand(N, N_patches, device=x.device)
-            noise = noise.repeat(1, num_channels)
+             noise = noise_single.repeat(1, num_channels)
         else:
-            noise = torch.rand(N, L, device=x.device)
+             noise = noise_single
             
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
