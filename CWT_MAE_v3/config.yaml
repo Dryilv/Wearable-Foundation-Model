@@ -39,7 +39,7 @@ train:
 
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
-  resume: ""
+  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_512_5channel/checkpoint_last.pth"
 
 data:
   index_path: "train_index_cleaned.json"
