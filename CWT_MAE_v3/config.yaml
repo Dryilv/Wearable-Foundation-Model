@@ -39,7 +39,7 @@ train:
 
   # 断点续训路径
   # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
-  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_768_5channel/checkpoint_last.pth"
+  resume: ""
 
 data:
   index_path: "train_index_cleaned.json"
@@ -53,11 +53,11 @@ model:
   cwt_scales: 64          
   
   # Patch Embedding 配置
-  # Time: 500 / 25 = 20 patches
+  # Time: 500 / 50 = 10 patches (更粗的粒度，每个 patch 包含更多上下文)
   # Freq: 64 / 4 = 16 patches
-  # 单个信号的 Token 数 = 20 * 16 = 320
-  # 5 通道总 Token 数 = 320 * 5 + 1 = 1601
-  patch_size_time: 25     
+  # 单个信号的 Token 数 = 10 * 16 = 160
+  # 5 通道总 Token 数 = 160 * 5 + 1 = 801
+  patch_size_time: 50     
   patch_size_freq: 4      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
@@ -65,7 +65,6 @@ model:
   embed_dim: 768          
   depth: 12               
   num_heads: 12           # 768 / 64 = 12
-  use_factorized_attn: False  # [修改] 关闭因子化注意力，回退到标准的 Global Attention (同 v1)，减少冗余
   
   # --- [关键] 张量分解参数 ---
   # 控制 MLP 层的低秩近似程度

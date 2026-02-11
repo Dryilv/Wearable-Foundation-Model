@@ -114,18 +114,6 @@ def init_distributed_mode():
         return 0, 0, 1
 
 # -------------------------------------------------------------------
-# 2. 关键：处理变长通道的 Collate Function
-# -------------------------------------------------------------------
-# def variable_channel_collate_fn(batch):
-#     """
-#     [Deprecated] 处理 Batch 中不同样本通道数不一致的情况。
-#     现在使用 dataset.py 中的 fixed_channel_collate_fn
-#     """
-#     pass
-
-
-
-# -------------------------------------------------------------------
 # 4. 学习率调度器
 # -------------------------------------------------------------------
 def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_steps, base_lr, min_lr):
@@ -440,8 +428,7 @@ def main():
         mask_ratio=config['model'].get('mask_ratio', 0.75),
         mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5),
         time_loss_weight=config['model'].get('time_loss_weight', 1.0),
-        use_conv_stem=config['model'].get('use_conv_stem', False),
-        use_factorized_attn=config['model'].get('use_factorized_attn', True)
+        use_conv_stem=config['model'].get('use_conv_stem', False)
     )
     model.to(device)
 

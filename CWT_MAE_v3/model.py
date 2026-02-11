@@ -230,92 +230,6 @@ class TensorizedBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-class SyncAttention(nn.Module):
-    """
-    针对多变量同步信息的注意力机制。
-    在相同时间索引 N 上，让不同通道 M 之间进行交互。
-    这对于捕捉 PTT (脉搏传输时间) 等相位差特征至关重要。
-    """
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x, M, N):
-        # x: (B, M*N, D)
-        B, MN, D = x.shape
-        # Reshape to (B*N, M, D) -> 把时间轴压入 Batch，在通道轴做 Attention
-        x_reshaped = x.view(B, M, N, D).permute(0, 2, 1, 3).reshape(B * N, M, D)
-        
-        BN, _, _ = x_reshaped.shape
-        qkv = self.qkv(x_reshaped).reshape(BN, M, 3, self.num_heads, D // self.num_heads).permute(2, 0, 1, 3, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        
-        # Sync Attention 不需要 RoPE，因为是在同一时刻
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-        
-        x_out = attn_out.transpose(1, 2).reshape(BN, M, D)
-        x_out = self.proj(x_out)
-        x_out = self.proj_drop(x_out)
-        
-        # Reshape back to (B, M*N, D)
-        x_out = x_out.view(B, N, M, D).permute(0, 2, 1, 3).reshape(B, MN, D)
-        return x_out
-
-class FactorizedMultivariateBlock(nn.Module):
-    """
-    因子化多变量 Transformer 块 (Axial Attention)。
-    交替执行时间维度注意力和跨通道同步注意力。
-    """
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., 
-                 rank_ratio=0.5, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.time_attn = RoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        
-        self.norm_sync = norm_layer(dim)
-        self.sync_attn = SyncAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        
-        self.norm2 = norm_layer(dim)
-        hidden_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            TensorizedLinear(dim, hidden_dim, rank_ratio=rank_ratio), 
-            nn.GELU(),
-            nn.Dropout(drop),
-            TensorizedLinear(hidden_dim, dim, rank_ratio=rank_ratio),
-            nn.Dropout(drop)
-        )
-
-    def forward(self, x, M, N, rope_cos=None, rope_sin=None):
-        # x: (B, 1 + Total_Tokens, D)
-        
-        # 1. Time & Global Attention (包含 CLS)
-        x = x + self.time_attn(self.norm1(x), rope_cos, rope_sin)
-        
-        # 2. Sync Attention (仅针对 Patch Tokens，且只有 M > 1 时执行)
-        if M > 1:
-            cls_token = x[:, :1, :]
-            patch_tokens = x[:, 1:, :]
-            
-            # 只有在未 Mask (Total_Tokens == M*N) 时才执行因子化同步
-            # 如果是预训练阶段且有 Mask，我们暂时跳过 SyncAttention 或使用全局 Attention 兜底
-            if patch_tokens.shape[1] == M * N:
-                patch_tokens = patch_tokens + self.sync_attn(self.norm_sync(patch_tokens), M, N)
-                x = torch.cat([cls_token, patch_tokens], dim=1)
-            
-        # 3. MLP
-        x = x + self.mlp(self.norm2(x))
-        return x
-
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., norm_layer=nn.LayerNorm):
         super().__init__()
@@ -356,8 +270,7 @@ class CWT_MAE_RoPE(nn.Module):
         mlp_rank_ratio=0.5,    
         norm_layer=nn.LayerNorm,
         time_loss_weight=1.0,
-        use_conv_stem=False,
-        use_factorized_attn=True  # 新增：是否使用因子化注意力
+        use_conv_stem=False
     ):
         super().__init__()
         
@@ -365,7 +278,6 @@ class CWT_MAE_RoPE(nn.Module):
         self.cwt_scales = cwt_scales
         self.time_loss_weight = time_loss_weight
         self.patch_size_time = patch_size_time
-        self.use_factorized_attn = use_factorized_attn
         
         # 1. Patch Embed (共享权重，不区分通道)
         self.patch_embed = DecomposedPatchEmbed(
@@ -393,24 +305,14 @@ class CWT_MAE_RoPE(nn.Module):
         self.rope_decoder = RotaryEmbedding(dim=decoder_embed_dim // decoder_num_heads)
 
         # 3. Encoder Blocks
-        if self.use_factorized_attn:
-            self.blocks = nn.ModuleList([
-                FactorizedMultivariateBlock(
-                    embed_dim, num_heads, 
-                    rank_ratio=mlp_rank_ratio, 
-                    norm_layer=norm_layer
-                ) 
-                for _ in range(depth)
-            ])
-        else:
-            self.blocks = nn.ModuleList([
-                TensorizedBlock(
-                    embed_dim, num_heads, 
-                    rank_ratio=mlp_rank_ratio, 
-                    norm_layer=norm_layer
-                ) 
-                for _ in range(depth)
-            ])
+        self.blocks = nn.ModuleList([
+            TensorizedBlock(
+                embed_dim, num_heads, 
+                rank_ratio=mlp_rank_ratio, 
+                norm_layer=norm_layer
+            ) 
+            for _ in range(depth)
+        ])
         self.norm = norm_layer(embed_dim)
 
         # 4. Decoder
@@ -529,10 +431,7 @@ class CWT_MAE_RoPE(nn.Module):
         # 7. Transformer
         rope_cos, rope_sin = self.rope_encoder(x, pos_ids)
         for blk in self.blocks:
-            if isinstance(blk, FactorizedMultivariateBlock):
-                x = blk(x, M, N_patches, rope_cos=rope_cos, rope_sin=rope_sin)
-            else:
-                x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
+            x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
         x = self.norm(x)
         
         return x, mask, ids_restore, M
