@@ -88,8 +88,13 @@ model:
   
   # --- Loss 权重 ---
   # 1.0: 强调时域重建质量 (R波尖锐度、相位对齐)
-  time_loss_weight: 1.0
-
+  # [Optimization] Reduced time_loss_weight to 0.1
+  # Reason: Spec Loss is dropping much slower than Time Loss. 
+  # This imbalance suggests the model prioritizes the "easy" time reconstruction task (low frequency shape)
+  # over the "hard" spectral detail reconstruction task.
+  # Reducing the weight forces the optimizer to pay more attention to the spectral loss gradient.
+  time_loss_weight: 0.1
+  
   # --- Data Ratio ---
   # 控制训练使用的样本比例 (0.0 - 1.0)，用于快速实验验证
   data_ratio: 1.0

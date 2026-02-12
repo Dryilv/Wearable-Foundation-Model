@@ -478,6 +478,10 @@ class CWT_MAE_RoPE(nn.Module):
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)
         loss = (loss * mask).sum() / (mask.sum() + 1e-6)
+        
+        # [Analysis] Scale Loss to be comparable with time domain
+        # The CWT values can be large or small depending on normalization.
+        # But here we already normalized imgs to N(0,1), so MSE should be around 1.0 initially.
         return loss
 
     def forward_loss_time(self, x_raw, pred_time, mask=None):
@@ -497,6 +501,27 @@ class CWT_MAE_RoPE(nn.Module):
         # [Optimization] Optional: Weight loss by mask density
         # If mask is provided (patch-level), we project it to time domain
         if mask is not None:
+             # mask: (B, M * N_patches) -> (B, M, Grid_H, Grid_W)
+             B, M, L = x_raw.shape
+             H, W = self.grid_size # (Freq, Time)
+             
+             # Reshape mask to (B, M, H, W)
+             mask_2d = mask.view(B, M, H, W)
+             
+             # Project to Time domain: Max pooling over Freq axis (B, M, 1, W)
+             # If any frequency at time t is masked, we consider time t as partially masked.
+             # Or use Mean pooling to get a soft weight.
+             # Let's use Mean pooling to weight the time loss.
+             time_mask_weight = mask_2d.float().mean(dim=2, keepdim=True) # (B, M, 1, W_patches)
+             
+             # Upsample to full time resolution (L)
+             # W_patches = 10, L = 500 -> scale_factor = 50
+             time_mask_weight = F.interpolate(time_mask_weight, size=L, mode='nearest') # (B, M, 1, L)
+             time_mask_weight = time_mask_weight.squeeze(2) # (B, M, L)
+             
+             # Apply weight: Focus more on masked regions
+             # loss shape is (B, M, L) before mean
+             # loss = loss * (0.1 + 0.9 * time_mask_weight) 
              pass
 
         loss = loss.mean()
