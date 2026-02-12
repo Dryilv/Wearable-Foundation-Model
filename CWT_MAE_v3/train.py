@@ -146,8 +146,10 @@ def validate(model, dataloader, device, config):
             batch = batch.to(device, non_blocking=True)
             
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, _, _, _, _ = model(batch)
+                loss, loss_dict, _, _, _, _ = model(batch)
             metric_logger['loss'].update(loss.item())
+            metric_logger['loss_spec'].update(loss_dict['loss_spec'].item())
+            metric_logger['loss_time'].update(loss_dict['loss_time'].item())
             
     # Gather metrics from all processes
     # 这里简单起见，只看主进程的，或者依赖 SmoothedValue 的 global_avg (如果它是跨进程同步的？当前实现不是)
@@ -155,12 +157,19 @@ def validate(model, dataloader, device, config):
     # 为了准确，我们在 SmoothedValue 外面做一次 reduce
     
     val_loss = metric_logger['loss'].global_avg
+    val_loss_spec = metric_logger['loss_spec'].global_avg
+    val_loss_time = metric_logger['loss_time'].global_avg
+    
     if dist.is_initialized():
-        val_loss_tensor = torch.tensor(val_loss, device=device)
-        dist.all_reduce(val_loss_tensor)
-        val_loss = val_loss_tensor.item() / dist.get_world_size()
+        # Create a tensor with all metrics
+        metrics_tensor = torch.tensor([val_loss, val_loss_spec, val_loss_time], device=device)
+        dist.all_reduce(metrics_tensor)
+        metrics_tensor /= dist.get_world_size()
+        val_loss = metrics_tensor[0].item()
+        val_loss_spec = metrics_tensor[1].item()
+        val_loss_time = metrics_tensor[2].item()
         
-    return val_loss
+    return val_loss, val_loss_spec, val_loss_time
 
 def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global, 
                     total_steps, warmup_steps, base_lr, min_lr):
@@ -174,6 +183,17 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     header = f'Epoch: [{epoch}/{config["train"]["epochs"]}]'
     num_steps_per_epoch = len(dataloader)
     accum_iter = config['train'].get('accum_iter', 1)
+    
+    # [Optimization] Linear Scaling Rule
+    # actual_lr = base_lr * batch_size * accum_iter / 256
+    # Note: We apply this scaling to the base_lr passed in
+    eff_batch_size = config['train']['batch_size'] * accum_iter * (dist.get_world_size() if dist.is_initialized() else 1)
+    if config['train'].get('auto_scale_lr', True):
+        base_lr_scaled = base_lr * eff_batch_size / 256.0
+        min_lr_scaled = min_lr * eff_batch_size / 256.0
+    else:
+        base_lr_scaled = base_lr
+        min_lr_scaled = min_lr
     
     # 优先使用 bfloat16
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -193,8 +213,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
                 current_step=global_step // accum_iter, 
                 total_steps=total_steps // accum_iter, 
                 warmup_steps=warmup_steps // accum_iter, 
-                base_lr=base_lr, 
-                min_lr=min_lr
+                base_lr=base_lr_scaled, 
+                min_lr=min_lr_scaled
             )
 
         # batch shape: (B, M, L)
@@ -218,10 +238,12 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, _, _, _, _ = model(batch)
+                loss, loss_dict, _, _, _, _ = model(batch)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
+            loss_spec_val = loss_dict['loss_spec'].item()
+            loss_time_val = loss_dict['loss_time'].item()
             
             if not math.isfinite(loss_value):
                 print(f"Loss is {loss_value}, stopping training")
@@ -255,13 +277,13 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             pass
 
         # Metrics Update
-
-        # Metrics Update
         batch_size = batch.shape[0]
         step_duration = time.time() - step_start_time
         throughput = batch_size / step_duration # samples/sec per GPU
         
         metric_logger['loss'].update(loss_value)
+        metric_logger['loss_spec'].update(loss_spec_val)
+        metric_logger['loss_time'].update(loss_time_val)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
         metric_logger['grad_norm'].update(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
         metric_logger['throughput'].update(throughput)
@@ -287,6 +309,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             logger.info(
                 f"{header} Step: [{step}/{num_steps_per_epoch}] "
                 f"Loss: {metric_logger['loss']} "
+                f"Spec: {metric_logger['loss_spec']} "
+                f"Time: {metric_logger['loss_time']} "
                 f"LR: {metric_logger['lr']} "
                 f"Grad: {metric_logger['grad_norm']} "
                 f"Speed: {metric_logger['throughput'].avg:.1f} samples/s "
@@ -489,7 +513,7 @@ def main():
         )
         
         # Validation
-        val_loss = validate(model, val_dataloader, device, config)
+        val_loss, val_loss_spec, val_loss_time = validate(model, val_dataloader, device, config)
         
         # Feature Evaluation
         linear_acc = -1.0
@@ -529,6 +553,8 @@ def main():
             metrics_dict = {
                 'train_loss': train_metrics['loss'],
                 'val_loss': val_loss,
+                'val_loss_spec': val_loss_spec,
+                'val_loss_time': val_loss_time,
                 'grad_norm': train_metrics['grad_norm'],
                 'gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 / 1024,
                 'throughput': train_metrics['throughput'],

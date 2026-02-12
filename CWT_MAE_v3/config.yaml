@@ -11,9 +11,12 @@ train:
   
   # 学习率策略
   # Batch Size 较大 (256) 时，LR 可以适当调大
+  # 代码中已实现 Linear Scaling Rule: actual_lr = base_lr * batch_size / 256
+  # 这里配置的是 base_lr (针对 Batch 256 的基准值)
   base_lr: 1.5e-4         
   min_lr: 1.0e-6
   warmup_epochs: 5        
+  auto_scale_lr: True     # [新增] 是否自动根据 Batch Size 缩放 LR        
   
   # 正则化
   # Tensor Decomposition 本身有参数压缩和正则化效果，Weight Decay 可适度降低

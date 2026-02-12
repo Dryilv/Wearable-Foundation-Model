@@ -542,6 +542,9 @@ class CWT_MAE_RoPE(nn.Module):
         feat_time_agg = self.time_reducer(feat_2d).squeeze(2).transpose(1, 2)
         pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M, -1)
         
-        loss_time = self.forward_loss_time(x, pred_time)
+        loss_time = self.forward_loss_time(x, pred_time, mask)
         
-        return loss_spec + self.time_loss_weight * loss_time, pred_spec, pred_time, imgs, mask
+        loss = loss_spec + self.time_loss_weight * loss_time
+        loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
+        
+        return loss, loss_dict, pred_spec, pred_time, imgs, mask
