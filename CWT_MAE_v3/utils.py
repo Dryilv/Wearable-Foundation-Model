@@ -194,7 +194,17 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         
         # 2. 模型推理 (直接使用原始信号，模型内部处理 CWT 和归一化)
         # x_time shape: (B, 5, L)
-        loss, pred_spec, pred_time, imgs, mask = real_model(x_time)
+        output = real_model(x_time)
+        
+        # Unpack output (Handling potentially varying return values)
+        # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask
+        if len(output) == 6:
+            loss, loss_dict, pred_spec, pred_time, imgs, mask = output
+        elif len(output) == 5:
+            # Fallback for old signature or other models
+            loss, pred_spec, pred_time, imgs, mask = output
+        else:
+            raise ValueError(f"Unexpected model output length: {len(output)}")
         
         # 3. 数据后处理 (取第一个样本 idx=0)
         idx = 0

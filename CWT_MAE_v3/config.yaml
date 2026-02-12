@@ -56,12 +56,14 @@ model:
   cwt_scales: 64          
   
   # Patch Embedding 配置
-  # Time: 500 / 50 = 10 patches (更粗的粒度，每个 patch 包含更多上下文)
-  # Freq: 64 / 4 = 16 patches
-  # 单个信号的 Token 数 = 10 * 16 = 160
-  # 5 通道总 Token 数 = 160 * 5 + 1 = 801
-  patch_size_time: 50     
-  patch_size_freq: 4      
+  # [Optimization] Trade-off Time/Freq Resolution
+  # Old: Time=50, Freq=4 -> Tokens = 10 * 16 = 160
+  # New: Time=10, Freq=8 -> Tokens = 50 * 8 = 400
+  # Total Tokens per sample: 400. 5 channels: 2000.
+  # This fits within ViT-Base capacity (usually 196 or 256 for images, but sequence models handle 2k-4k easily with FlashAttn).
+  # 10 points = 100ms. This is fine-grained enough for QRS complexes.
+  patch_size_time: 10     
+  patch_size_freq: 8      
   use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
   
   # --- Transformer Encoder (ViT-Base 规模) ---
