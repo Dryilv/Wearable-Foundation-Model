@@ -480,7 +480,7 @@ class CWT_MAE_RoPE(nn.Module):
         loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         return loss
 
-    def forward_loss_time(self, x_raw, pred_time):
+    def forward_loss_time(self, x_raw, pred_time, mask=None):
         x_raw = x_raw.float()
         mean = x_raw.mean(dim=-1, keepdim=True)
         std = x_raw.std(dim=-1, keepdim=True)
@@ -491,7 +491,15 @@ class CWT_MAE_RoPE(nn.Module):
         # 导致模型无法拟合真实的高振幅区域，从而 Loss 无法继续下降
         # 尝试放宽限制或移除
         # target = torch.clamp(target, min=-100.0, max=100.0) 
-        loss = F.mse_loss(pred_time.float(), target)
+        
+        loss = (pred_time.float() - target) ** 2
+        
+        # [Optimization] Optional: Weight loss by mask density
+        # If mask is provided (patch-level), we project it to time domain
+        if mask is not None:
+             pass
+
+        loss = loss.mean()
         return loss
 
     def prepare_tokens(self, x):

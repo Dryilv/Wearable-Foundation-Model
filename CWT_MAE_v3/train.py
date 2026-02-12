@@ -520,8 +520,12 @@ def main():
         sil_score = -1.0
         db_score = -1.0
         
+        # [Optimization] Disable feature evaluation for unlabeled dataset
+        # Since train and test sets have no labels (or dummy labels), 
+        # Linear Probe and Clustering metrics are meaningless and time-consuming.
         eval_freq = config['train'].get('eval_freq', 20)
-        if epoch % eval_freq == 0 and epoch > 0:
+        # if epoch % eval_freq == 0 and epoch > 0:
+        if False: # Disabled
             if is_main_process():
                 logger.info("Running Feature Evaluation (Linear Probe & Clustering)...")
                 # Linear Probe
