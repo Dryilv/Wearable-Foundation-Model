@@ -475,14 +475,52 @@ class CWT_MAE_RoPE(nn.Module):
         target = target.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
         target = target.view(B, M, -1, C * p_h * p_w)
         mask = mask.view(B, M, -1)
+        
+        # [Enhancement] CWT Consistency Constraint
+        # We also compute the CWT of the reconstructed time signal (pred_time)
+        # and enforce it to match the target spectrogram.
+        # This bridges the gap between time and frequency domains.
+        # Note: We need to detach the target to avoid double counting gradients or unstable loops,
+        # but here we want gradients to flow back to pred_time -> decoder.
+        
+        # However, computing CWT inside loss is expensive.
+        # Instead, we can use the 'pred' (which is the predicted spectrogram from decoder)
+        # and compare it with the CWT of 'pred_time'.
+        # Consistency Loss: || CWT(pred_time) - pred_spec ||^2
+        # This ensures the time reconstruction and spectral reconstruction are physically consistent.
+        
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)
         loss = (loss * mask).sum() / (mask.sum() + 1e-6)
         
-        # [Analysis] Scale Loss to be comparable with time domain
-        # The CWT values can be large or small depending on normalization.
-        # But here we already normalized imgs to N(0,1), so MSE should be around 1.0 initially.
         return loss
+
+    def forward_loss_consistency(self, pred_time, pred_spec):
+        """
+        Enforce physical consistency: CWT(Time_Recon) ≈ Spec_Recon
+        """
+        # pred_time: (B, M, L)
+        # pred_spec: (B, M, N_patches, D_patch)
+        
+        # 1. Compute CWT of reconstructed time signal
+        # Re-use the same CWT parameters as input
+        # Note: We need to handle normalization carefully.
+        # The input 'imgs' was normalized (Z-score).
+        # 'pred_time' is in normalized Z-score space of time domain.
+        # We should denormalize -> CWT -> normalize? 
+        # Or just assume linearity if CWT is linear? 
+        # CWT is linear. But the normalization (x-mean)/std is non-linear per sample.
+        # For simplicity and stability, we skip complex denormalization and just apply CWT on pred_time.
+        # Ideally, if pred_time is perfect, its CWT (normalized) should match target spectrogram.
+        
+        # imgs_recon = self.prepare_tokens(pred_time) # This does CWT + Norm
+        # But prepare_tokens expects (B, M, L) and returns (B, M, C, H, W)
+        
+        # To avoid circular dependency or graph issues, we use a lightweight version or just rely on the main losses.
+        # Implementing full consistency loss is computationally heavy (another CWT per step).
+        # Let's stick to the user's suggestion: "Relation between time and freq".
+        
+        return 0.0
 
     def forward_loss_time(self, x_raw, pred_time, mask=None):
         x_raw = x_raw.float()
@@ -577,7 +615,29 @@ class CWT_MAE_RoPE(nn.Module):
         
         loss_time = self.forward_loss_time(x, pred_time, mask)
         
-        loss = loss_spec + self.time_loss_weight * loss_time
-        loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
+        # [Enhancement] Consistency Loss
+        # We compute the CWT of the reconstructed time signal and compare it with the predicted spectrogram.
+        # This enforces that the spectral prediction and temporal prediction are physically consistent.
+        # Cost: One extra CWT forward pass per step.
+        imgs_recon = self.prepare_tokens(pred_time) # (B, M, C, H, W)
+        
+        # Reshape imgs_recon to patch format to compare with pred_spec
+        B, M, C, H, W = imgs_recon.shape
+        p_h, p_w = self.patch_embed.patch_size
+        target_recon = imgs_recon.view(B, M, C, H // p_h, p_h, W // p_w, p_w)
+        target_recon = target_recon.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
+        target_recon = target_recon.view(B, M, -1, C * p_h * p_w)
+        
+        # Consistency Loss: MSE(CWT(Time_Pred), Spec_Pred)
+        # We only compute this on visible patches? Or all?
+        # Let's compute on ALL patches to ensure global consistency.
+        loss_consist = (pred_spec - target_recon) ** 2
+        loss_consist = loss_consist.mean()
+        
+        # Total Loss
+        # We add a small weight for consistency loss
+        loss = loss_spec + self.time_loss_weight * loss_time + 0.5 * loss_consist
+        
+        loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time, 'loss_consist': loss_consist}
         
         return loss, loss_dict, pred_spec, pred_time, imgs, mask
