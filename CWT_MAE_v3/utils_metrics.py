@@ -41,7 +41,9 @@ def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, e
     
     # 自动推断 embed_dim
     with torch.no_grad():
-        dummy_batch, _ = next(iter(train_loader))
+        # Handle 3-element tuple from loader
+        batch_data = next(iter(train_loader))
+        dummy_batch = batch_data[0]
         dummy_batch = dummy_batch.to(device)
         # 兼容 CWT_MAE_RoPE 的 forward_encoder 输出
         # forward_encoder 返回: x, mask, ids, M
@@ -57,9 +59,14 @@ def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, e
     # Train Loop
     for ep in range(epochs):
         probe.train()
-        for i, (batch, labels) in enumerate(train_loader):
+        for i, batch_data in enumerate(train_loader):
             if limit_batches is not None and i >= limit_batches:
                 break
+            
+            if len(batch_data) == 3:
+                batch, _, labels = batch_data
+            else:
+                batch, labels = batch_data
                 
             batch = batch.to(device)
             labels = labels.to(device)
@@ -82,9 +89,15 @@ def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, e
     all_preds = []
     all_labels = []
     with torch.no_grad():
-        for i, (batch, labels) in enumerate(val_loader):
+        for i, batch_data in enumerate(val_loader):
             if limit_val_batches is not None and i >= limit_val_batches:
                 break
+            
+            if len(batch_data) == 3:
+                batch, _, labels = batch_data
+            else:
+                batch, labels = batch_data
+
             batch = batch.to(device)
             labels = labels.to(device)
             

@@ -508,7 +508,8 @@ def main():
     vis_batch = None
     if is_main_process():
         try:
-            vis_batch, _ = next(iter(train_dataloader)) # Use train loader for vis
+            # Retrieve the first batch; the dataloader returns (signals, modality_ids, labels)
+            vis_batch = next(iter(train_dataloader))[0] # Use train loader for vis
             vis_batch = vis_batch.to(device)
         except StopIteration:
             pass
