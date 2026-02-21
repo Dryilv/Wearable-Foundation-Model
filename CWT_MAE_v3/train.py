@@ -302,7 +302,6 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         metric_logger['loss_spec'].update(loss_spec_val)
         metric_logger['loss_time'].update(loss_time_val)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
-        metric_logger['grad_norm'].update(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
         metric_logger['throughput'].update(throughput)
 
         if step % 50 == 0 and is_main_process():
