@@ -6,7 +6,7 @@ train:
   
   # [关键修改] 梯度累积步数
   # 有效 Batch Size = 32 * 8 = 256，保证 MAE 预训练的稳定性
-  accum_iter: 8
+  accum_iter: 1
   
   base_lr: 1.5e-4         
   min_lr: 1.0e-6
