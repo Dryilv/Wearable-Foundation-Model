@@ -122,7 +122,9 @@ class AdaptivePatientDataset(Dataset):
 
     def __getitem__(self, idx):
         sig = self.windows[idx]
-        return torch.from_numpy(sig) # (M, L)
+        # 假设 5 通道: ECG, ACCx3, PPG
+        modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+        return torch.from_numpy(sig), modality_ids # (M, L), (M,)
 
 # ==========================================
 # 3. 主推理逻辑 (多分类修改版)
@@ -142,7 +144,6 @@ def main():
     parser.add_argument('--cwt_scales', type=int, default=64)
     parser.add_argument('--patch_size_time', type=int, default=50)
     parser.add_argument('--patch_size_freq', type=int, default=4)
-    parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
 
     # 推理参数
     parser.add_argument('--batch_size', type=int, default=64)
@@ -167,7 +168,6 @@ def main():
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
-        mlp_rank_ratio=args.mlp_rank_ratio,
         use_cot=True # v1 默认开启 CoT
     )
     
@@ -221,13 +221,16 @@ def main():
         all_probs_list = []
         
         with torch.no_grad():
-            for x in loader:
+            for batch in loader:
+                x, modality_ids = batch
                 x = x.to(device)
+                modality_ids = modality_ids.to(device)
+                
                 with autocast(device_type='cuda', dtype=amp_dtype):
-                    logits = model(x)
+                    logits = model(x, modality_ids=modality_ids)
                     # 强制 float32 保证精度
                     probs = F.softmax(logits.float(), dim=1)
-                all_probs_list.append(probs.cpu().numpy())
+                    all_probs_list.append(probs.cpu().numpy())
 
         # 拼接所有 batch: Shape [Total_Segments, Num_Classes]
         all_probs = np.vstack(all_probs_list)

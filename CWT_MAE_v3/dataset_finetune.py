@@ -133,18 +133,26 @@ class DownstreamClassificationDataset(Dataset):
 
             # --- 6. 通道乱序 (Channel Shuffling) ---
             # 关键：微调时也保持 Bag-of-Signals 逻辑，增强对通道顺序的不敏感性
+            
+            # [新增] 构建 Modality IDs (默认 5 通道)
+            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+            
             if self.mode == 'train':
                 M = signal_tensor.shape[0]
                 if M > 1:
                     perm_indices = torch.randperm(M)
                     signal_tensor = signal_tensor[perm_indices]
+                    # 同步打乱 Modality IDs (如果通道数匹配)
+                    if M == 5:
+                         modality_ids = modality_ids[perm_indices]
 
-            return signal_tensor, torch.tensor(label, dtype=torch.long)
+            return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
 
         except Exception as e:
             # print(f"Error loading {filename}: {e}") # 生产环境建议 log 而非 print
             # 返回全0兜底，防止训练中断
-            return torch.zeros(1, self.signal_len), torch.tensor(0, dtype=torch.long)
+            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+            return torch.zeros(5, self.signal_len), modality_ids, torch.tensor(0, dtype=torch.long)
 
     def _sync_crop_or_pad(self, signal):
         """

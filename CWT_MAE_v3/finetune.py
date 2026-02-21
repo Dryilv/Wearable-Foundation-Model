@@ -78,12 +78,13 @@ def gather_tensors(tensor, device):
 def variable_channel_collate_fn_cls(batch):
     """
     处理分类任务中不同样本通道数不一致的情况。
-    Batch: list of tuples (signal_tensor, label)
+    Batch: list of tuples (signal_tensor, modality_ids, label)
     signal_tensor shape: (M_i, L)
     """
     # 分离信号和标签
     signals = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
+    modality_ids = [item[1] for item in batch]
+    labels = [item[2] for item in batch]
     
     # 1. 找到当前 Batch 中最大的通道数
     max_m = max([s.shape[0] for s in signals])
@@ -92,16 +93,15 @@ def variable_channel_collate_fn_cls(batch):
     
     # 2. 初始化全 0 张量 (B, Max_M, L)
     padded_signals = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
+    padded_modality_ids = torch.zeros((batch_size, max_m), dtype=torch.long)
     
     # 3. 填充数据
     for i, s in enumerate(signals):
         m = s.shape[0]
         padded_signals[i, :m, :] = s
+        padded_modality_ids[i, :m] = modality_ids[i]
         
-    # 4. 堆叠标签
-    labels = torch.stack(labels)
-        
-    return padded_signals, labels
+    return padded_signals, padded_modality_ids, torch.stack(labels)
 
 # -------------------------------------------------------------------
 # 3. 训练与验证逻辑
@@ -142,8 +142,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
 
     iterator = tqdm(loader, desc=f"Epoch {epoch} Train") if is_main_process() else loader
     
-    for x, y in iterator:
-        x, y = x.to(device), y.to(device)
+    for batch in iterator:
+        if len(batch) == 3:
+            x, modality_ids, y = batch
+            x, modality_ids, y = x.to(device), modality_ids.to(device), y.to(device)
+        else:
+            x, y = batch
+            modality_ids = None
+            x, y = x.to(device), y.to(device)
         
         # Mixup
         inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=0.2, device=device)
@@ -157,11 +163,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
             if is_arcface:
                 # ArcFace needs labels to calculate margin
                 # Apply mixup logic manually: calc loss for target_a and target_b then mix
-                logits_a = model(inputs, label=targets_a)
-                logits_b = model(inputs, label=targets_b)
+                logits_a = model(inputs, modality_ids=modality_ids, label=targets_a)
+                logits_b = model(inputs, modality_ids=modality_ids, label=targets_b)
                 loss = lam * criterion(logits_a, targets_a) + (1 - lam) * criterion(logits_b, targets_b)
             else:
-                logits = model(inputs)
+                logits = model(inputs, modality_ids=modality_ids)
                 loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
         
         if use_amp and amp_dtype == torch.float16:
@@ -201,11 +207,17 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
     iterator = tqdm(loader, desc="Validating") if is_main_process() else loader
 
     with torch.no_grad():
-        for x, y in iterator:
-            x, y = x.to(device), y.to(device)
+        for batch in iterator:
+            if len(batch) == 3:
+                x, modality_ids, y = batch
+                x, modality_ids, y = x.to(device), modality_ids.to(device), y.to(device)
+            else:
+                x, y = batch
+                modality_ids = None
+                x, y = x.to(device), y.to(device)
             
             with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                logits = model(x)
+                logits = model(x, modality_ids=modality_ids)
                 loss = criterion(logits, y)
             
             if dist.is_initialized():

@@ -121,7 +121,6 @@ class ArcFaceHead(nn.Module):
 # ===================================================================
 class TF_MAE_Classifier(nn.Module):
     def __init__(self, pretrained_path, num_classes, 
-                 mlp_rank_ratio=0.5, 
                  use_cot=True, 
                  use_arcface=False,
                  arcface_s=30.0,
@@ -135,7 +134,6 @@ class TF_MAE_Classifier(nn.Module):
         # 1. 初始化 Encoder (CWT-MAE-RoPE)
         # 注意：不再需要 max_num_channels
         self.encoder_model = CWT_MAE_RoPE(
-            mlp_rank_ratio=mlp_rank_ratio,
             mask_ratio=0.0, # 微调时关闭 Mask
             **kwargs
         )
@@ -224,8 +222,8 @@ class TF_MAE_Classifier(nn.Module):
         if old_pos_embed.shape[1] == new_pos_embed.shape[1]: return
 
         print(f"Interpolating {key}: {old_pos_embed.shape[1]} -> {new_pos_embed.shape[1]}")
-        cls_token = old_pos_embed[:, :1, :]
-        patch_tokens = old_pos_embed[:, 1:, :] 
+        # cls_token = old_pos_embed[:, :1, :]
+        patch_tokens = old_pos_embed # Assuming no CLS token in model.py
         
         grid_h, grid_w_new = self.encoder_model.grid_size
         n_old = patch_tokens.shape[1]
@@ -239,18 +237,21 @@ class TF_MAE_Classifier(nn.Module):
         patch_tokens = F.interpolate(patch_tokens, size=(grid_h, grid_w_new), mode='bicubic', align_corners=False)
         patch_tokens = patch_tokens.flatten(2).transpose(1, 2)
         
-        new_pos_embed_interpolated = torch.cat((cls_token, patch_tokens), dim=1)
-        state_dict[key] = new_pos_embed_interpolated
+        state_dict[key] = patch_tokens
 
-    def forward(self, x, label=None, return_features=False):
+    def forward(self, x, modality_ids=None, label=None, return_features=False):
         """
         x: (B, M, L) 多通道输入
+        modality_ids: (B, M) 模态 ID
         label: (B,) 标签，用于 ArcFace 训练
         return_features: 是否返回特征向量而不是 Logits
         """
         # 兼容单通道输入 (B, L) -> (B, 1, L)
         if x.dim() == 2: x = x.unsqueeze(1)
-        
+        if modality_ids is None and x.shape[1] > 1:
+             # 如果未提供且通道 > 1，默认 0
+             modality_ids = torch.zeros((x.shape[0], x.shape[1]), dtype=torch.long, device=x.device)
+
         # 1. CWT 变换 (B, M, L) -> (B, M, 3, Scales, L)
         # 注意：cwt_wrap 现在支持多通道
         imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0)
@@ -275,12 +276,11 @@ class TF_MAE_Classifier(nn.Module):
         # 新版 forward_encoder 返回: x, mask, ids, M
         # x 的形状是 (B, M*N_patches + 1, D)
         self.encoder_model.mask_ratio = 0.0
-        latent, _, _, _ = self.encoder_model.forward_encoder(imgs)
+        latent, _, _, _ = self.encoder_model.forward_encoder(imgs, modality_ids=modality_ids)
         
         # 4. 提取特征
-        # 丢弃 CLS token (index 0)，保留 Patch tokens
         # patch_tokens: (B, M*N_patches, D)
-        patch_tokens = latent[:, 1:, :] 
+        patch_tokens = latent # model.py has no CLS token 
         
         # 5. Forward Head
         if isinstance(self.head, LatentReasoningHead):

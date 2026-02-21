@@ -236,13 +236,14 @@ class PhysioSignalDataset(Dataset):
                 # 转为 Tensor
                 signal_tensor = torch.from_numpy(processed_signal) 
 
-                # 2) 移除原有通道对齐/重排操作 (保持 5 通道固定顺序)
-                # if self.mode == 'train':
-                #     M = signal_tensor.shape[0]
-                #     perm_indices = torch.randperm(M)
-                #     signal_tensor = signal_tensor[perm_indices]
-
-                return signal_tensor, torch.tensor(label, dtype=torch.long)
+                # 5. [新增] 构建 Modality IDs
+                # 假设固定顺序: 0:ECG, 1:ACC, 2:PPG
+                # channels 0 -> ECG
+                # channels 1,2,3 -> ACC
+                # channels 4 -> PPG
+                modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+                
+                return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
 
             except Exception as e:
                 print(f"Error loading sample {idx}: {e}")
@@ -259,11 +260,13 @@ class PhysioSignalDataset(Dataset):
             safe_signal = content['data'][:, :self.signal_len]
             # 简单的归一化
             safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
-            return torch.from_numpy(safe_signal).float(), torch.tensor(0, dtype=torch.long)
+            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+            return torch.from_numpy(safe_signal).float(), modality_ids, torch.tensor(0, dtype=torch.long)
         except:
             # 极度兜底：返回全一信号而非全零，全一信号在 Z-Score 后会变成全零，但至少带有一个微小的 epsilon std
             fallback_signal = torch.ones((self.expected_channels, self.signal_len), dtype=torch.float32) * 0.01
-            return fallback_signal, torch.tensor(0, dtype=torch.long)
+            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+            return fallback_signal, modality_ids, torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal, fixed_start=None):
         """
@@ -299,17 +302,14 @@ class PhysioSignalDataset(Dataset):
 def fixed_channel_collate_fn(batch):
     """
     针对 5 通道对齐数据的 Collate Function。
-    不再进行 padding，而是断言所有样本通道数一致。
-    Output: (B, 5, L), (B,)
+    Output: (B, 5, L), (B, 5), (B,)
     """
     signals = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
-    
-    # 验证维度一致性
-    # 假设 __getitem__ 已经保证了是 5 通道
-    # 但为了保险，可以在这里再次断言，或者假设它是安全的
+    modality_ids = [item[1] for item in batch]
+    labels = [item[2] for item in batch]
     
     padded_signals = torch.stack(signals) # (B, 5, L)
+    padded_modality_ids = torch.stack(modality_ids) # (B, 5)
     labels = torch.stack(labels)
     
-    return padded_signals, labels
+    return padded_signals, padded_modality_ids, labels

@@ -142,11 +142,18 @@ def validate(model, dataloader, device, config):
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     with torch.no_grad():
-        for batch, labels in dataloader:
+        for batch_data in dataloader:
+            if len(batch_data) == 3:
+                batch, modality_ids, labels = batch_data
+                modality_ids = modality_ids.to(device, non_blocking=True)
+            else:
+                batch, labels = batch_data
+                modality_ids = None
+                
             batch = batch.to(device, non_blocking=True)
             
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, loss_dict, _, _, _, _ = model(batch)
+                loss, loss_dict, _, _, _, _ = model(batch, modality_ids=modality_ids)
             metric_logger['loss'].update(loss.item())
             metric_logger['loss_spec'].update(loss_dict['loss_spec'].item())
             metric_logger['loss_time'].update(loss_dict['loss_time'].item())
@@ -205,10 +212,17 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     
     optimizer.zero_grad() # Initialize gradients
 
-    for step, (batch, labels) in enumerate(dataloader):
+    for step, batch_data in enumerate(dataloader):
         step_start_time = time.time()
         global_step = epoch * num_steps_per_epoch + step
         
+        if len(batch_data) == 3:
+            batch, modality_ids, labels = batch_data
+            modality_ids = modality_ids.to(device, non_blocking=True)
+        else:
+            batch, labels = batch_data
+            modality_ids = None
+
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
             adjust_learning_rate_per_step(
@@ -241,7 +255,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, loss_dict, _, _, _, _ = model(batch)
+                loss, loss_dict, _, _, _, _ = model(batch, modality_ids=modality_ids)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
@@ -453,9 +467,7 @@ def main():
         decoder_depth=config['model']['decoder_depth'],
         decoder_num_heads=config['model']['decoder_num_heads'],
         mask_ratio=config['model'].get('mask_ratio', 0.75),
-        mlp_rank_ratio=config['model'].get('mlp_rank_ratio', 0.5),
-        time_loss_weight=config['model'].get('time_loss_weight', 1.0),
-        use_conv_stem=config['model'].get('use_conv_stem', False)
+        time_loss_weight=config['model'].get('time_loss_weight', 1.0)
     )
     model.to(device)
 
