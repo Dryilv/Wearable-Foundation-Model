@@ -1,102 +1,63 @@
 train:
-  # 2w 小时数据量巨大，建议先跑 100 epoch 观察 Loss 收敛情况
   epochs: 100             
   
-  # [显存优化与 Batch Size] 
-  # 注意：现在的输入是 (B, M, L)，显存占用取决于 Batch Size * 平均通道数 M。
-  # 如果 M 平均为 3-5：
-  # - 24G 显存 (3090/4090): 建议 48 - 64
-  # - 80G 显存 (A100/H100): 建议 256 - 384
+  # [显存优化] 3000点信号较长，物理 Batch Size 建议设为 16-32 (视显存而定)
   batch_size: 32        
   
-  # 学习率策略
-  # Batch Size 较大 (256) 时，LR 可以适当调大
-  # 代码中已实现 Linear Scaling Rule: actual_lr = base_lr * batch_size / 256
-  # 这里配置的是 base_lr (针对 Batch 256 的基准值)
+  # [关键修改] 梯度累积步数
+  # 有效 Batch Size = 32 * 8 = 256，保证 MAE 预训练的稳定性
+  accum_iter: 8
+  
   base_lr: 1.5e-4         
   min_lr: 1.0e-6
   warmup_epochs: 5        
-  auto_scale_lr: True     # [新增] 是否自动根据 Batch Size 缩放 LR        
+  auto_scale_lr: True     
   
-  # 正则化
-  # Tensor Decomposition 本身有参数压缩和正则化效果，Weight Decay 可适度降低
   weight_decay: 0.05      
   clip_grad: 3.0
   
-  # [新增] 梯度累积步数 (1 = 不累积)
-  # 增大 Effective Batch Size 以稳定梯度
-  accum_iter: 1
-  
-  # [必须开启] 混合精度训练
-  # 配合代码中的 bfloat16 使用，防止 RoPE 溢出并加速训练
   use_amp: True           
   
-  # 日志与保存
   log_interval: 50
   save_freq: 5
-  save_dir: "./checkpoint_768_5channel"
+  save_dir: "./checkpoint_768_5channel_3000pts"
   
-  # 评估频率与限制
-  eval_freq: 20           # 每 20 个 Epoch 跑一次 Linear Probe & Clustering
-  linear_probe_limit: 100 # 限制 Linear Probe 使用的 Batch 数 (加速评估)
-
-  # 断点续训路径
-  # 如果是新开始训练，请设为 null 或注释掉；如果中断后继续，指向 checkpoint_last.pth
+  eval_freq: 20           
+  linear_probe_limit: 100 
   resume: ""
 
 data:
   index_path: "train_index_cleaned.json"
-  signal_len: 500          # 5秒 @ 100Hz (方案2：精细细节捕获)
-  num_workers: 16         # 保持高并发加载，避免 GPU 等待 CPU
-  use_sliding_window: False # [新增] 是否启用滑动窗口读取数据
-  window_stride: 250       # 步长随长度调整
+  # [关键修改] 统一对齐到 3000 点
+  signal_len: 3000        
+  num_workers: 16         
+  use_sliding_window: False 
+  window_stride: 1500      # 如果未来开启滑动窗口，步长设为长度的一半
 
 model:
-  # --- CWT & Patch 参数 ---
   cwt_scales: 64          
   
-  # Patch Embedding 配置
-  # [Optimization] Trade-off Time/Freq Resolution
-  # Old: Time=50, Freq=4 -> Tokens = 10 * 16 = 160
-  # New: Time=10, Freq=8 -> Tokens = 50 * 8 = 400
-  # Total Tokens per sample: 400. 5 channels: 2000.
-  # This fits within ViT-Base capacity (usually 196 or 256 for images, but sequence models handle 2k-4k easily with FlashAttn).
-  # 10 points = 100ms. This is fine-grained enough for QRS complexes.
-  patch_size_time: 10     
+  # [关键修改] 避免 Token 爆炸
+  # Time=30, Freq=8 -> Tokens = (3000/30) * (64/8) = 100 * 8 = 800 tokens/channel
+  # 既保留了 0.3s 的精细时间分辨率，又将计算量控制在合理范围
+  patch_size_time: 30     
   patch_size_freq: 8      
-  use_conv_stem: True     # 开启卷积 Stem 增强局部特征提取      
+  use_conv_stem: True     
   
-  # --- Transformer Encoder (ViT-Base 规模) ---
   embed_dim: 768          
   depth: 12               
-  num_heads: 12           # 768 / 64 = 12
+  num_heads: 12           
   
-  # --- [关键] 张量分解参数 ---
-  # 控制 MLP 层的低秩近似程度
-  # 0.5: 参数量减少约 40%，显存占用降低，适合大规模预训练
   mlp_rank_ratio: 0.5     
   
-  # --- Decoder (轻量级) ---
   decoder_embed_dim: 512  
   decoder_depth: 8        
   decoder_num_heads: 16   
   
-  # --- 训练策略 ---
-  # Mask Ratio: 0.75
-  # 生理信号自相关性极强，必须高 Mask 才能迫使模型学习波形特征而非插值
-  # 但对于 CWT-MAE，0.75 可能太高了，因为每个 patch 包含了很多信息
-  # 尝试降低到 0.6，给模型更多可见信息
+  # 配合 Tubelet Masking，0.6 是一个非常好的起点
   mask_ratio: 0.6         
   
-  # --- Loss 权重 ---
-  # 1.0: 强调时域重建质量 (R波尖锐度、相位对齐)
-  # [Optimization] Reduced time_loss_weight to 0.1
-  # Reason: Spec Loss is dropping much slower than Time Loss. 
-  # This imbalance suggests the model prioritizes the "easy" time reconstruction task (low frequency shape)
-  # over the "hard" spectral detail reconstruction task.
-  # Reducing the weight forces the optimizer to pay more attention to the spectral loss gradient.
+  # 新版代码中时域 Loss 仅计算 Mask 部分，数值会变小，0.1 可作为起点，视 wandb 曲线调整
   time_loss_weight: 0.1
   
-  # --- Data Ratio ---
-  # 控制训练使用的样本比例 (0.0 - 1.0)，用于快速实验验证
   data_ratio: 1.0
