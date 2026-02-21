@@ -28,24 +28,32 @@ class SmoothedValue(object):
     @property
     def median(self):
         d = torch.tensor(list(self.deque))
+        if d.numel() == 0:
+            return 0.0
         return d.median().item()
 
     @property
     def avg(self):
         d = torch.tensor(list(self.deque))
+        if d.numel() == 0:
+            return 0.0
         return d.mean().item()
 
     @property
     def global_avg(self):
+        if self.count == 0:
+            return 0.0
         return self.total / self.count
 
     def __str__(self):
+        if self.count == 0:
+            return "N/A"
         return self.fmt.format(
             median=self.median,
             avg=self.avg,
             global_avg=self.global_avg,
-            max=max(self.deque),
-            value=self.deque[-1]
+            max=max(self.deque) if len(self.deque) > 0 else 0,
+            value=self.deque[-1] if len(self.deque) > 0 else 0
         )
 
 def format_time(seconds):
