@@ -24,7 +24,7 @@ train:
   
   eval_freq: 20           
   linear_probe_limit: 100 
-  resume: ""
+  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_768_5channel_3000pts/checkpoint_last.pth"
 
 data:
   index_path: "train_index_cleaned.json"
