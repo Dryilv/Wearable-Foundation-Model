@@ -224,6 +224,14 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         recon_signal = pred_time[idx].cpu().numpy()    # (M, L)
         mask_val = mask[idx].cpu().numpy()            # (M * N_patches,)
         
+        # [Fix] Denormalize reconstruction for visualization
+        # Model predicts normalized signal (mean=0, std=1)
+        # We need to scale it back to original signal range
+        mean = orig_signal.mean(axis=-1, keepdims=True)
+        std = orig_signal.std(axis=-1, keepdims=True)
+        std = np.maximum(std, 1e-5)
+        recon_signal = recon_signal * std + mean
+        
         M, L = orig_signal.shape
         N_patches = real_model.num_patches
         patch_size = real_model.patch_size_time
