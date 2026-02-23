@@ -224,14 +224,6 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         recon_signal = pred_time[idx].cpu().numpy()    # (M, L)
         mask_val = mask[idx].cpu().numpy()            # (M * N_patches,)
         
-        # [Fix] Denormalize reconstruction for visualization
-        # Model predicts normalized signal (mean=0, std=1)
-        # We need to scale it back to original signal range
-        mean = orig_signal.mean(axis=-1, keepdims=True)
-        std = orig_signal.std(axis=-1, keepdims=True)
-        std = np.maximum(std, 1e-5)
-        recon_signal = recon_signal * std + mean
-        
         M, L = orig_signal.shape
         N_patches = real_model.num_patches
         patch_size = real_model.patch_size_time
@@ -284,10 +276,15 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
             axs[m, 1].grid(True, alpha=0.3)
 
             # --- Column 3: Reconstruction Overlay ---
+            # 【修复】构建混合信号：Visible 部分使用原始信号，Masked 部分使用重构信号
+            combined_signal = orig_signal[m].copy()
+            # 仅在被 Mask 的区域使用模型预测值
+            combined_signal[m_mask_time_expanded == 1] = recon_signal[m][m_mask_time_expanded == 1]
+
             axs[m, 2].plot(orig_signal[m], 'gray', alpha=0.5, label='Original')
-            axs[m, 2].plot(recon_signal[m], 'r', alpha=0.8, lw=1, label='Reconstructed')
+            axs[m, 2].plot(combined_signal, 'r', alpha=0.8, lw=1, label='Reconstructed')
             if m == 0: 
-                axs[m, 2].set_title("Reconstruction")
+                axs[m, 2].set_title("Reconstruction (Merged)")
                 axs[m, 2].legend(loc='upper right', fontsize='small')
             axs[m, 2].grid(True, alpha=0.3)
 
