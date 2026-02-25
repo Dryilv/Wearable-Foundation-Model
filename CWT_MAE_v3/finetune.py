@@ -346,6 +346,11 @@ def main():
     if is_main_process():
         os.makedirs(args.save_dir, exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
+        
+    # Enable cuDNN benchmark for stable performance and potentially avoid kernel issues
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True # Allow TF32 on Ampere
+    torch.backends.cudnn.allow_tf32 = True
 
     # Dataset 初始化
     train_ds = DownstreamClassificationDataset(

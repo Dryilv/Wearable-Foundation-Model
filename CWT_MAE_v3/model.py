@@ -357,6 +357,10 @@ class CWT_MAE_RoPE(nn.Module):
         # 2. 【SOTA】注入动态模态提示词 (Modality Prompts)
         if modality_ids is None:
             modality_ids = torch.zeros((B, M), dtype=torch.long, device=x.device)
+        else:
+            # [Safety] Clamp indices to prevent illegal memory access
+            modality_ids = torch.clamp(modality_ids, 0, self.modality_prompts.shape[0] - 1)
+            
         mod_embeds = self.modality_prompts[modality_ids] # (B, M, D)
         mod_embeds = mod_embeds.unsqueeze(2).expand(-1, -1, N_patches, -1)
         x = x + mod_embeds
