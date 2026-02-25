@@ -55,7 +55,7 @@ model:
   decoder_num_heads: 16   
   
   # 配合 Tubelet Masking，0.6 是一个非常好的起点
-  mask_ratio: 0.6         
+  mask_ratio: 0.75         
   
   # 新版代码中时域 Loss 仅计算 Mask 部分，数值会变小，0.1 可作为起点，视 wandb 曲线调整
   time_loss_weight: 0.1
