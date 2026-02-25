@@ -513,11 +513,13 @@ def main():
 
     # 获取一个 Batch 用于固定可视化
     vis_batch = None
+    vis_modality_ids = None
     if is_main_process():
         try:
             # Retrieve the first batch; the dataloader returns (signals, modality_ids, labels)
-            vis_batch = next(iter(train_dataloader))[0] # Use train loader for vis
-            vis_batch = vis_batch.to(device)
+            batch = next(iter(train_dataloader)) # Use train loader for vis
+            vis_batch = batch[0].to(device)
+            vis_modality_ids = batch[1].to(device)
         except StopIteration:
             pass
 
@@ -603,7 +605,8 @@ def main():
                     model, 
                     vis_batch, 
                     epoch, 
-                    config['train']['save_dir']
+                    config['train']['save_dir'],
+                    modality_ids=vis_modality_ids
                 )
             
             # 保存 Checkpoint

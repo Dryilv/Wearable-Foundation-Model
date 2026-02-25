@@ -186,7 +186,7 @@ def get_layer_wise_lr(model, base_lr, layer_decay):
     return list(param_groups.values())
 # Visualization (已修改：支持 5 通道多变量可视化)
 # -------------------------------------------------------------------
-def save_reconstruction_images(model, x_time, epoch, save_dir):
+def save_reconstruction_images(model, x_time, epoch, save_dir, modality_ids=None):
     """
     5-Channel Visualization for CWT-MAE-v3
     """
@@ -202,7 +202,10 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         
         # 2. 模型推理 (直接使用原始信号，模型内部处理 CWT 和归一化)
         # x_time shape: (B, 5, L)
-        output = real_model(x_time)
+        if modality_ids is None:
+            output = real_model(x_time)
+        else:
+            output = real_model(x_time, modality_ids=modality_ids)
         
         # Unpack output (Handling potentially varying return values)
         # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask
@@ -221,11 +224,16 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         # Log statistics for debugging
         print(f"[Vis Epoch {epoch}] Orig Signal Stats: Mean={orig_signal.mean():.4e}, Std={orig_signal.std():.4e}, Max={orig_signal.max():.4e}, Min={orig_signal.min():.4e}")
         
-        recon_signal = pred_time[idx].cpu().numpy()    # (M, L)
+        x_f32 = x_time.float()
+        mean = x_f32.mean(dim=-1, keepdim=True)
+        std = torch.clamp(x_f32.std(dim=-1, keepdim=True), min=1e-5)
+        pred_time_denorm = pred_time.float() * std + mean
+        recon_signal = pred_time_denorm[idx].cpu().numpy()    # (M, L)
         mask_val = mask[idx].cpu().numpy()            # (M * N_patches,)
         
         M, L = orig_signal.shape
-        N_patches = real_model.num_patches
+        N_freq, N_time = real_model.grid_size
+        N_patches = N_freq * N_time
         patch_size = real_model.patch_size_time
         
         # 4. 绘图 (M 行, 3 列)
@@ -253,8 +261,6 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
             # 但在时间轴上，它是 patch_size_time 的倍数。
             
             # 我们需要重新整理 mask 形状
-            N_time = L // patch_size
-            N_freq = N_patches // N_time
             m_mask_2d = m_mask.reshape(N_freq, N_time)
             
             # 【修复】Mask 可视化逻辑优化
@@ -263,7 +269,11 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
             # 这样可以看到那些 "部分可见" 的波形，而不是全白
             m_mask_time = (m_mask_2d.sum(axis=0) / N_freq) > 0.6
             
-            m_mask_time_expanded = np.repeat(m_mask_time, patch_size)[:L]
+            m_mask_time_expanded = np.repeat(m_mask_time, patch_size)
+            if m_mask_time_expanded.shape[0] < L:
+                m_mask_time_expanded = np.pad(m_mask_time_expanded, (0, L - m_mask_time_expanded.shape[0]), constant_values=0)
+            else:
+                m_mask_time_expanded = m_mask_time_expanded[:L]
             
             masked_signal = orig_signal[m].copy()
             masked_signal[m_mask_time_expanded == 1] = np.nan
