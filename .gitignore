@@ -210,3 +210,6 @@ runs/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Cleanup scripts (not to be committed)
+cleanup-python-cache.ps1
