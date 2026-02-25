@@ -1,0 +1,33 @@
+train:
+  epochs: 100
+  batch_size: 32        # Physical batch size
+  accum_iter: 1         # Gradient accumulation steps
+  base_lr: 1.5e-4
+  min_lr: 1.0e-6
+  warmup_epochs: 5
+  auto_scale_lr: True
+  weight_decay: 0.05
+  clip_grad: 3.0
+  use_amp: True
+  log_interval: 50
+  save_freq: 5
+  save_dir: "./checkpoints_patchtst"
+  eval_freq: 20
+  resume: ""            # Path to checkpoint to resume from
+
+data:
+  index_path: "train_index_cleaned.json" # Ensure this path is correct relative to running directory or absolute
+  signal_len: 3000
+  num_workers: 4
+  use_sliding_window: False
+  window_stride: 1500
+
+model:
+  # PatchTST parameters
+  patch_len: 50
+  stride: 50            # Non-overlapping for now
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mask_ratio: 0.6       # Align with CWT-MAE experience
+  dropout: 0.1
