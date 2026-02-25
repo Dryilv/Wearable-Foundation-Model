@@ -286,7 +286,8 @@ def main():
         n_heads=config['model']['num_heads'],
         e_layers=config['model']['depth'],
         dropout=config['model'].get('dropout', 0.1),
-        mask_ratio=config['model'].get('mask_ratio', 0.6)
+        mask_ratio=config['model'].get('mask_ratio', 0.6),
+        use_revin=config['model'].get('use_revin', True)
     )
     model.to(device)
 

@@ -31,3 +31,4 @@ model:
   num_heads: 12
   mask_ratio: 0.6       # Align with CWT-MAE experience
   dropout: 0.1
+  use_revin: True       # Enable Reversible Instance Normalization

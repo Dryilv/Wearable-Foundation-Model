@@ -3,37 +3,71 @@ import torch
 import torch.nn as nn
 import math
 
+class RevIN(nn.Module):
+    def __init__(self, num_features: int, eps=1e-5, affine=True):
+        """
+        Reversible Instance Normalization
+        :param num_features: the number of features or channels
+        :param eps: a value added for numerical stability
+        :param affine: if True, RevIN has learnable affine parameters
+        """
+        super(RevIN, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.affine = affine
+        if self.affine:
+            self._init_params()
+
+    def _init_params(self):
+        self.affine_weight = nn.Parameter(torch.ones(self.num_features))
+        self.affine_bias = nn.Parameter(torch.zeros(self.num_features))
+
+    def _get_statistics(self, x):
+        dim2reduce = tuple(range(1, x.ndim-1))
+        self.mean = torch.mean(x, dim=dim2reduce, keepdim=True).detach()
+        self.stdev = torch.sqrt(torch.var(x, dim=dim2reduce, keepdim=True, unbiased=False) + self.eps).detach()
+
+    def forward(self, x, mode:str):
+        if mode == 'norm':
+            self._get_statistics(x)
+            x = (x - self.mean) / self.stdev
+            if self.affine:
+                x = x * self.affine_weight + self.affine_bias
+            return x
+        elif mode == 'denorm':
+            if self.affine:
+                x = (x - self.affine_bias) / (self.affine_weight + 1e-10)
+            x = x * self.stdev + self.mean
+            return x
 
 class PositionalEncoding(nn.Module):
-    """传统的绝对位置编码"""
-
+    """
+    Learnable Positional Encoding (as per PatchTST paper)
+    """
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+        # Paper says: "W_pos is the learnable positional embedding"
+        self.pe = nn.Parameter(torch.zeros(1, max_len, d_model))
+        nn.init.uniform_(self.pe, -0.02, 0.02)
 
     def forward(self, x):
         # x shape: [Batch*Channels, Num_Patches, d_model]
-        return x + self.pe[:x.size(1), :].unsqueeze(0)
-
+        return x + self.pe[:, :x.size(1), :]
 
 class PatchTST_Pretrain(nn.Module):
     def __init__(
             self,
-            seq_len=3000,  # 你的序列长度
-            patch_len=50,  # 对应你模型的 patch_size_time
-            stride=50,  # 步长等于 patch_len，无重叠 (与你的 MAE 一致)
-            in_channels=3,  # 输入通道数 (比如 ECG, PPG)
-            d_model=768,  # 对齐你的 embed_dim
-            n_heads=12,  # 对齐你的 num_heads
-            e_layers=12,  # 对齐你的 depth
-            d_ff=3072,  # Transformer 前馈网络维度 (通常是 4*d_model)
+            seq_len=3000,
+            patch_len=50,
+            stride=50,
+            in_channels=3,
+            d_model=768,
+            n_heads=12,
+            e_layers=12,
+            d_ff=3072,
             dropout=0.1,
-            mask_ratio=0.75  # 掩码比例，与你保持一致
+            mask_ratio=0.75,
+            use_revin=True
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -42,28 +76,33 @@ class PatchTST_Pretrain(nn.Module):
         self.in_channels = in_channels
         self.d_model = d_model
         self.mask_ratio = mask_ratio
+        self.use_revin = use_revin
 
-        # 计算 Patch 数量
+        # RevIN Module
+        if self.use_revin:
+            self.revin = RevIN(in_channels, affine=True)
+
+        # Patch Num
         self.patch_num = int((seq_len - patch_len) / stride + 1)
 
-        # 1. Patch Embedding (仅时域 Linear 投影，这就是和你的核心区别之一)
+        # 1. Patch Embedding
         self.value_embedding = nn.Linear(patch_len, d_model, bias=False)
-        self.position_embedding = PositionalEncoding(d_model)
+        self.position_embedding = PositionalEncoding(d_model, max_len=self.patch_num)
         self.dropout = nn.Dropout(dropout)
 
-        # 2. Transformer Encoder (纯净版 Vanilla Transformer)
+        # 2. Transformer Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=d_ff,
             dropout=dropout,
             activation='gelu',
-            batch_first=True  # 注意这里用 batch_first
+            batch_first=True,
+            norm_first=True # Usually better for deep transformers
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
 
-        # 3. 预训练重建头 (Reconstruction Head)
-        # 把 d_model 映射回 patch_len 的原始波形数值
+        # 3. Reconstruction Head
         self.head = nn.Linear(d_model, patch_len)
 
     def random_masking(self, x, mask_ratio):
@@ -72,7 +111,7 @@ class PatchTST_Pretrain(nn.Module):
         len_keep = int(N * (1 - mask_ratio))
 
         noise = torch.rand(B, N, device=x.device)  # 随机噪声
-        ids_shuffle = torch.argsort(noise, dim=1)  # 升序排列，获取打乱的索引
+        ids_shuffle = torch.argsort(noise, dim=1)  # 升序排列
         ids_restore = torch.argsort(ids_shuffle, dim=1)  # 恢复索引
 
         # 保持未被 Mask 的部分
@@ -84,8 +123,7 @@ class PatchTST_Pretrain(nn.Module):
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
-        # PatchTST 预训练中通常用全 0 向量填充被 mask 的位置 (或者用 learnable token)
-        # 这里用全 0 填充以保持轻量化
+        # PatchTST: Zero-fill masked patches
         mask_tokens = torch.zeros(B, N - len_keep, D, device=x.device)
         x_masked = torch.cat([x_kept, mask_tokens], dim=1)
         x_masked = torch.gather(x_masked, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D))
@@ -93,45 +131,55 @@ class PatchTST_Pretrain(nn.Module):
         return x_masked, mask
 
     def forward(self, x):
-        # 输入 x: [Batch, Seq_Len, Channels]
-        # (注意，和你的模型直接吃 3D 甚至 2D 不一样，这里吃纯 1D 序列)
+        # Input x: [Batch, Seq_Len, Channels]
+        # or [Batch, Channels, Seq_Len] if dataset outputs that?
+        # Standard convention: [Batch, Seq_Len, Channels] if channels are last.
+        # But wait, my dataset collate_fn outputs (B, C, L).
+        # In train.py: batch = batch.permute(0, 2, 1) -> (B, L, C)
+        # So here x is (B, L, C).
+        
         B, L, M = x.shape
 
+        # 1. RevIN Normalization (Per-Channel)
+        if self.use_revin:
+            # RevIN expects (B, L, M) or (B, M, L)?
+            # My RevIN implementation uses dim2reduce=tuple(range(1, x.ndim-1))
+            # If x is (B, L, M), dim2reduce is (1,).
+            # So mean is (B, 1, M).
+            # (B, L, M) - (B, 1, M) -> Works.
+            x = self.revin(x, 'norm')
+
         # ==============================================================
-        # 【核心精髓】：Channel Independence (通道独立)
-        # 把 Batch 和 Channels 融合成同一个维度，让它们共享权重但互不干扰
+        # Channel Independence
         # [Batch, Seq_Len, Channels] -> [Batch * Channels, Seq_Len, 1]
         # ==============================================================
         x = x.permute(0, 2, 1).contiguous().view(B * M, L, 1)
 
-        # 1. Patching 过程 (切块)
-        # 使用 unfold 提取块: [B*M, Patch_Num, Patch_Len]
+        # 2. Patching
+        # unfold: (B*M, L, 1) -> (B*M, N, P)
         x = x.unfold(dimension=1, size=self.patch_len, step=self.stride).squeeze(2)
 
-        # 保存原始的 Patch 用于计算 Loss
+        # Save Target
         target_patches = x.clone()
 
-        # 2. Embedding
-        x = self.value_embedding(x)  # -> [B*M, Patch_Num, d_model]
+        # 3. Embedding
+        x = self.value_embedding(x)  # -> [B*M, N, d_model]
         x = self.position_embedding(x)
         x = self.dropout(x)
 
-        # 3. Masking
+        # 4. Masking
         x_masked, mask = self.random_masking(x, self.mask_ratio)
 
-        # 4. Transformer 编码
-        # 注意: 这里的 Encoder 接收的是 [B*M, Patch_Num, d_model]
-        # 意味着 ECG 和 PPG 是被当作两个完全不认识的序列来处理的！
+        # 5. Transformer Encoder
         enc_out = self.encoder(x_masked)
 
-        # 5. 重建输出
-        # -> [B*M, Patch_Num, Patch_Len]
+        # 6. Reconstruction
         pred_patches = self.head(enc_out)
 
-        # 6. 计算 MSE Loss (仅计算被 Mask 掉的部分)
+        # 7. Loss
+        # Loss is calculated on normalized patches (if RevIN used)
         loss = (pred_patches - target_patches) ** 2
-        loss = loss.mean(dim=-1)  # 对每个 Patch 内的数值求均值
-        loss = (loss * mask).sum() / (mask.sum() + 1e-6)  # 仅保留被 mask 掉的 patch 的 loss
+        loss = loss.mean(dim=-1)
+        loss = (loss * mask).sum() / (mask.sum() + 1e-6)
 
-        # 返回 Loss 和掩码信息 (后续可以把 pred_patches 拼回去做可视化)
         return loss, pred_patches, target_patches, mask
