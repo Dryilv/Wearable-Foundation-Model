@@ -316,8 +316,8 @@ def main():
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--num_heads', type=int, default=12)
     parser.add_argument('--cwt_scales', type=int, default=64)
-    parser.add_argument('--patch_size_time', type=int, default=50)
-    parser.add_argument('--patch_size_freq', type=int, default=4)
+    parser.add_argument('--patch_size_time', type=int, default=30)
+    parser.add_argument('--patch_size_freq', type=int, default=8)
     parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
     parser.add_argument('--use_factorized_attn', action='store_true', default=True, help="Enable Factorized Sync-Attention")
     
