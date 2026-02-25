@@ -343,7 +343,7 @@ class CWT_MAE_RoPE(nn.Module):
         
         return x_masked, mask, global_ids_restore, ids_keep
 
-    def forward_encoder(self, x, modality_ids=None):
+    def forward_encoder(self, x, modality_ids=None, mask_ratio=None):
         B, M, C, H, W = x.shape
         
         x = x.view(B * M, C, H, W)
@@ -364,13 +364,14 @@ class CWT_MAE_RoPE(nn.Module):
         x = x.view(B, M * N_patches, -1)
 
         # 3. Tubelet Masking
-        if self.mask_ratio == 0.0:
+        current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
+        if current_mask_ratio == 0.0:
             x_masked = x
             mask = torch.zeros(B, M * N_patches, device=x.device)
             global_ids_restore = torch.arange(M * N_patches, device=x.device).unsqueeze(0).expand(B, -1)
             ids_keep = torch.arange(N_patches, device=x.device).unsqueeze(0).expand(B, -1)
         else:
-            x_masked, mask, global_ids_restore, ids_keep = self.tubelet_masking(x, self.mask_ratio, M, N_patches)
+            x_masked, mask, global_ids_restore, ids_keep = self.tubelet_masking(x, current_mask_ratio, M, N_patches)
 
         # 4. RoPE Position IDs (仅针对保留的时间步)
         pos_ids = ids_keep # (B, len_keep)
@@ -465,15 +466,16 @@ class CWT_MAE_RoPE(nn.Module):
         imgs = torch.clamp(imgs, min=-100.0, max=100.0)
         return imgs.to(dtype=next(self.parameters()).dtype)
 
-    def forward(self, x, modality_ids=None):
+    def forward(self, x, modality_ids=None, mask_ratio=None):
         """
         x: (B, M, L)
         modality_ids: (B, M) 标明每个通道的信号类型 (可选)
+        mask_ratio: float, optional override for mask ratio
         """
         imgs = self.prepare_tokens(x)
 
         # Encoder
-        latent, mask, ids, M = self.forward_encoder(imgs, modality_ids)
+        latent, mask, ids, M = self.forward_encoder(imgs, modality_ids, mask_ratio=mask_ratio)
         
         # Decoder
         decoder_features = self.forward_decoder(latent, ids, M)

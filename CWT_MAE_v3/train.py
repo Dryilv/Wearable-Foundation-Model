@@ -187,7 +187,7 @@ def validate(model, dataloader, device, config):
     return val_loss, val_loss_spec, val_loss_time
 
 def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global, 
-                    total_steps, warmup_steps, base_lr, min_lr):
+                    total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0):
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
@@ -233,9 +233,13 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
+            current_step_for_lr = global_step - lr_start_step
+            # Ensure non-negative
+            if current_step_for_lr < 0: current_step_for_lr = 0
+            
             adjust_learning_rate_per_step(
                 optimizer, 
-                current_step=global_step // accum_iter, 
+                current_step=current_step_for_lr // accum_iter, 
                 total_steps=total_steps // accum_iter, 
                 warmup_steps=warmup_steps // accum_iter, 
                 base_lr=base_lr_scaled, 
@@ -263,7 +267,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, loss_dict, _, _, _, _ = model(batch, modality_ids=modality_ids)
+                loss, loss_dict, _, _, _, _ = model(batch, modality_ids=modality_ids, mask_ratio=mask_ratio)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
@@ -528,13 +532,56 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         train_sampler.set_epoch(epoch)
         
+        # --- Dynamic Mask Ratio Scheduling ---
+        if epoch < 45:
+            current_mask_ratio = 0.6
+        elif epoch < 55:
+            # Linear increase from 0.6 to 0.75 over 10 epochs (45-54)
+            # Epoch 44 was 0.6. We want Epoch 54 to be 0.75.
+            # Steps = 10.
+            progress = (epoch - 44) / 10.0
+            current_mask_ratio = 0.6 + (0.75 - 0.6) * progress
+        else:
+            current_mask_ratio = 0.75
+
+        # --- Dynamic Learning Rate Scheduling ---
+        # User Request: Pull LR to 1e-4 at epoch 45 to handle increased difficulty
+        if epoch >= 45:
+             # Restart Logic: Treat epoch 45 as the start of a new phase (Phase 2)
+             # Phase 2: Epoch 45-100 (55 epochs)
+             phase_epochs = total_epochs - 45
+             phase_total_steps = phase_epochs * num_steps_per_epoch
+             
+             # Warmup: minimal or none for restart? User asked for "smooth transition" or "briefly pull up".
+             # Let's set a very short warmup (e.g., 1 epoch) to avoid shock, or 0 if "pull up" implies immediate jump.
+             # Given "briefly pull up", a jump is expected.
+             phase_warmup_steps = 0 
+             
+             # Adjust base_lr to 1e-4 as requested
+             current_base_lr = 1.0e-4
+             
+             # Override scheduler parameters
+             current_total_steps = phase_total_steps
+             current_warmup_steps = phase_warmup_steps
+             current_lr_start_step = 45 * num_steps_per_epoch
+        else:
+             current_base_lr = base_lr
+             current_total_steps = total_steps
+             current_warmup_steps = warmup_steps
+             current_lr_start_step = 0
+
+        if is_main_process():
+            logger.info(f"Epoch {epoch} Configuration: Mask Ratio = {current_mask_ratio:.4f}, Base LR Target = {current_base_lr}")
+
         # Train
         train_metrics = train_one_epoch(
             model, train_dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            base_lr=base_lr,
-            min_lr=min_lr
+            total_steps=current_total_steps,
+            warmup_steps=current_warmup_steps,
+            base_lr=current_base_lr,
+            min_lr=min_lr,
+            mask_ratio=current_mask_ratio,
+            lr_start_step=current_lr_start_step
         )
         
         # Validation
