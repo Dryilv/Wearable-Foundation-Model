@@ -52,12 +52,13 @@ class MultiChannelAugmentor:
 # 2. Dataset 定义
 # ===================================================================
 class DownstreamClassificationDataset(Dataset):
-    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2):
+    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2, channel_policy='default_5ch'):
         self.data_root = data_root
         self.signal_len = signal_len
         self.mode = mode
         self.task_index = task_index
         self.num_classes = num_classes
+        self.channel_policy = channel_policy
 
         # 训练集开启增强
         self.augmentor = MultiChannelAugmentor(p=0.5) if mode == 'train' else None
@@ -134,17 +135,52 @@ class DownstreamClassificationDataset(Dataset):
             # --- 6. 通道乱序 (Channel Shuffling) ---
             # 关键：微调时也保持 Bag-of-Signals 逻辑，增强对通道顺序的不敏感性
             
-            # [新增] 构建 Modality IDs (默认 5 通道)
-            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+            # [新增] 构建 Modality IDs (支持多模式)
+            # 0: ECG, 1: ACC, 2: PPG
+            M = signal_tensor.shape[0]
+            
+            if self.channel_policy == 'ppg_only':
+                # 假设输入只有 PPG (或用户提供单通道数据)
+                if M == 1:
+                    modality_ids = torch.tensor([2], dtype=torch.long)
+                elif M == 5: # 兼容 5 通道数据取 PPG (最后一行)
+                    signal_tensor = signal_tensor[4:5, :]
+                    modality_ids = torch.tensor([2], dtype=torch.long)
+                else:
+                    # 未知单通道，默认设为 PPG
+                    modality_ids = torch.tensor([2], dtype=torch.long)
+
+            elif self.channel_policy == 'ecg_ppg':
+                # 假设输入是 ECG, PPG (或用户提供 2 通道数据)
+                if M == 2:
+                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
+                elif M == 5: # 兼容 5 通道数据取 ECG, PPG
+                    signal_tensor = signal_tensor[[0, 4], :]
+                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
+                else:
+                    # 未知双通道，默认设为 ECG, PPG
+                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
+            
+            elif self.channel_policy == 'default_5ch':
+                if M == 5:
+                    modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+                else:
+                    # Fallback for non-5-channel data in default mode
+                    modality_ids = torch.zeros(M, dtype=torch.long)
+            
+            else:
+                # Fallback for unknown policy
+                modality_ids = torch.zeros(M, dtype=torch.long)
+            
+            # 更新 M (可能被切片修改)
+            M = signal_tensor.shape[0]
             
             if self.mode == 'train':
-                M = signal_tensor.shape[0]
                 if M > 1:
                     perm_indices = torch.randperm(M)
                     signal_tensor = signal_tensor[perm_indices]
                     # 同步打乱 Modality IDs (如果通道数匹配)
-                    if M == 5:
-                         modality_ids = modality_ids[perm_indices]
+                    modality_ids = modality_ids[perm_indices]
 
             return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
 

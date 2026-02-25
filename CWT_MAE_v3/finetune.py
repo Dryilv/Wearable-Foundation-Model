@@ -332,6 +332,12 @@ def main():
 
     parser.add_argument('--clean_indices_path', type=str, default=None)
     parser.add_argument('--clean_test_indices_path', type=str, default=None)
+    
+    # [新增] 通道策略
+    parser.add_argument('--channel_policy', type=str, default='default_5ch',
+                        choices=['default_5ch', 'ppg_only', 'ecg_ppg'],
+                        help="Data channel configuration: 'default_5ch' (ECG, 3xACC, PPG), 'ppg_only' (PPG), 'ecg_ppg' (ECG, PPG)")
+    
     args = parser.parse_args()
 
     local_rank, rank, world_size = setup_distributed()
@@ -344,11 +350,13 @@ def main():
     # Dataset 初始化
     train_ds = DownstreamClassificationDataset(
         args.data_root, args.split_file, mode='train', 
-        signal_len=args.signal_len, num_classes=args.num_classes
+        signal_len=args.signal_len, num_classes=args.num_classes,
+        channel_policy=args.channel_policy
     )
     val_ds = DownstreamClassificationDataset(
         args.data_root, args.split_file, mode='test', 
-        signal_len=args.signal_len, num_classes=args.num_classes
+        signal_len=args.signal_len, num_classes=args.num_classes,
+        channel_policy=args.channel_policy
     )
 
     val_dataset_len = len(val_ds)
@@ -404,7 +412,6 @@ def main():
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
-        mlp_rank_ratio=args.mlp_rank_ratio,
         # Decoder 参数 (虽然会被删除，但初始化 Encoder 时需要)
         decoder_embed_dim=512, 
         decoder_depth=8,
