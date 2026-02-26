@@ -468,7 +468,8 @@ def main():
         decoder_depth=config['model']['decoder_depth'],
         decoder_num_heads=config['model']['decoder_num_heads'],
         mask_ratio=config['model'].get('mask_ratio', 0.75),
-        time_loss_weight=config['model'].get('time_loss_weight', 1.0)
+        time_loss_weight=config['model'].get('time_loss_weight', 1.0),
+        use_diff=config['model'].get('use_diff', False)
     )
     model.to(device)
 

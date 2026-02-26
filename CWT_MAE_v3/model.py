@@ -39,21 +39,27 @@ def cwt_ricker(x, scales):
     return cwt_output
 
 @torch.compiler.disable
-def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0):
+def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0, use_diff=True):
     if x.dim() == 2:
         x = x.unsqueeze(1)
     B, M, L = x.shape
     x_flat = x.view(B * M, L)
     
-    x_pad = F.pad(x_flat, (1, 1), mode='replicate') 
-    d1 = x_pad[:, 1:] - x_pad[:, :-1]
-    d2 = d1[:, 1:] - d1[:, :-1]
-    
-    base = x_flat
-    d1_cut = d1[:, :L]
-    d2_cut = d2[:, :L]
-    
-    signals = torch.stack([base, d1_cut, d2_cut], dim=1) 
+    if use_diff:
+        x_pad = F.pad(x_flat, (1, 1), mode='replicate') 
+        d1 = x_pad[:, 1:] - x_pad[:, :-1]
+        d2 = d1[:, 1:] - d1[:, :-1]
+        
+        base = x_flat
+        d1_cut = d1[:, :L]
+        d2_cut = d2[:, :L]
+        
+        signals = torch.stack([base, d1_cut, d2_cut], dim=1) 
+    else:
+        # 极速模式：仅使用原始信号，移除一阶和二阶差分
+        base = x_flat
+        signals = base.unsqueeze(1) # (BM, 1, L)
+        
     BM, C, _ = signals.shape
     signals_flat = signals.view(BM * C, L)
     
@@ -243,6 +249,7 @@ class CWT_MAE_RoPE(nn.Module):
         mask_ratio=0.75,       
         norm_layer=nn.LayerNorm,
         time_loss_weight=1.0,
+        use_diff=False,  # 新增控制参数
         max_modalities=16 # 【SOTA】支持的最大模态种类数
     ):
         super().__init__()
@@ -250,11 +257,15 @@ class CWT_MAE_RoPE(nn.Module):
         self.cwt_scales = cwt_scales
         self.time_loss_weight = time_loss_weight
         self.patch_size_time = patch_size_time
+        self.use_diff = use_diff
+        
+        in_chans = 3 if use_diff else 1
         
         self.patch_embed = DecomposedPatchEmbed(
             img_size=(cwt_scales, signal_len),
             patch_size=(patch_size_freq, patch_size_time),
-            embed_dim=embed_dim, norm_layer=norm_layer
+            embed_dim=embed_dim, norm_layer=norm_layer,
+            in_chans=in_chans
         )
         self.num_patches = self.patch_embed.num_patches
         self.grid_size = self.patch_embed.grid_size 
@@ -432,10 +443,15 @@ class CWT_MAE_RoPE(nn.Module):
 
     def forward_loss_spec(self, imgs, pred, mask):
         B, M, C, H, W = imgs.shape
+        # imgs shape: (B, M, 1/3, 64, 3000)
+        # pred shape: (B, M * N_patches, pixels_per_patch)
+        
         p_h, p_w = self.patch_embed.patch_size
+        # target unfolding
         target = imgs.view(B, M, C, H // p_h, p_h, W // p_w, p_w)
         target = target.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
         target = target.view(B, M, -1, C * p_h * p_w)
+        
         mask = mask.view(B, M, -1)
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)
@@ -484,7 +500,7 @@ class CWT_MAE_RoPE(nn.Module):
 
     def prepare_tokens(self, x):
         if x.dim() == 2: x = x.unsqueeze(1)
-        imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0)
+        imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0, use_diff=self.use_diff)
         imgs_f32 = imgs.float() 
         mean = imgs_f32.mean(dim=(3, 4), keepdim=True)
         std = torch.clamp(imgs_f32.std(dim=(3, 4), keepdim=True), min=1e-5)
