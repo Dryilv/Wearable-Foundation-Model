@@ -315,10 +315,20 @@ class CWT_MAE_RoPE(nn.Module):
     def tubelet_masking(self, x, mask_ratio, M, N_patches):
         """【SOTA】管道掩码：强制所有通道在同一时间步被 Mask，杜绝信息泄漏"""
         B, _, D = x.shape
-        len_keep = int(N_patches * (1 - mask_ratio))
+        H_grid, W_grid = self.grid_size
+        len_keep_w = int(W_grid * (1 - mask_ratio))
+        len_keep = len_keep_w * H_grid
         
-        # 仅在时间维度生成噪声
-        noise = torch.rand(B, N_patches, device=x.device)
+        # 1. 仅在时间维度生成噪声
+        noise_w = torch.rand(B, W_grid, device=x.device)
+        ids_shuffle_w = torch.argsort(noise_w, dim=1)
+        ids_restore_w = torch.argsort(ids_shuffle_w, dim=1)
+        
+        # 2. 扩展组合出真正的 2D Tubelet 优先级排布
+        h_idx = torch.arange(H_grid, device=x.device).view(1, H_grid, 1)
+        ids_restore_w_exp = ids_restore_w.unsqueeze(1)
+        noise = (ids_restore_w_exp * H_grid + h_idx).reshape(B, N_patches)
+        
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1) # (B, N_patches)
         ids_keep = ids_shuffle[:, :len_keep]            # (B, len_keep)
@@ -377,8 +387,9 @@ class CWT_MAE_RoPE(nn.Module):
         else:
             x_masked, mask, global_ids_restore, ids_keep = self.tubelet_masking(x, current_mask_ratio, M, N_patches)
 
-        # 4. RoPE Position IDs (仅针对保留的时间步)
-        pos_ids = ids_keep # (B, len_keep)
+        # 4. RoPE Position IDs (基于真实的 Time 相对坐标)
+        H_grid, W_grid = self.grid_size
+        pos_ids = ids_keep % W_grid # (B, len_keep)
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids)
         
         # 5. Transformer Blocks
@@ -406,7 +417,8 @@ class CWT_MAE_RoPE(nn.Module):
         x = x_patches.view(B, Total_Tokens, D_dec)
 
         # RoPE
-        patch_pos = torch.arange(N_patches, device=x.device).unsqueeze(0).expand(B, -1)
+        H_grid, W_grid = self.grid_size
+        patch_pos = (torch.arange(N_patches, device=x.device) % W_grid).unsqueeze(0).expand(B, -1)
         # 扩展 RoPE 以匹配 Decoder 的全局 Attention (Decoder 依然使用标准 Block)
         patch_pos_expanded = patch_pos.repeat(1, M)
         rope_cos, rope_sin = self.rope_decoder(x, patch_pos_expanded)
@@ -447,9 +459,8 @@ class CWT_MAE_RoPE(nn.Module):
         mask_2d = mask.view(B, M, H_grid, W_grid)
         
         # Aggregate mask over frequency dimension (H)
-        # mask values are 0 (keep) or 1 (remove)
-        # We use mean to weight the loss: if more freq patches are masked, higher weight.
-        mask_t = mask_2d.mean(dim=2) # (B, M, W_grid)
+        # mask values are 0 (keep) or 1 (remove). True tubelet ensures mean is exactly 0.0 or 1.0.
+        mask_t = torch.round(mask_2d.mean(dim=2)) # (B, M, W_grid)
         
         # Expand to time resolution
         mask_time = mask_t.unsqueeze(-1).expand(-1, -1, -1, self.patch_size_time)
