@@ -524,17 +524,23 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         train_sampler.set_epoch(epoch)
         
-        # --- Dynamic Mask Ratio Scheduling ---
-        if epoch < 45:
-            current_mask_ratio = 0.6
-        elif epoch < 55:
-            # Linear increase from 0.6 to 0.75 over 10 epochs (45-54)
-            # Epoch 44 was 0.6. We want Epoch 54 to be 0.75.
-            # Steps = 10.
-            progress = (epoch - 44) / 10.0
-            current_mask_ratio = 0.6 + (0.75 - 0.6) * progress
+        # --- Dynamic Mask Ratio Scheduling (Robust Version) ---
+        # Configurable curriculum learning
+        mask_start = config['model'].get('mask_ratio_start_epoch', 5)
+        mask_warmup = config['model'].get('mask_ratio_warmup_epochs', 20)
+        mask_min = config['model'].get('mask_ratio_min', 0.4)
+        mask_max = config['model'].get('mask_ratio_max', 0.75)
+        
+        if epoch < mask_start:
+            # Phase 1: Warmup with easy task
+            current_mask_ratio = mask_min
+        elif epoch < mask_start + mask_warmup:
+            # Phase 2: Linear increase (Curriculum)
+            progress = (epoch - mask_start) / mask_warmup
+            current_mask_ratio = mask_min + (mask_max - mask_min) * progress
         else:
-            current_mask_ratio = 0.75
+            # Phase 3: Hard task (Standard MAE)
+            current_mask_ratio = mask_max
 
         # --- Dynamic Learning Rate Scheduling ---
         # User Request: Pull LR to 1e-4 at epoch 45 to handle increased difficulty

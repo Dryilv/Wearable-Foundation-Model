@@ -303,6 +303,12 @@ class CWT_MAE_RoPE(nn.Module):
         # Decoder
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+        
+        # [Fix] Explicitly scale mask token to prevent large gradients during early training
+        # We initialize it normally, but during forward we might want to scale it?
+        # Actually, trunc_normal with std=0.02 is fine, but the issue is the accumulation.
+        # Let's keep initialization standard.
+        
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, decoder_embed_dim))
         
         self.decoder_blocks = nn.ModuleList([
@@ -318,7 +324,9 @@ class CWT_MAE_RoPE(nn.Module):
 
         self.time_reducer = nn.Sequential(
             nn.Conv2d(decoder_embed_dim, decoder_embed_dim, kernel_size=(self.grid_size[0], 1)),
-            nn.GELU()
+            nn.GELU(),
+            # [Add] LayerNorm before projection to prevent value explosion
+            norm_layer(decoder_embed_dim)
         )
         self.time_pred = nn.Linear(decoder_embed_dim, patch_size_time, bias=True)
 
@@ -496,7 +504,8 @@ class CWT_MAE_RoPE(nn.Module):
         x_raw = x_raw.float()
         mean = x_raw.mean(dim=-1, keepdim=True)
         std = torch.clamp(x_raw.std(dim=-1, keepdim=True), min=1e-5)
-        target = torch.clamp((x_raw - mean) / std, min=-100.0, max=100.0)
+        # [Fix] Target Normalization is correct, but let's be safer with outliers
+        target = torch.clamp((x_raw - mean) / std, min=-10.0, max=10.0)
         
         # pred_time: (B, M, L)
         # mask: (B, M, N_patches)
@@ -557,8 +566,18 @@ class CWT_MAE_RoPE(nn.Module):
         
         B, M, N, D = decoder_features.shape
         H_grid, W_grid = self.grid_size
+        # [Fix] Need to transpose correctly for LayerNorm if using Conv2d output
         feat_2d = decoder_features.reshape(B * M, N, D).transpose(1, 2).reshape(B * M, D, H_grid, W_grid)
-        feat_time_agg = self.time_reducer(feat_2d).squeeze(2).transpose(1, 2)
+        
+        # time_reducer: Conv2d -> GELU -> LayerNorm
+        # Conv2d out: (BM, D, 1, W)
+        feat_time_agg = self.time_reducer[0](feat_2d) # Conv2d
+        feat_time_agg = self.time_reducer[1](feat_time_agg) # GELU
+        
+        # Reshape for LayerNorm: (BM, W, D)
+        feat_time_agg = feat_time_agg.squeeze(2).transpose(1, 2)
+        feat_time_agg = self.time_reducer[2](feat_time_agg) # LayerNorm
+        
         pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M, -1)
         
         # 传入 mask 计算时域 Loss
