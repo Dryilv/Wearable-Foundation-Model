@@ -60,6 +60,12 @@ model:
   # False: 1通道 (原始), 速度极快, 显存占用低
   use_diff: False
 
+  # [关键修改] 差分通道 Loss 权重
+  # 仅在 use_diff: True 时生效
+  # 建议降低差分信号的权重，因为它们含噪较大且难预测
+  # 格式: [原始信号权重, 一阶差分权重, 二阶差分权重]
+  diff_loss_weight: [1.0, 0.5, 0.1]
+
   # 新版代码中时域 Loss 仅计算 Mask 部分，数值会变小，0.1 可作为起点，视 wandb 曲线调整
   time_loss_weight: 0.1
   

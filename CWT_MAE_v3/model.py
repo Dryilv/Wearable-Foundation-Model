@@ -250,6 +250,7 @@ class CWT_MAE_RoPE(nn.Module):
         norm_layer=nn.LayerNorm,
         time_loss_weight=1.0,
         use_diff=False,  # 新增控制参数
+        diff_loss_weight=None, # 新增差分通道权重
         max_modalities=16 # 【SOTA】支持的最大模态种类数
     ):
         super().__init__()
@@ -258,6 +259,20 @@ class CWT_MAE_RoPE(nn.Module):
         self.time_loss_weight = time_loss_weight
         self.patch_size_time = patch_size_time
         self.use_diff = use_diff
+        
+        # 处理差分权重
+        if diff_loss_weight is None:
+            self.diff_loss_weight = [1.0, 1.0, 1.0] if use_diff else [1.0]
+        else:
+            self.diff_loss_weight = diff_loss_weight
+        
+        # 确保权重长度与通道数一致
+        expected_chans = 3 if use_diff else 1
+        if len(self.diff_loss_weight) != expected_chans:
+            print(f"Warning: diff_loss_weight length {len(self.diff_loss_weight)} != expected {expected_chans}. Using default.")
+            self.diff_loss_weight = [1.0] * expected_chans
+            
+        self.register_buffer('channel_loss_weights', torch.tensor(self.diff_loss_weight).view(1, 1, 1, -1))
         
         in_chans = 3 if use_diff else 1
         
@@ -455,7 +470,19 @@ class CWT_MAE_RoPE(nn.Module):
         
         mask = mask.view(B, M, -1)
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)
+        
+        # [NEW] Channel-wise weighted loss
+        # loss shape: (B, M, N_patches, C*p_h*p_w)
+        # Reshape to separate channels
+        loss = loss.view(B, M, -1, C, p_h * p_w)
+        loss = loss.mean(dim=-1) # (B, M, N_patches, C)
+        
+        # Apply weights (weights shape: 1, 1, 1, C)
+        # Weights are automatically on correct device via register_buffer
+        loss = loss * self.channel_loss_weights
+        
+        # Sum over channels to get scalar loss per patch
+        loss = loss.sum(dim=-1) # (B, M, N_patches)
         
         mask_sum = mask.sum()
         if mask_sum > 0:
