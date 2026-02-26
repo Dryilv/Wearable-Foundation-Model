@@ -1,12 +1,12 @@
 train:
   epochs: 100             
   
-  # [显存优化] 3000点信号较长，物理 Batch Size 建议设为 16-32 (视显存而定)
-  batch_size: 32        
+  # [显存优化] 压榨 80G 显存
+  batch_size: 48        
   
   # [关键修改] 梯度累积步数
-  # 有效 Batch Size = 32 * 8 = 256，保证 MAE 预训练的稳定性
-  accum_iter: 1
+  # 有效 Batch Size = 48 * 8 = 384，保证 MAE 预训练的稳定性
+  accum_iter: 8
   
   base_lr: 1.5e-4         
   min_lr: 1.0e-6
