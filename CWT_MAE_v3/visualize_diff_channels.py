@@ -51,8 +51,11 @@ def visualize_all_channels():
     scales = torch.arange(num_scales) * 1.0 + 0.1
     
     # 定义通道名称 (假设顺序)
-    channel_names = ["ECG", "ACC_X", "ACC_Y", "ACC_Z", "PPG"]
-    if num_channels != 5:
+    # Original: ["ECG", "ACC_X", "ACC_Y", "ACC_Z", "PPG"]
+    # Kept only: 0:ECG and 4:PPG
+    channel_names = ["ECG", "PPG"]
+    
+    if num_channels != 2:
         channel_names = [f"Channel {i}" for i in range(num_channels)]
 
     # 4. 循环为每个通道绘图

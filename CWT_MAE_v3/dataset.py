@@ -175,21 +175,34 @@ class PhysioSignalDataset(Dataset):
                 # User specified: data key is a 5-channel numpy array
                 raw_signal = content['data']
                 
+                # [FILTER] Remove ACC channels (Indices 1, 2, 3)
+                # Original channels: 0:ECG, 1:ACC_X, 2:ACC_Y, 3:ACC_Z, 4:PPG (Assumption based on 5 channels)
+                # Requirement: Keep only ECG (0) and PPG (4).
+                if raw_signal.ndim == 2 and raw_signal.shape[0] > 4:
+                     # Keep index 0 and 4
+                     keep_indices = [0, 4]
+                     raw_signal = raw_signal[keep_indices, :]
+                
                 if raw_signal.ndim == 1:
                     raw_signal = raw_signal[np.newaxis, :]
                     
-                    if raw_signal.dtype != np.float32:
-                        raw_signal = raw_signal.astype(np.float32)
+                if raw_signal.dtype != np.float32:
+                    raw_signal = raw_signal.astype(np.float32)
+                
+                # Update expected channels for check
+                current_expected_channels = self.expected_channels
+                if self.expected_channels == 5:
+                     current_expected_channels = 2
                 
                 # 1. 基础检查
                 # 注意：raw_signal 可能是只读的（来自缓存），如果后续有原地修改操作需要 copy
                 # 目前的代码逻辑主要是读取和计算，或者 create new tensor，是安全的。
                 # 但为了保险起见，如果需要修改 raw_signal，建议 raw_signal = raw_signal.copy()
                 
-                # [新增] 验证通道数是否符合预期 (5通道)
-                if raw_signal.shape[0] != self.expected_channels:
+                # [新增] 验证通道数是否符合预期
+                if raw_signal.shape[0] != current_expected_channels:
                      # 严重错误，数据不匹配
-                     # print(f"Skipping sample {original_idx}: Expected {self.expected_channels} channels, got {raw_signal.shape[0]}")
+                     # print(f"Skipping sample {original_idx}: Expected {current_expected_channels} channels, got {raw_signal.shape[0]}")
                      idx = random.randint(0, len(self.samples) - 1)
                      continue
 
@@ -237,11 +250,14 @@ class PhysioSignalDataset(Dataset):
                 signal_tensor = torch.from_numpy(processed_signal) 
 
                 # 5. [新增] 构建 Modality IDs
-                # 假设固定顺序: 0:ECG, 1:ACC, 2:PPG
-                # channels 0 -> ECG
-                # channels 1,2,3 -> ACC
-                # channels 4 -> PPG
-                modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+                # Original 5 channels: 0:ECG, 1:ACC_X, 2:ACC_Y, 3:ACC_Z, 4:PPG
+                # Kept only: 0:ECG and 4:PPG
+                # New 2 channels: 0:ECG, 1:PPG
+                # Modality IDs mapping:
+                # 0 -> ECG (Type 0)
+                # 1 -> PPG (Type 2)
+                # Note: Type 2 for PPG to maintain consistency with previous encoding
+                modality_ids = torch.tensor([0, 2], dtype=torch.long)
                 
                 return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
 
@@ -257,15 +273,20 @@ class PhysioSignalDataset(Dataset):
             # 尝试返回第一个样本（通常是经过预处理验证的）
             sample_info = self.samples[0]
             content = load_pickle_file(self.index_data[sample_info['idx']]['path'])
-            safe_signal = content['data'][:, :self.signal_len]
+            safe_signal = content['data']
+            if safe_signal.shape[0] > 4:
+                 # Keep index 0 and 4
+                 keep_indices = [0, 4]
+                 safe_signal = safe_signal[keep_indices, :]
+            safe_signal = safe_signal[:, :self.signal_len]
             # 简单的归一化
             safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
-            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+            modality_ids = torch.tensor([0, 2], dtype=torch.long)
             return torch.from_numpy(safe_signal).float(), modality_ids, torch.tensor(0, dtype=torch.long)
         except:
-            # 极度兜底：返回全一信号而非全零，全一信号在 Z-Score 后会变成全零，但至少带有一个微小的 epsilon std
-            fallback_signal = torch.ones((self.expected_channels, self.signal_len), dtype=torch.float32) * 0.01
-            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
+            # 极度兜底：返回全一信号而非全零
+            fallback_signal = torch.ones((2, self.signal_len), dtype=torch.float32) * 0.01
+            modality_ids = torch.tensor([0, 2], dtype=torch.long)
             return fallback_signal, modality_ids, torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal, fixed_start=None):
