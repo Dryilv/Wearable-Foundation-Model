@@ -297,7 +297,8 @@ class CWT_MAE_RoPE(nn.Module):
         self.decoder_norm = norm_layer(decoder_embed_dim)
         
         # Heads
-        self.patch_pixels = 3 * patch_size_freq * patch_size_time
+        # 动态计算 patch 像素数，取决于输入通道数 (1 or 3)
+        self.patch_pixels = in_chans * patch_size_freq * patch_size_time
         self.decoder_pred_spec = nn.Linear(decoder_embed_dim, self.patch_pixels, bias=True)
 
         self.time_reducer = nn.Sequential(
