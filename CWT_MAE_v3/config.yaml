@@ -1,78 +1,106 @@
+# ==============================================================================
+# CWT-MAE Training Configuration
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Training & Optimization (训练与优化)
+# ------------------------------------------------------------------------------
 train:
-  epochs: 100             
+  # --- Training Duration ---
+  epochs: 100               # 总训练轮数
   
+  # --- Batch Size & Memory Optimization ---
   # [显存优化] 压榨 80G 显存
-  batch_size: 48       
+  batch_size: 40            # 单卡 Batch Size
   
   # [关键修改] 梯度累积步数
-  # 有效 Batch Size = 48 * 8 = 384，保证 MAE 预训练的稳定性
-  accum_iter: 1
-  
-  base_lr: 1.5e-4         
-  min_lr: 1.0e-6
-  warmup_epochs: 5        
-  auto_scale_lr: True     
-  
-  weight_decay: 0.05      
-  clip_grad: 3.0
-  
-  use_amp: True           
-  
-  log_interval: 50
-  save_freq: 5
-  save_dir: "./checkpoint_768_5channel_flash"
-  
-  resume: ""
+  # 有效 Batch Size = batch_size * accum_iter * num_gpus
+  # e.g., 40 * 8 * 1 = 320 (单卡) or 40 * 8 * 8 = 2560 (8卡)
+  accum_iter: 1             # 梯度累积步数，用于增大有效 Batch Size，保证 MAE 预训练的稳定性
 
+  # --- Learning Rate & Scheduler ---
+  base_lr: 1.5e-4           # 基础学习率 (会被 auto_scale_lr 调整)
+  min_lr: 1.0e-6            # 最小学习率 (Cosine Annealing 终点)
+  warmup_epochs: 5          # 预热轮数
+  auto_scale_lr: True       # 是否根据 Batch Size 自动缩放学习率 (Linear Scaling Rule)
+
+  # --- Optimizer Regularization ---
+  weight_decay: 0.05        # 权重衰减 (AdamW)
+  clip_grad: 3.0            # 梯度裁剪阈值，防止梯度爆炸
+
+  # --- Precision ---
+  use_amp: True             # 是否使用混合精度训练 (Automatic Mixed Precision)
+
+  # --- Logging & Checkpointing ---
+  log_interval: 50          # 日志打印间隔 (steps)
+  save_freq: 5              # 模型保存间隔 (epochs)
+  save_dir: "./checkpoint_768_5channel_flash" # Checkpoint 保存路径
+  resume: ""                # 断点续训路径 (e.g., "./checkpoint/checkpoint_last.pth")
+
+# ------------------------------------------------------------------------------
+# 2. Dataset Configuration (数据设置)
+# ------------------------------------------------------------------------------
 data:
-  index_path: "train_index_cleaned.json"
+  index_path: "train_index_cleaned.json"  # 数据索引文件路径
+  
   # [关键修改] 统一对齐到 3000 点
-  signal_len: 3000        
-  num_workers: 16         
-  use_sliding_window: False 
-  window_stride: 1500      # 如果未来开启滑动窗口，步长设为长度的一半
+  signal_len: 3000          # 输入信号长度 (Time steps)
+  
+  num_workers: 16           # DataLoader 工作线程数
+  
+  # --- Sliding Window (Optional) ---
+  use_sliding_window: False # 是否使用滑动窗口切分长信号
+  window_stride: 1500       # 滑动窗口步长 (如果开启，建议设为 signal_len / 2)
 
+# ------------------------------------------------------------------------------
+# 3. Model Architecture (模型架构)
+# ------------------------------------------------------------------------------
 model:
-  cwt_scales: 64          
+  # --- Input Processing (CWT & Patching) ---
+  cwt_scales: 64            # CWT (连续小波变换) 的频带数量 (Frequency dim)
+  use_conv_stem: True       # 是否使用卷积 Stem 替代简单的 Linear Patch Embed
   
   # [关键修改] 避免 Token 爆炸
+  # Patch Size 设置决定了 Token 数量: (signal_len / patch_size_time) * (cwt_scales / patch_size_freq)
   # Time=30, Freq=8 -> Tokens = (3000/30) * (64/8) = 100 * 8 = 800 tokens/channel
   # 既保留了 0.3s 的精细时间分辨率，又将计算量控制在合理范围
-  patch_size_time: 30     
-  patch_size_freq: 8      
-  use_conv_stem: True     
-  
-  embed_dim: 768          
-  depth: 12               
-  num_heads: 12           
-  
-  mlp_rank_ratio: 0.5     
-  
-  decoder_embed_dim: 512  
-  decoder_depth: 8        
-  decoder_num_heads: 16   
-  
-  # 配合 Tubelet Masking，0.6 是一个非常好的起点
+  patch_size_time: 30       # 时间维度的 Patch 大小
+  patch_size_freq: 8        # 频率维度的 Patch 大小
+
+  # --- Transformer Encoder (ViT) ---
+  embed_dim: 768            # Encoder 嵌入维度
+  depth: 12                 # Encoder 层数
+  num_heads: 12             # Encoder 注意力头数
+  mlp_rank_ratio: 0.5       # MLP 扩展比例 (Note: Check implementation for usage)
+
+  # --- Transformer Decoder (MAE) ---
+  decoder_embed_dim: 512    # Decoder 嵌入维度
+  decoder_depth: 8          # Decoder 层数
+  decoder_num_heads: 16     # Decoder 注意力头数
+
+  # --- Masking Strategy (Curriculum Learning) ---
   # [NEW] 动态 Mask Ratio 策略 (Curriculum Learning)
-  # 初始阶段使用较低的 Mask Ratio 帮助模型快速收敛
-  # 然后逐渐增加难度，直到达到目标 Mask Ratio
+  # 初始阶段使用较低的 Mask Ratio 帮助模型快速收敛，然后逐渐增加难度，直到达到目标 Mask Ratio
+  # 配合 Tubelet Masking，0.6 是一个非常好的起点
   mask_ratio_start_epoch: 5      # 从第 5 个 Epoch 开始增加难度
   mask_ratio_warmup_epochs: 20   # 持续 20 个 Epoch 线性增加
   mask_ratio_min: 0.5            # 初始 Mask Ratio (简单模式)
   mask_ratio_max: 0.75           # 最终目标 Mask Ratio (困难模式)
-  
-  # 是否使用信号差分特征 (d1, d2)
-  # True: 3通道 (原始+一阶+二阶), 精度更高但慢
-  # False: 1通道 (原始), 速度极快, 显存占用低
-  use_diff: False
 
+  # --- Signal Difference (Optional) ---
+  # 是否使用信号差分特征 (d1, d2)
+  # True: 3通道 (原始+一阶+二阶), 精度更高但慢; False: 1通道 (原始), 速度极快, 显存占用低
+  use_diff: False
+  
   # [关键修改] 差分通道 Loss 权重
-  # 仅在 use_diff: True 时生效
-  # 建议降低差分信号的权重，因为它们含噪较大且难预测
   # 格式: [原始信号权重, 一阶差分权重, 二阶差分权重]
+  # 仅在 use_diff: True 时生效，建议降低差分信号的权重，因为它们含噪较大且难预测
   diff_loss_weight: [1.0, 0.5, 0.1]
 
+  # --- Loss Weighting ---
+  # 时域 Loss 权重 (相对于频域 Loss)
   # 新版代码中时域 Loss 仅计算 Mask 部分，数值会变小，0.1 可作为起点，视 wandb 曲线调整
   time_loss_weight: 0.1
   
-  data_ratio: 1.0
+  # --- Data Usage ---
+  data_ratio: 1.0           # 使用数据的比例 (0.0-1.0)，用于快速测试或少样本训练
