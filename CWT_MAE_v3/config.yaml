@@ -2,11 +2,11 @@ train:
   epochs: 100             
   
   # [显存优化] 压榨 80G 显存
-  batch_size: 40       
+  batch_size: 48       
   
   # [关键修改] 梯度累积步数
   # 有效 Batch Size = 48 * 8 = 384，保证 MAE 预训练的稳定性
-  accum_iter: 8
+  accum_iter: 1
   
   base_lr: 1.5e-4         
   min_lr: 1.0e-6
