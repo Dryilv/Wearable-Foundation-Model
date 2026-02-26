@@ -298,10 +298,10 @@ class CWT_MAE_RoPE(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        torch.nn.init.normal_(self.pos_embed, std=.02)
-        torch.nn.init.normal_(self.decoder_pos_embed, std=.02)
-        torch.nn.init.normal_(self.mask_token, std=.02)
-        torch.nn.init.normal_(self.modality_prompts, std=.02)
+        torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
+        torch.nn.init.trunc_normal_(self.decoder_pos_embed, std=.02)
+        torch.nn.init.trunc_normal_(self.mask_token, std=.02)
+        torch.nn.init.trunc_normal_(self.modality_prompts, std=.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -439,7 +439,12 @@ class CWT_MAE_RoPE(nn.Module):
         mask = mask.view(B, M, -1)
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)
-        loss = (loss * mask).sum() / (mask.sum() + 1e-6)
+        
+        mask_sum = mask.sum()
+        if mask_sum > 0:
+            loss = (loss * mask).sum() / mask_sum
+        else:
+            loss = loss.mean() * 0.0
         return loss
 
     def forward_loss_time(self, x_raw, pred_time, mask):
@@ -463,11 +468,18 @@ class CWT_MAE_RoPE(nn.Module):
         mask_t = torch.round(mask_2d.mean(dim=2)) # (B, M, W_grid)
         
         # Expand to time resolution
+        # mask_t shape: (B, M, W_grid)
+        # We want to expand W_grid to L = W_grid * patch_size_time
         mask_time = mask_t.unsqueeze(-1).expand(-1, -1, -1, self.patch_size_time)
         mask_time = mask_time.reshape(B, M, -1) # (B, M, L)
         
         loss = (pred_time.float() - target) ** 2
-        loss = (loss * mask_time).sum() / (mask_time.sum() + 1e-6)
+        # Use mean instead of sum with a small denominator to prevent large gradient values
+        mask_time_sum = mask_time.sum()
+        if mask_time_sum > 0:
+            loss = (loss * mask_time).sum() / mask_time_sum
+        else:
+            loss = loss.mean() * 0.0
         return loss
 
     def prepare_tokens(self, x):
