@@ -251,30 +251,42 @@ def save_reconstruction_images(model, x_time, epoch, save_dir, modality_ids=None
             axs[m, 0].set_ylabel(channel_names[m] if m < len(channel_names) else f"Ch {m}")
             if m == 0: axs[m, 0].set_title("Original")
             axs[m, 0].grid(True, alpha=0.3)
+        
+        # 4. 绘图 (M 行, 3 列)
+        fig, axs = plt.subplots(M, 3, figsize=(18, 3 * M), squeeze=False)
+        plt.suptitle(f"Epoch {epoch} Reconstruction (5 Channels)", fontsize=16)
+        
+        # 通道名称示例 (根据实际情况调整)
+        channel_names = ["ECG", "ACC1", "ACC2", "ACC3", "PPG"]
+        if M != 5:
+            channel_names = [f"Ch {i}" for i in range(M)]
+
+        for m in range(M):
+            # --- Column 1: Original Signal ---
+            axs[m, 0].plot(orig_signal[m], 'k', lw=1)
+            axs[m, 0].set_ylabel(channel_names[m] if m < len(channel_names) else f"Ch {m}")
+            if m == 0: axs[m, 0].set_title("Original")
+            axs[m, 0].grid(True, alpha=0.3)
 
             # --- Column 2: Masked Input ---
             # 提取该通道对应的 mask 片段
             # 注意：mask 的顺序是所有通道拼接在一起的
             m_mask = mask_val[m * N_patches : (m + 1) * N_patches]
-            # 这里的 mask 是基于 Patch 的，我们需要将其映射回时间点
-            # 由于 CWT-MAE 的 Patch 包含频率维度，简单 repeat 可能会有重合，
-            # 但在时间轴上，它是 patch_size_time 的倍数。
-            
-            # 我们需要重新整理 mask 形状
+            # 这里的 mask 真正代表的是时间步的 Mask
+            # 经过修复，所有频率在同一时间点的 Mask 是一致的。
+            # mask_val (M * N_patches,) 包含了每个通道每一块 Patch 的判定，
+            # 由于 N_patches = N_freq * N_time, 我们只取时间轴：
             m_mask_2d = m_mask.reshape(N_freq, N_time)
             
-            # 【修复】Mask 可视化逻辑优化
-            # 之前使用 any(axis=0) 导致高 Mask Ratio (0.75) 下几乎所有时间步都被标记为 Mask
-            # 现在的逻辑：如果该时间步的频率 Patch 中有超过 60% 被 Mask，才视为 Mask
-            # 这样可以看到那些 "部分可见" 的波形，而不是全白
-            m_mask_time = (m_mask_2d.sum(axis=0) / N_freq) > 0.6
+            # 【修复】提取纯时间步 Mask (直接取第一行，因为整个列都是相同的值)
+            m_mask_time = m_mask_2d[0, :] # shape: (N_time,)
             
+            # 将粗粒度的时间 Patch 扩展到原始信号级
             m_mask_time_expanded = np.repeat(m_mask_time, patch_size)
             if m_mask_time_expanded.shape[0] < L:
                 m_mask_time_expanded = np.pad(m_mask_time_expanded, (0, L - m_mask_time_expanded.shape[0]), constant_values=0)
             else:
                 m_mask_time_expanded = m_mask_time_expanded[:L]
-            
             masked_signal = orig_signal[m].copy()
             masked_signal[m_mask_time_expanded == 1] = np.nan
             

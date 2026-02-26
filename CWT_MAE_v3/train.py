@@ -427,7 +427,7 @@ def main():
     )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    # val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     
     # DataLoader (使用自定义 collate_fn)
     train_dataloader = DataLoader(
@@ -437,16 +437,6 @@ def main():
         num_workers=config['data']['num_workers'],
         pin_memory=True,
         drop_last=True,
-        collate_fn=fixed_channel_collate_fn
-    )
-    
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=config['train']['batch_size'],
-        sampler=val_sampler,
-        num_workers=config['data']['num_workers'],
-        pin_memory=True,
-        drop_last=False,
         collate_fn=fixed_channel_collate_fn
     )
 
@@ -463,7 +453,7 @@ def main():
     if is_main_process():
         logger.info(f"Total Steps: {total_steps}, Warmup Steps: {warmup_steps}")
         logger.info(f"Base LR: {base_lr}, Min LR: {min_lr}")
-        logger.info(f"Train Size: {len(train_dataset)}, Val Size: {len(val_dataset)}")
+        logger.info(f"Train Size: {len(train_dataset)}")
 
     # 初始化模型 (无 max_num_channels)
     model = CWT_MAE_RoPE(
@@ -584,8 +574,8 @@ def main():
             lr_start_step=current_lr_start_step
         )
         
-        # Validation
-        val_loss, val_loss_spec, val_loss_time = validate(model, val_dataloader, device, config)
+        # Validation Removed
+        val_loss, val_loss_spec, val_loss_time = 0.0, 0.0, 0.0
         
         # Feature Evaluation
         linear_acc = -1.0
@@ -628,15 +618,9 @@ def main():
             # Log Metrics
             metrics_dict = {
                 'train_loss': train_metrics['loss'],
-                'val_loss': val_loss,
-                'val_loss_spec': val_loss_spec,
-                'val_loss_time': val_loss_time,
                 'grad_norm': train_metrics['grad_norm'],
                 'gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 / 1024,
                 'throughput': train_metrics['throughput'],
-                'linear_acc': linear_acc,
-                'sil_score': sil_score,
-                'db_score': db_score
             }
             tracker.log(epoch, metrics_dict)
             logger.info(f"Epoch {epoch} Metrics: {metrics_dict}")
