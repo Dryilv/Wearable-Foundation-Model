@@ -203,10 +203,10 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     accum_iter = config['train'].get('accum_iter', 1)
     
     # [Optimization] Linear Scaling Rule
-    # actual_lr = base_lr * batch_size * accum_iter / 256
-    # Note: We apply this scaling to the base_lr passed in
+    # Note: We apply this scaling to the base_lr passed in AFTER dynamic schedule adjustment
     eff_batch_size = config['train']['batch_size'] * accum_iter * (dist.get_world_size() if dist.is_initialized() else 1)
     if config['train'].get('auto_scale_lr', True):
+        # Apply scaling based on effective batch size
         base_lr_scaled = base_lr * eff_batch_size / 256.0
         min_lr_scaled = min_lr * eff_batch_size / 256.0
     else:
@@ -233,6 +233,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
+            # When resuming at epoch 20 (or 45), lr_start_step is set to epoch * num_steps_per_epoch.
+            # However, global_step also counts from 0 based on epoch * num_steps_per_epoch.
+            # For phase restarting logic, current_step_for_lr resets to 0.
             current_step_for_lr = global_step - lr_start_step
             # Ensure non-negative
             if current_step_for_lr < 0: current_step_for_lr = 0
@@ -550,18 +553,23 @@ def main():
              phase_total_steps = phase_epochs * num_steps_per_epoch
              phase_warmup_steps = 0 
              
-             current_base_lr = 1.0e-4
+             current_base_lr = 1.0e-4 / (base_lr * eff_batch_size / 256.0 / base_lr if config['train'].get('auto_scale_lr', True) else 1.0)
              
              current_total_steps = phase_total_steps
              current_warmup_steps = phase_warmup_steps
              current_lr_start_step = 45 * num_steps_per_epoch
         elif epoch >= 20:
              # User Request: Restart at epoch 20, pull LR up to 1.2e-4
-             phase_epochs = 45 - 20 # Or total_epochs - 20 if the epoch 45 rule is removed
+             phase_epochs = (45 if total_epochs > 45 else total_epochs) - 20 # Next phase is at 45
              phase_total_steps = phase_epochs * num_steps_per_epoch
-             phase_warmup_steps = 0 # no warmup needed, jump directly to 1.2e-4
+             phase_warmup_steps = 0 # no warmup needed, jump directly to target
              
-             current_base_lr = 1.2e-4
+             # Calculate effective batch size multiplier to target EXACTLY 1.2e-4
+             eff_batch_size = config['train']['batch_size'] * config['train'].get('accum_iter', 1) * (dist.get_world_size() if dist.is_initialized() else 1)
+             auto_scale_factor = eff_batch_size / 256.0 if config['train'].get('auto_scale_lr', True) else 1.0
+             
+             # Divide the target by the auto scale factor so when the scaler multiplies it back, it's correct
+             current_base_lr = 1.2e-4 / auto_scale_factor
              
              current_total_steps = phase_total_steps
              current_warmup_steps = phase_warmup_steps
