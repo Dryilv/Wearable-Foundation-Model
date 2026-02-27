@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -71,7 +72,7 @@ def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0, use_diff=True):
     return cwt_out
 
 # ===================================================================
-# 2. 基础组件 & RoPE (修复了精度问题)
+# 2. 基础组件 & RoPE
 # ===================================================================
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=6000):
@@ -87,7 +88,6 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        # 【SOTA 修复】: 缓存保持 float32，防止长序列精度丢失
         self.register_buffer("cos_cached", emb.cos().to(torch.float32), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(torch.float32), persistent=False)
 
@@ -95,7 +95,6 @@ class RotaryEmbedding(nn.Module):
         seq_len = torch.max(pos_ids) + 1
         if seq_len > self.max_seq_len:
             self._update_cache(int(seq_len * 1.5))
-        # 动态转换到输入的数据类型 (如 bfloat16/float16)
         cos = F.embedding(pos_ids, self.cos_cached).to(x.dtype)
         sin = F.embedding(pos_ids, self.sin_cached).to(x.dtype)
         return cos.unsqueeze(2), sin.unsqueeze(2)
@@ -149,7 +148,7 @@ class RoPEAttention(nn.Module):
         return x
 
 # ===================================================================
-# 3. 【SOTA 核心】真正的时空因子化 Block
+# 3. 【SOTA 核心】真正的时空因子化 Block (已修复 RoPE 适配)
 # ===================================================================
 class TrueFactorizedBlock(nn.Module):
     """
@@ -158,18 +157,13 @@ class TrueFactorizedBlock(nn.Module):
     """
     def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
         super().__init__()
-        # 1. 时间注意力 (单通道内)
         self.norm_time = norm_layer(dim)
         self.time_attn = RoPEAttention(dim, num_heads=num_heads, proj_drop=drop)
         
-        # 2. 跨通道注意力
         self.norm_channel = norm_layer(dim)
-        # 【SOTA 秘籍】: 局部时间平滑 (Depthwise Conv1D)
-        # 允许通道注意力在交互前“看到”相邻的 Patch，完美捕捉 PTT 相位差！
         self.temporal_smooth = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.channel_attn = RoPEAttention(dim, num_heads=num_heads, proj_drop=drop)
         
-        # 3. MLP
         self.norm_mlp = norm_layer(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * mlp_ratio)),
@@ -180,15 +174,19 @@ class TrueFactorizedBlock(nn.Module):
         )
 
     def forward(self, x, M, N, rope_cos=None, rope_sin=None):
-        # x: (B, M*N, D)
         B, MN, D = x.shape
         
         # --- 1. Time Attention ---
         x_time = x.view(B * M, N, D)
-        # 扩展 RoPE 以匹配 B*M
-        cos_t = rope_cos.repeat_interleave(M, dim=0) if rope_cos is not None else None
-        sin_t = rope_sin.repeat_interleave(M, dim=0) if rope_sin is not None else None
         
+        # [FIX: 智能 RoPE 适配]
+        # 如果 rope_cos 已经是 B*M (非同步掩码)，则不 repeat；如果是 B (同步掩码)，则 repeat
+        if rope_cos is not None and rope_sin is not None:
+            cos_t = rope_cos if rope_cos.shape[0] == B * M else rope_cos.repeat_interleave(M, dim=0)
+            sin_t = rope_sin if rope_sin.shape[0] == B * M else rope_sin.repeat_interleave(M, dim=0)
+        else:
+            cos_t, sin_t = None, None
+            
         x_time = x_time + self.time_attn(self.norm_time(x_time), cos_t, sin_t)
         
         # --- 2. Cross-Channel Attention ---
@@ -201,7 +199,6 @@ class TrueFactorizedBlock(nn.Module):
             
             # 跨通道交互 (把时间压入 Batch)
             x_channel = x_smooth.transpose(1, 2).reshape(B * N, M, D)
-            # 通道之间没有绝对顺序，不需要 RoPE
             attn_out = self.channel_attn(self.norm_channel(x_channel))
             
             # 残差连接 (加在平滑前的特征上)
@@ -231,7 +228,7 @@ class Block(nn.Module):
         return x
 
 # ===================================================================
-# 4. 主模型: SOTA CWT-MAE
+# 4. 主模型: SOTA CWT-MAE (包含混合掩码策略)
 # ===================================================================
 class CWT_MAE_RoPE(nn.Module):
     def __init__(
@@ -249,9 +246,9 @@ class CWT_MAE_RoPE(nn.Module):
         mask_ratio=0.75,       
         norm_layer=nn.LayerNorm,
         time_loss_weight=1.0,
-        use_diff=False,  # 新增控制参数
-        diff_loss_weight=None, # 新增差分通道权重
-        max_modalities=16 # 【SOTA】支持的最大模态种类数
+        use_diff=False,
+        diff_loss_weight=None,
+        max_modalities=16
     ):
         super().__init__()
         self.mask_ratio = mask_ratio
@@ -260,13 +257,11 @@ class CWT_MAE_RoPE(nn.Module):
         self.patch_size_time = patch_size_time
         self.use_diff = use_diff
         
-        # 处理差分权重
         if diff_loss_weight is None:
             self.diff_loss_weight = [1.0, 1.0, 1.0] if use_diff else [1.0]
         else:
             self.diff_loss_weight = diff_loss_weight
         
-        # 确保权重长度与通道数一致
         expected_chans = 3 if use_diff else 1
         if len(self.diff_loss_weight) != expected_chans:
             print(f"Warning: diff_loss_weight length {len(self.diff_loss_weight)} != expected {expected_chans}. Using default.")
@@ -285,10 +280,7 @@ class CWT_MAE_RoPE(nn.Module):
         self.num_patches = self.patch_embed.num_patches
         self.grid_size = self.patch_embed.grid_size 
 
-        # 【SOTA】动态模态提示词 (Modality Prompts)
         self.modality_prompts = nn.Parameter(torch.zeros(max_modalities, embed_dim))
-        
-        # Time Position Embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
@@ -300,15 +292,8 @@ class CWT_MAE_RoPE(nn.Module):
         ])
         self.norm = norm_layer(embed_dim)
 
-        # Decoder
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        
-        # [Fix] Explicitly scale mask token to prevent large gradients during early training
-        # We initialize it normally, but during forward we might want to scale it?
-        # Actually, trunc_normal with std=0.02 is fine, but the issue is the accumulation.
-        # Let's keep initialization standard.
-        
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, decoder_embed_dim))
         
         self.decoder_blocks = nn.ModuleList([
@@ -317,15 +302,12 @@ class CWT_MAE_RoPE(nn.Module):
         ])
         self.decoder_norm = norm_layer(decoder_embed_dim)
         
-        # Heads
-        # 动态计算 patch 像素数，取决于输入通道数 (1 or 3)
         self.patch_pixels = in_chans * patch_size_freq * patch_size_time
         self.decoder_pred_spec = nn.Linear(decoder_embed_dim, self.patch_pixels, bias=True)
 
         self.time_reducer = nn.Sequential(
             nn.Conv2d(decoder_embed_dim, decoder_embed_dim, kernel_size=(self.grid_size[0], 1)),
             nn.GELU(),
-            # [Add] LayerNorm before projection to prevent value explosion
             norm_layer(decoder_embed_dim)
         )
         self.time_pred = nn.Linear(decoder_embed_dim, patch_size_time, bias=True)
@@ -354,170 +336,168 @@ class CWT_MAE_RoPE(nn.Module):
         len_keep_w = int(W_grid * (1 - mask_ratio))
         len_keep = len_keep_w * H_grid
         
-        # 1. 仅在时间维度生成噪声
         noise_w = torch.rand(B, W_grid, device=x.device)
         ids_shuffle_w = torch.argsort(noise_w, dim=1)
         ids_restore_w = torch.argsort(ids_shuffle_w, dim=1)
         
-        # 2. 扩展组合出真正的 2D Tubelet 优先级排布
         h_idx = torch.arange(H_grid, device=x.device).view(1, H_grid, 1)
         ids_restore_w_exp = ids_restore_w.unsqueeze(1)
         noise = (ids_restore_w_exp * H_grid + h_idx).reshape(B, N_patches)
         
         ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1) # (B, N_patches)
-        ids_keep = ids_shuffle[:, :len_keep]            # (B, len_keep)
+        ids_restore = torch.argsort(ids_shuffle, dim=1) 
+        ids_keep = ids_shuffle[:, :len_keep]            
         
-        # 广播到所有通道并 Gather
         x_reshaped = x.view(B, M, N_patches, D)
         ids_keep_expanded = ids_keep.unsqueeze(1).unsqueeze(-1).expand(B, M, len_keep, D)
         x_masked = torch.gather(x_reshaped, dim=2, index=ids_keep_expanded)
         x_masked = x_masked.reshape(B, M * len_keep, D)
         
-        # 生成 Mask 矩阵
         mask = torch.ones([B, N_patches], device=x.device)
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
         mask = mask.unsqueeze(1).expand(B, M, N_patches).reshape(B, M * N_patches)
         
-        # 构建全局 ids_restore 供 Decoder 使用
-        global_ids_restore = []
+        global_ids_restore =[]
         for m in range(M):
             global_ids_restore.append(ids_restore + m * N_patches)
-        global_ids_restore = torch.cat(global_ids_restore, dim=1) # (B, M*N_patches)
+        global_ids_restore = torch.cat(global_ids_restore, dim=1) 
+        
+        return x_masked, mask, global_ids_restore, ids_keep
+
+    def async_masking(self, x, mask_ratio, M, N_patches):
+        """
+        [NEW: Async Masking] 非同步掩码：不同通道的时间步掩码是独立的
+        逻辑：噪声在 [Batch, Channel, Time] 三个维度独立生成
+        """
+        B, _, D = x.shape
+        H_grid, W_grid = self.grid_size
+        len_keep_w = int(W_grid * (1 - mask_ratio))
+        len_keep = len_keep_w * H_grid
+        
+        # 1. 仅在时间维度生成噪声，但对每个通道独立生成
+        noise_w = torch.rand(B, M, W_grid, device=x.device)
+        
+        # 2. 扩展到频域 H_grid (同一时间步的频率成分同生共死)
+        noise = noise_w.unsqueeze(2).repeat(1, 1, H_grid, 1)
+        
+        # 3. 展平为 Patch 维度
+        noise = noise.reshape(B, M, N_patches)
+        
+        # 4. 生成 ids_shuffle 和 ids_restore
+        ids_shuffle = torch.argsort(noise, dim=2) 
+        ids_restore = torch.argsort(ids_shuffle, dim=2)
+        
+        # 5. 生成 ids_keep (B, M, len_keep)
+        ids_keep = ids_shuffle[:, :, :len_keep]
+        
+        # 6. Gather x_masked
+        x_reshaped = x.view(B, M, N_patches, D)
+        ids_keep_expanded = ids_keep.unsqueeze(-1).expand(-1, -1, -1, D)
+        x_masked = torch.gather(x_reshaped, dim=2, index=ids_keep_expanded)
+        x_masked = x_masked.reshape(B, M * len_keep, D)
+        
+        # 7. 生成 Mask 矩阵
+        mask = torch.ones([B, M, N_patches], device=x.device)
+        mask[:, :, :len_keep] = 0
+        mask = torch.gather(mask, dim=2, index=ids_restore)
+        mask = mask.reshape(B, M * N_patches)
+        
+        # 8. 构建全局 global_ids_restore
+        offset = torch.arange(M, device=x.device).view(1, M, 1) * N_patches
+        global_ids_restore = ids_restore + offset
+        global_ids_restore = global_ids_restore.reshape(B, M * N_patches)
         
         return x_masked, mask, global_ids_restore, ids_keep
 
     def mixed_masking(self, x, mask_ratio, M, N_patches):
         """
-        混合掩码策略 (Mixed Masking Strategy)
+        [NEW: Mixed Masking] 混合掩码策略
         1. Tubelet Masking (40%): 同步掩码，学习 PTT 和相位差。
-        2. ECG 100% Masking (40%): 跨模态生成，逼迫模型从 PPG 推断 ECG。
-        3. PPG 100% Masking (20%): 反向翻译，增强电-机械耦合理解。
+        2. Async Masking (20%): 非同步掩码，学习通道独立性与微观对齐。
+        3. ECG 100% Masking (20%): 跨模态生成。
+        4. PPG 100% Masking (20%): 反向翻译。
         """
         B, total_tokens, D = x.shape
-        # x is (B, M*N_patches, D)
         N = N_patches
         
         # 随机选择策略 (Per Batch)
         rand_val = torch.rand(1).item()
         
         # -------------------------------------------------------
-        # Strategy 1: Tubelet Masking (40%) - Default Behavior
+        # Strategy 1: Tubelet Masking (40%)
         # -------------------------------------------------------
         if rand_val < 0.4:
             return self.tubelet_masking(x, mask_ratio, M, N_patches) + (M,)
 
         # -------------------------------------------------------
-        # Strategy 2 & 3: Asymmetric Masking
-        # Strategy 2 (40%): Mask ECG (0) 100%, Keep PPG (1) ~80%
-        # Strategy 3 (20%): Mask PPG (1) 100%, Keep ECG (0) 100%
+        # Strategy 2: Async Masking (20%)
         # -------------------------------------------------------
-        
-        # Define target channel and mask ratios
+        elif rand_val < 0.6:
+            return self.async_masking(x, mask_ratio, M, N_patches) + (M,)
+
+        # -------------------------------------------------------
+        # Strategy 3 & 4: Asymmetric Masking (40% Total)
+        # -------------------------------------------------------
         if rand_val < 0.8: 
-            # Strategy 2: ECG Masked, PPG Visible
-            # Keep Channel 1 (PPG), Mask Channel 0 (ECG)
+            # Strategy 3: ECG Masked, PPG Visible
             keep_channel_idx = 1 
-            target_mask_ratio = 0.2 # PPG mask ratio
+            target_mask_ratio = 0.2 
             masked_channel_idx = 0
         else:
-            # Strategy 3: PPG Masked, ECG Visible
-            # Keep Channel 0 (ECG), Mask Channel 1 (PPG)
+            # Strategy 4: PPG Masked, ECG Visible
             keep_channel_idx = 0
-            target_mask_ratio = 0.0 # ECG mask ratio (Keep all)
+            target_mask_ratio = 0.0 
             masked_channel_idx = 1
             
-        # Extract the kept channel data
-        # x shape: (B, M*N, D) -> View as (B, M, N, D)
         x_reshaped = x.view(B, M, N, D)
-        x_keep = x_reshaped[:, keep_channel_idx, :, :] # (B, N, D)
-        x_keep = x_keep.reshape(B, 1, N, D) # (B, 1, N, D) for tubelet_masking
+        x_keep = x_reshaped[:, keep_channel_idx, :, :] 
+        x_keep = x_keep.reshape(B, 1, N, D) 
         
-        # Apply Tubelet Masking on the KEPT channel only
-        # Note: We use M=1 here effectively
         x_masked, mask_keep, ids_restore_keep_local, ids_keep_local = \
             self.tubelet_masking(x_keep.reshape(B, N, D), target_mask_ratio, M=1, N_patches=N)
         
-        # x_masked: (B, len_keep, D)
-        # mask_keep: (B, N)
-        # ids_restore_keep_local: (B, N) - Values 0..N-1
-        # ids_keep_local: (B, len_keep) - Values 0..N-1
-        
         len_keep = x_masked.shape[1]
-        
-        # Construct Global Mask (B, M*N)
-        # Masked Channel is ALL 1s (Fully Masked)
-        # Kept Channel is mask_keep
         mask_full_ones = torch.ones((B, N), device=x.device)
         
         if keep_channel_idx == 0:
-            # Keep 0, Mask 1 -> [mask_keep, ones]
             mask = torch.cat([mask_keep, mask_full_ones], dim=1)
         else:
-            # Mask 0, Keep 1 -> [ones, mask_keep]
             mask = torch.cat([mask_full_ones, mask_keep], dim=1)
             
-        # Construct Global IDs Restore (B, M*N)
-        # We need to map 2N output positions to the input sequence: [Kept_Tokens (K), Mask_Tokens (2N-K)]
-        # Range [0, K-1] -> Kept tokens
-        # Range [K, 2N-1] -> Mask tokens
-        
-        # We have K = len_keep tokens.
-        # The fully masked channel needs N mask tokens.
-        # The partially kept channel needs N-K mask tokens.
-        # Let's assign indices [K, K+N-1] to the fully masked channel.
-        # And indices [K+N, 2N-1] to the masked part of the kept channel.
-        
-        # ids_restore_keep_local maps [0..N-1] -> [0..N-1] (Local permuted)
-        # In local permutation: 0..K-1 are kept, K..N-1 are masked.
-        
-        # Transformation for Kept Channel Restore IDs:
-        # If val < K: val (Map to kept token)
-        # If val >= K: val + N (Map to second block of mask tokens: K+N .. 2N-1)
-        
         K = len_keep
         ids_restore_keep = ids_restore_keep_local.clone()
         mask_tokens_mask = ids_restore_keep >= K
         ids_restore_keep[mask_tokens_mask] = ids_restore_keep[mask_tokens_mask] + N
         
-        # IDs for Fully Masked Channel:
-        # Map to first block of mask tokens: K .. K+N-1
-        # Any permutation works, we use range.
         ids_restore_masked = torch.arange(K, K + N, device=x.device).unsqueeze(0).expand(B, -1)
         
         if keep_channel_idx == 0:
-            # Order: [Keep_Channel, Masked_Channel]
             global_ids_restore = torch.cat([ids_restore_keep, ids_restore_masked], dim=1)
         else:
-            # Order: [Masked_Channel, Keep_Channel]
             global_ids_restore = torch.cat([ids_restore_masked, ids_restore_keep], dim=1)
             
-        # Effective M for Encoder
-        # Since we only feed ONE channel to the encoder, M_enc = 1
         M_enc = 1
-        
         return x_masked, mask, global_ids_restore, ids_keep_local, M_enc
 
     def forward_encoder(self, x, modality_ids=None, mask_ratio=None):
         B, M, C, H, W = x.shape
         
         x = x.view(B * M, C, H, W)
-        x = self.patch_embed(x) # (B*M, N_patches, D)
-        x = x.view(B, M, -1, x.shape[-1]) # (B, M, N_patches, D)
+        x = self.patch_embed(x) 
+        x = x.view(B, M, -1, x.shape[-1]) 
         N_patches = x.shape[2]
 
         # 1. Add Time Position Embeddings
         x = x + self.pos_embed.unsqueeze(1)
 
-        # 2. 【SOTA】注入动态模态提示词 (Modality Prompts)
+        # 2. 注入动态模态提示词 (Modality Prompts)
         if modality_ids is None:
             modality_ids = torch.zeros((B, M), dtype=torch.long, device=x.device)
         else:
-            # [Safety] Clamp indices to prevent illegal memory access
             modality_ids = torch.clamp(modality_ids, 0, self.modality_prompts.shape[0] - 1)
             
-        mod_embeds = self.modality_prompts[modality_ids] # (B, M, D)
+        mod_embeds = self.modality_prompts[modality_ids] 
         mod_embeds = mod_embeds.unsqueeze(2).expand(-1, -1, N_patches, -1)
         x = x + mod_embeds
 
@@ -532,22 +512,26 @@ class CWT_MAE_RoPE(nn.Module):
             ids_keep = torch.arange(N_patches, device=x.device).unsqueeze(0).expand(B, -1)
             M_enc = M
         else:
-            # Use Mixed Masking Strategy
             x_masked, mask, global_ids_restore, ids_keep, M_enc = self.mixed_masking(x, current_mask_ratio, M, N_patches)
 
         # 4. RoPE Position IDs (基于真实的 Time 相对坐标)
         H_grid, W_grid = self.grid_size
-        pos_ids = ids_keep % W_grid # (B, len_keep)
         
-        # [Fix] When M_enc=1 (Asymmetric), ids_keep corresponds to the kept channel's time steps.
-        # This is compatible with RoPE logic.
-        
-        rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids)
+        # [FIX: 完美适配 2D/3D ids_keep]
+        is_async = (ids_keep.dim() == 3)
+        if is_async:
+            # Async Masking: ids_keep is (B, M, len_keep)
+            pos_ids_flat = (ids_keep % W_grid).view(B * M_enc, -1) # (B*M, len_keep)
+        else:
+            # Sync Masking or Asymmetric: ids_keep is (B, len_keep)
+            pos_ids_flat = (ids_keep % W_grid) # (B, len_keep)
+            
+        rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids_flat)
         
         # 5. Transformer Blocks
-        len_keep = ids_keep.shape[1]
+        len_keep = ids_keep.shape[-1]
         for blk in self.blocks:
-            # Pass effective M (M_enc) to block
+            # 统一传入 M_enc，Block 内部会自动处理 RoPE 的形状并执行跨通道交互
             x_masked = blk(x_masked, M_enc, len_keep, rope_cos=rope_cos, rope_sin=rope_sin)
         x_masked = self.norm(x_masked)
         
@@ -559,20 +543,16 @@ class CWT_MAE_RoPE(nn.Module):
         N_patches = self.num_patches
         Total_Tokens = M * N_patches
 
-        # 恢复 Mask Tokens
         mask_tokens = self.mask_token.repeat(B, Total_Tokens - x.shape[1], 1)
         x_ = torch.cat([x, mask_tokens], dim=1)
         x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D_dec))
 
-        # Add Decoder Time Pos
         x_patches = x.view(B, M, N_patches, D_dec)
         x_patches = x_patches + self.decoder_pos_embed.unsqueeze(1)
         x = x_patches.view(B, Total_Tokens, D_dec)
 
-        # RoPE
         H_grid, W_grid = self.grid_size
         patch_pos = (torch.arange(N_patches, device=x.device) % W_grid).unsqueeze(0).expand(B, -1)
-        # 扩展 RoPE 以匹配 Decoder 的全局 Attention (Decoder 依然使用标准 Block)
         patch_pos_expanded = patch_pos.repeat(1, M)
         rope_cos, rope_sin = self.rope_decoder(x, patch_pos_expanded)
         
@@ -585,11 +565,8 @@ class CWT_MAE_RoPE(nn.Module):
 
     def forward_loss_spec(self, imgs, pred, mask):
         B, M, C, H, W = imgs.shape
-        # imgs shape: (B, M, 1/3, 64, 3000)
-        # pred shape: (B, M * N_patches, pixels_per_patch)
-        
         p_h, p_w = self.patch_embed.patch_size
-        # target unfolding
+        
         target = imgs.view(B, M, C, H // p_h, p_h, W // p_w, p_w)
         target = target.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
         target = target.view(B, M, -1, C * p_h * p_w)
@@ -597,18 +574,10 @@ class CWT_MAE_RoPE(nn.Module):
         mask = mask.view(B, M, -1)
         loss = (pred - target) ** 2
         
-        # [NEW] Channel-wise weighted loss
-        # loss shape: (B, M, N_patches, C*p_h*p_w)
-        # Reshape to separate channels
         loss = loss.view(B, M, -1, C, p_h * p_w)
-        loss = loss.mean(dim=-1) # (B, M, N_patches, C)
-        
-        # Apply weights (weights shape: 1, 1, 1, C)
-        # Weights are automatically on correct device via register_buffer
+        loss = loss.mean(dim=-1) 
         loss = loss * self.channel_loss_weights
-        
-        # Sum over channels to get scalar loss per patch
-        loss = loss.sum(dim=-1) # (B, M, N_patches)
+        loss = loss.sum(dim=-1) 
         
         mask_sum = mask.sum()
         if mask_sum > 0:
@@ -618,34 +587,21 @@ class CWT_MAE_RoPE(nn.Module):
         return loss
 
     def forward_loss_time(self, x_raw, pred_time, mask):
-        """【SOTA】仅对被 Mask 的部分计算时域 Loss"""
         x_raw = x_raw.float()
         mean = x_raw.mean(dim=-1, keepdim=True)
         std = torch.clamp(x_raw.std(dim=-1, keepdim=True), min=1e-5)
-        # [Fix] Target Normalization is correct, but let's be safer with outliers
         target = torch.clamp((x_raw - mean) / std, min=-10.0, max=10.0)
         
-        # pred_time: (B, M, L)
-        # mask: (B, M, N_patches)
         B, M, _ = pred_time.shape
         H_grid, W_grid = self.grid_size
         
-        # Reshape mask to (B, M, H_grid, W_grid)
-        # mask corresponds to patches flattened by (H, W) -> H-major
         mask_2d = mask.view(B, M, H_grid, W_grid)
+        mask_t = torch.round(mask_2d.mean(dim=2)) 
         
-        # Aggregate mask over frequency dimension (H)
-        # mask values are 0 (keep) or 1 (remove). True tubelet ensures mean is exactly 0.0 or 1.0.
-        mask_t = torch.round(mask_2d.mean(dim=2)) # (B, M, W_grid)
-        
-        # Expand to time resolution
-        # mask_t shape: (B, M, W_grid)
-        # We want to expand W_grid to L = W_grid * patch_size_time
         mask_time = mask_t.unsqueeze(-1).expand(-1, -1, -1, self.patch_size_time)
-        mask_time = mask_time.reshape(B, M, -1) # (B, M, L)
+        mask_time = mask_time.reshape(B, M, -1) 
         
         loss = (pred_time.float() - target) ** 2
-        # Use mean instead of sum with a small denominator to prevent large gradient values
         mask_time_sum = mask_time.sum()
         if mask_time_sum > 0:
             loss = (loss * mask_time).sum() / mask_time_sum
@@ -665,40 +621,26 @@ class CWT_MAE_RoPE(nn.Module):
         return imgs.to(dtype=next(self.parameters()).dtype)
 
     def forward(self, x, modality_ids=None, mask_ratio=None):
-        """
-        x: (B, M, L)
-        modality_ids: (B, M) 标明每个通道的信号类型 (可选)
-        mask_ratio: float, optional override for mask ratio
-        """
         imgs = self.prepare_tokens(x)
 
-        # Encoder
         latent, mask, ids, M = self.forward_encoder(imgs, modality_ids, mask_ratio=mask_ratio)
-        
-        # Decoder
         decoder_features = self.forward_decoder(latent, ids, M)
         
-        # Heads
         pred_spec = self.decoder_pred_spec(decoder_features)
         loss_spec = self.forward_loss_spec(imgs, pred_spec, mask)
         
         B, M, N, D = decoder_features.shape
         H_grid, W_grid = self.grid_size
-        # [Fix] Need to transpose correctly for LayerNorm if using Conv2d output
         feat_2d = decoder_features.reshape(B * M, N, D).transpose(1, 2).reshape(B * M, D, H_grid, W_grid)
         
-        # time_reducer: Conv2d -> GELU -> LayerNorm
-        # Conv2d out: (BM, D, 1, W)
-        feat_time_agg = self.time_reducer[0](feat_2d) # Conv2d
-        feat_time_agg = self.time_reducer[1](feat_time_agg) # GELU
+        feat_time_agg = self.time_reducer[0](feat_2d) 
+        feat_time_agg = self.time_reducer[1](feat_time_agg) 
         
-        # Reshape for LayerNorm: (BM, W, D)
         feat_time_agg = feat_time_agg.squeeze(2).transpose(1, 2)
-        feat_time_agg = self.time_reducer[2](feat_time_agg) # LayerNorm
+        feat_time_agg = self.time_reducer[2](feat_time_agg) 
         
         pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M, -1)
         
-        # 传入 mask 计算时域 Loss
         loss_time = self.forward_loss_time(x, pred_time, mask)
         
         loss = loss_spec + self.time_loss_weight * loss_time
