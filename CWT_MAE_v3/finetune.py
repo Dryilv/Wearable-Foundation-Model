@@ -320,6 +320,7 @@ def main():
     parser.add_argument('--patch_size_freq', type=int, default=8)
     parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
     parser.add_argument('--use_factorized_attn', action='store_true', default=True, help="Enable Factorized Sync-Attention")
+    parser.add_argument('--use_diff', action='store_true', help="Use differential channels (d1, d2)")
     
     # [新增] CoT 参数
     parser.add_argument('--use_cot', action='store_true', help="Enable Chain-of-Thought Reasoning Head")
@@ -417,6 +418,7 @@ def main():
         embed_dim=args.embed_dim,
         depth=args.depth,
         num_heads=args.num_heads,
+        use_diff=args.use_diff,
         # Decoder 参数 (虽然会被删除，但初始化 Encoder 时需要)
         decoder_embed_dim=512, 
         decoder_depth=8,
