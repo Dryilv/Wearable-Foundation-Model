@@ -254,7 +254,9 @@ class TF_MAE_Classifier(nn.Module):
 
         # 1. CWT 变换 (B, M, L) -> (B, M, 3, Scales, L)
         # 注意：cwt_wrap 现在支持多通道
-        imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0)
+        # [Fix] 显式传递 use_diff 参数，确保与 Encoder 初始化一致
+        use_diff = getattr(self.encoder_model, 'use_diff', False)
+        imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0, use_diff=use_diff)
         
         # 2. Instance Norm (独立对每个通道、每个样本归一化)
         imgs_f32 = imgs.float()
