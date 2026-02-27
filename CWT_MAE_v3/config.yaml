@@ -100,7 +100,7 @@ model:
   # --- Loss Weighting ---
   # 时域 Loss 权重 (相对于频域 Loss)
   # 新版代码中时域 Loss 仅计算 Mask 部分，数值会变小，0.1 可作为起点，视 wandb 曲线调整
-  time_loss_weight: 0.1
+  time_loss_weight: 0.5
   
   # --- Data Usage ---
   data_ratio: 1.0           # 使用数据的比例 (0.0-1.0)，用于快速测试或少样本训练
