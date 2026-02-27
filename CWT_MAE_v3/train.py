@@ -543,25 +543,29 @@ def main():
             current_mask_ratio = mask_max
 
         # --- Dynamic Learning Rate Scheduling ---
-        # User Request: Pull LR to 1e-4 at epoch 45 to handle increased difficulty
+        # User Request: Resume at epoch 20 and pull LR to 1.2e-4
         if epoch >= 45:
-             # Restart Logic: Treat epoch 45 as the start of a new phase (Phase 2)
-             # Phase 2: Epoch 45-100 (55 epochs)
+             # Restart Logic: Treat epoch 45 as the start of a new phase (Phase 3)
              phase_epochs = total_epochs - 45
              phase_total_steps = phase_epochs * num_steps_per_epoch
-             
-             # Warmup: minimal or none for restart? User asked for "smooth transition" or "briefly pull up".
-             # Let's set a very short warmup (e.g., 1 epoch) to avoid shock, or 0 if "pull up" implies immediate jump.
-             # Given "briefly pull up", a jump is expected.
              phase_warmup_steps = 0 
              
-             # Adjust base_lr to 1e-4 as requested
              current_base_lr = 1.0e-4
              
-             # Override scheduler parameters
              current_total_steps = phase_total_steps
              current_warmup_steps = phase_warmup_steps
              current_lr_start_step = 45 * num_steps_per_epoch
+        elif epoch >= 20:
+             # User Request: Restart at epoch 20, pull LR up to 1.2e-4
+             phase_epochs = 45 - 20 # Or total_epochs - 20 if the epoch 45 rule is removed
+             phase_total_steps = phase_epochs * num_steps_per_epoch
+             phase_warmup_steps = 0 # no warmup needed, jump directly to 1.2e-4
+             
+             current_base_lr = 1.2e-4
+             
+             current_total_steps = phase_total_steps
+             current_warmup_steps = phase_warmup_steps
+             current_lr_start_step = 20 * num_steps_per_epoch
         else:
              current_base_lr = base_lr
              current_total_steps = total_steps

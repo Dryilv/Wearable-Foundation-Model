@@ -35,7 +35,7 @@ train:
   log_interval: 50          # 日志打印间隔 (steps)
   save_freq: 5              # 模型保存间隔 (epochs)
   save_dir: "./checkpoint_768_5channel_flash" # Checkpoint 保存路径
-  resume: ""                # 断点续训路径 (e.g., "./checkpoint/checkpoint_last.pth")
+  resume: "./checkpoint_768_5channel_flash/checkpoint_last.pth"                # 断点续训路径 (e.g., "./checkpoint/checkpoint_last.pth")
 
 # ------------------------------------------------------------------------------
 # 2. Dataset Configuration (数据设置)
