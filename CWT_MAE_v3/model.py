@@ -388,6 +388,117 @@ class CWT_MAE_RoPE(nn.Module):
         
         return x_masked, mask, global_ids_restore, ids_keep
 
+    def mixed_masking(self, x, mask_ratio, M, N_patches):
+        """
+        混合掩码策略 (Mixed Masking Strategy)
+        1. Tubelet Masking (40%): 同步掩码，学习 PTT 和相位差。
+        2. ECG 100% Masking (40%): 跨模态生成，逼迫模型从 PPG 推断 ECG。
+        3. PPG 100% Masking (20%): 反向翻译，增强电-机械耦合理解。
+        """
+        B, total_tokens, D = x.shape
+        # x is (B, M*N_patches, D)
+        N = N_patches
+        
+        # 随机选择策略 (Per Batch)
+        rand_val = torch.rand(1).item()
+        
+        # -------------------------------------------------------
+        # Strategy 1: Tubelet Masking (40%) - Default Behavior
+        # -------------------------------------------------------
+        if rand_val < 0.4:
+            return self.tubelet_masking(x, mask_ratio, M, N_patches) + (M,)
+
+        # -------------------------------------------------------
+        # Strategy 2 & 3: Asymmetric Masking
+        # Strategy 2 (40%): Mask ECG (0) 100%, Keep PPG (1) ~80%
+        # Strategy 3 (20%): Mask PPG (1) 100%, Keep ECG (0) 100%
+        # -------------------------------------------------------
+        
+        # Define target channel and mask ratios
+        if rand_val < 0.8: 
+            # Strategy 2: ECG Masked, PPG Visible
+            # Keep Channel 1 (PPG), Mask Channel 0 (ECG)
+            keep_channel_idx = 1 
+            target_mask_ratio = 0.2 # PPG mask ratio
+            masked_channel_idx = 0
+        else:
+            # Strategy 3: PPG Masked, ECG Visible
+            # Keep Channel 0 (ECG), Mask Channel 1 (PPG)
+            keep_channel_idx = 0
+            target_mask_ratio = 0.0 # ECG mask ratio (Keep all)
+            masked_channel_idx = 1
+            
+        # Extract the kept channel data
+        # x shape: (B, M*N, D) -> View as (B, M, N, D)
+        x_reshaped = x.view(B, M, N, D)
+        x_keep = x_reshaped[:, keep_channel_idx, :, :] # (B, N, D)
+        x_keep = x_keep.reshape(B, 1, N, D) # (B, 1, N, D) for tubelet_masking
+        
+        # Apply Tubelet Masking on the KEPT channel only
+        # Note: We use M=1 here effectively
+        x_masked, mask_keep, ids_restore_keep_local, ids_keep_local = \
+            self.tubelet_masking(x_keep.reshape(B, N, D), target_mask_ratio, M=1, N_patches=N)
+        
+        # x_masked: (B, len_keep, D)
+        # mask_keep: (B, N)
+        # ids_restore_keep_local: (B, N) - Values 0..N-1
+        # ids_keep_local: (B, len_keep) - Values 0..N-1
+        
+        len_keep = x_masked.shape[1]
+        
+        # Construct Global Mask (B, M*N)
+        # Masked Channel is ALL 1s (Fully Masked)
+        # Kept Channel is mask_keep
+        mask_full_ones = torch.ones((B, N), device=x.device)
+        
+        if keep_channel_idx == 0:
+            # Keep 0, Mask 1 -> [mask_keep, ones]
+            mask = torch.cat([mask_keep, mask_full_ones], dim=1)
+        else:
+            # Mask 0, Keep 1 -> [ones, mask_keep]
+            mask = torch.cat([mask_full_ones, mask_keep], dim=1)
+            
+        # Construct Global IDs Restore (B, M*N)
+        # We need to map 2N output positions to the input sequence: [Kept_Tokens (K), Mask_Tokens (2N-K)]
+        # Range [0, K-1] -> Kept tokens
+        # Range [K, 2N-1] -> Mask tokens
+        
+        # We have K = len_keep tokens.
+        # The fully masked channel needs N mask tokens.
+        # The partially kept channel needs N-K mask tokens.
+        # Let's assign indices [K, K+N-1] to the fully masked channel.
+        # And indices [K+N, 2N-1] to the masked part of the kept channel.
+        
+        # ids_restore_keep_local maps [0..N-1] -> [0..N-1] (Local permuted)
+        # In local permutation: 0..K-1 are kept, K..N-1 are masked.
+        
+        # Transformation for Kept Channel Restore IDs:
+        # If val < K: val (Map to kept token)
+        # If val >= K: val + N (Map to second block of mask tokens: K+N .. 2N-1)
+        
+        K = len_keep
+        ids_restore_keep = ids_restore_keep_local.clone()
+        mask_tokens_mask = ids_restore_keep >= K
+        ids_restore_keep[mask_tokens_mask] = ids_restore_keep[mask_tokens_mask] + N
+        
+        # IDs for Fully Masked Channel:
+        # Map to first block of mask tokens: K .. K+N-1
+        # Any permutation works, we use range.
+        ids_restore_masked = torch.arange(K, K + N, device=x.device).unsqueeze(0).expand(B, -1)
+        
+        if keep_channel_idx == 0:
+            # Order: [Keep_Channel, Masked_Channel]
+            global_ids_restore = torch.cat([ids_restore_keep, ids_restore_masked], dim=1)
+        else:
+            # Order: [Masked_Channel, Keep_Channel]
+            global_ids_restore = torch.cat([ids_restore_masked, ids_restore_keep], dim=1)
+            
+        # Effective M for Encoder
+        # Since we only feed ONE channel to the encoder, M_enc = 1
+        M_enc = 1
+        
+        return x_masked, mask, global_ids_restore, ids_keep_local, M_enc
+
     def forward_encoder(self, x, modality_ids=None, mask_ratio=None):
         B, M, C, H, W = x.shape
         
@@ -412,25 +523,32 @@ class CWT_MAE_RoPE(nn.Module):
 
         x = x.view(B, M * N_patches, -1)
 
-        # 3. Tubelet Masking
+        # 3. Mixed Masking
         current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
         if current_mask_ratio == 0.0:
             x_masked = x
             mask = torch.zeros(B, M * N_patches, device=x.device)
             global_ids_restore = torch.arange(M * N_patches, device=x.device).unsqueeze(0).expand(B, -1)
             ids_keep = torch.arange(N_patches, device=x.device).unsqueeze(0).expand(B, -1)
+            M_enc = M
         else:
-            x_masked, mask, global_ids_restore, ids_keep = self.tubelet_masking(x, current_mask_ratio, M, N_patches)
+            # Use Mixed Masking Strategy
+            x_masked, mask, global_ids_restore, ids_keep, M_enc = self.mixed_masking(x, current_mask_ratio, M, N_patches)
 
         # 4. RoPE Position IDs (基于真实的 Time 相对坐标)
         H_grid, W_grid = self.grid_size
         pos_ids = ids_keep % W_grid # (B, len_keep)
+        
+        # [Fix] When M_enc=1 (Asymmetric), ids_keep corresponds to the kept channel's time steps.
+        # This is compatible with RoPE logic.
+        
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids)
         
         # 5. Transformer Blocks
         len_keep = ids_keep.shape[1]
         for blk in self.blocks:
-            x_masked = blk(x_masked, M, len_keep, rope_cos=rope_cos, rope_sin=rope_sin)
+            # Pass effective M (M_enc) to block
+            x_masked = blk(x_masked, M_enc, len_keep, rope_cos=rope_cos, rope_sin=rope_sin)
         x_masked = self.norm(x_masked)
         
         return x_masked, mask, global_ids_restore, M
