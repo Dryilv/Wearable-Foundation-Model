@@ -235,11 +235,12 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         
         # 4. 绘图 (M 行, 3 列)
         fig, axs = plt.subplots(M, 3, figsize=(18, 3 * M), squeeze=False)
-        plt.suptitle(f"Epoch {epoch} Reconstruction (5 Channels)", fontsize=16)
+        plt.suptitle(f"Epoch {epoch} Reconstruction ({M} Channels)", fontsize=16)
         
         # 通道名称示例 (根据实际情况调整)
-        channel_names = ["ECG", "ACC1", "ACC2", "ACC3", "PPG"]
-        if M != 5:
+        # Assuming index 0 is ECG, 1 is PPG (based on dataset logic)
+        channel_names = ["ECG", "PPG"]
+        if M != 2:
             channel_names = [f"Ch {i}" for i in range(M)]
 
         for m in range(M):

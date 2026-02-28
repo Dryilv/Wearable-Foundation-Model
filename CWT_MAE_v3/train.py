@@ -632,28 +632,23 @@ def main():
 
             # 保存可视化
             if vis_batch is not None:
-                # For SingleTowerContrastiveMAE, we need to extract one modality (e.g., PPG) for visualization
-                # vis_batch shape: (B, 2, L)
-                # Take PPG channel (index 1) as an example, or visualize both separately if needed
-                # save_reconstruction_images expects input (B, M, L) or (B, L)
+                # 修复：可视化全部通道 (ECG & PPG)
+                # vis_batch shape: (B, 2, L), 其中 0:ECG, 1:PPG
+                # save_reconstruction_images 接受的输入是 (B, M, L)
                 
-                # Option 1: Visualize PPG
-                vis_input = vis_batch[:, 1:2, :] # (B, 1, L)
-                
-                # Fix: We should use the underlying encoder for visualization, which is a standard CWT_MAE_RoPE
-                # model is DDP(SingleTowerContrastiveMAE) -> model.module.encoder is CWT_MAE_RoPE
-                
+                # 1. 提取 Encoder (CWT_MAE_RoPE)
                 real_model = model.module if hasattr(model, 'module') else model
-                
-                # 确保我们获取的是 encoder
                 if hasattr(real_model, 'encoder'):
                     encoder_model = real_model.encoder
                 else:
-                    encoder_model = real_model # Fallback if model is already CWT_MAE_RoPE
+                    encoder_model = real_model 
 
+                # 2. 传入所有通道进行可视化
+                # 注意：CWT_MAE_RoPE 默认设计是可以处理多通道输入的 (M > 1)
+                # 它会对每个通道分别进行 Mask 和重构
                 save_reconstruction_images(
                     encoder_model, 
-                    vis_input, 
+                    vis_batch,  # 传入完整 (B, 2, L) 数据
                     epoch, 
                     config['train']['save_dir']
                 )
