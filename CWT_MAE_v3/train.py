@@ -632,9 +632,28 @@ def main():
 
             # 保存可视化
             if vis_batch is not None:
+                # For SingleTowerContrastiveMAE, we need to extract one modality (e.g., PPG) for visualization
+                # vis_batch shape: (B, 2, L)
+                # Take PPG channel (index 1) as an example, or visualize both separately if needed
+                # save_reconstruction_images expects input (B, M, L) or (B, L)
+                
+                # Option 1: Visualize PPG
+                vis_input = vis_batch[:, 1:2, :] # (B, 1, L)
+                
+                # Fix: We should use the underlying encoder for visualization, which is a standard CWT_MAE_RoPE
+                # model is DDP(SingleTowerContrastiveMAE) -> model.module.encoder is CWT_MAE_RoPE
+                
+                real_model = model.module if hasattr(model, 'module') else model
+                
+                # 确保我们获取的是 encoder
+                if hasattr(real_model, 'encoder'):
+                    encoder_model = real_model.encoder
+                else:
+                    encoder_model = real_model # Fallback if model is already CWT_MAE_RoPE
+
                 save_reconstruction_images(
-                    model, 
-                    vis_batch, 
+                    encoder_model, 
+                    vis_input, 
                     epoch, 
                     config['train']['save_dir']
                 )
