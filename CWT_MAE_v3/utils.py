@@ -251,22 +251,6 @@ def save_reconstruction_images(model, x_time, epoch, save_dir, modality_ids=None
             axs[m, 0].set_ylabel(channel_names[m] if m < len(channel_names) else f"Ch {m}")
             if m == 0: axs[m, 0].set_title("Original")
             axs[m, 0].grid(True, alpha=0.3)
-        
-        # 4. 绘图 (M 行, 3 列)
-        fig, axs = plt.subplots(M, 3, figsize=(18, 3 * M), squeeze=False)
-        plt.suptitle(f"Epoch {epoch} Reconstruction (5 Channels)", fontsize=16)
-        
-        # 通道名称示例 (根据实际情况调整)
-        channel_names = ["ECG", "ACC1", "ACC2", "ACC3", "PPG"]
-        if M != 5:
-            channel_names = [f"Ch {i}" for i in range(M)]
-
-        for m in range(M):
-            # --- Column 1: Original Signal ---
-            axs[m, 0].plot(orig_signal[m], 'k', lw=1)
-            axs[m, 0].set_ylabel(channel_names[m] if m < len(channel_names) else f"Ch {m}")
-            if m == 0: axs[m, 0].set_title("Original")
-            axs[m, 0].grid(True, alpha=0.3)
 
             # --- Column 2: Masked Input ---
             # 提取该通道对应的 mask 片段
@@ -312,6 +296,6 @@ def save_reconstruction_images(model, x_time, epoch, save_dir, modality_ids=None
 
         plt.tight_layout()
         plt.savefig(os.path.join(vis_dir, f"epoch_{epoch}.png"))
-        plt.close()
+        plt.close(fig)
         
     model.train()
