@@ -13,7 +13,7 @@ train:
   # 如果显存不够，降到 128；如果显存还有剩，大胆开到 512。
   batch_size: 64            
   
-  accum_iter: 1             
+  accum_iter: 16             
 
   # [学习率调整] 配合较大的 Batch Size
   base_lr: 1.5e-4           # 配合 auto_scale_lr，实际 lr ≈ 1.5e-4 * 256 / 256 = 1.5e-4
