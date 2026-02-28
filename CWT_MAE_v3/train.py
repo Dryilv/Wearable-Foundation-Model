@@ -527,58 +527,14 @@ def main():
     for epoch in range(start_epoch, total_epochs):
         train_sampler.set_epoch(epoch)
         
-        # --- Dynamic Mask Ratio Scheduling (Robust Version) ---
-        # Configurable curriculum learning
-        mask_start = config['model'].get('mask_ratio_start_epoch', 5)
-        mask_warmup = config['model'].get('mask_ratio_warmup_epochs', 20)
-        mask_min = config['model'].get('mask_ratio_min', 0.4)
-        mask_max = config['model'].get('mask_ratio_max', 0.75)
-        
-        if epoch < mask_start:
-            # Phase 1: Warmup with easy task
-            current_mask_ratio = mask_min
-        elif epoch < mask_start + mask_warmup:
-            # Phase 2: Linear increase (Curriculum)
-            progress = (epoch - mask_start) / mask_warmup
-            current_mask_ratio = mask_min + (mask_max - mask_min) * progress
-        else:
-            # Phase 3: Hard task (Standard MAE)
-            current_mask_ratio = mask_max
+        # --- Fixed Mask Ratio (No Curriculum) ---
+        current_mask_ratio = config['model'].get('mask_ratio', 0.75)
 
-        # --- Dynamic Learning Rate Scheduling ---
-        # User Request: Resume at epoch 20 and pull LR to 1.2e-4
-        if epoch >= 45:
-             # Restart Logic: Treat epoch 45 as the start of a new phase (Phase 3)
-             phase_epochs = total_epochs - 45
-             phase_total_steps = phase_epochs * num_steps_per_epoch
-             phase_warmup_steps = 0 
-             
-             current_base_lr = 1.0e-4 / (base_lr * eff_batch_size / 256.0 / base_lr if config['train'].get('auto_scale_lr', True) else 1.0)
-             
-             current_total_steps = phase_total_steps
-             current_warmup_steps = phase_warmup_steps
-             current_lr_start_step = 45 * num_steps_per_epoch
-        elif epoch >= 20:
-             # User Request: Restart at epoch 20, pull LR up to 1.2e-4
-             phase_epochs = (45 if total_epochs > 45 else total_epochs) - 20 # Next phase is at 45
-             phase_total_steps = phase_epochs * num_steps_per_epoch
-             phase_warmup_steps = 0 # no warmup needed, jump directly to target
-             
-             # Calculate effective batch size multiplier to target EXACTLY 1.2e-4
-             eff_batch_size = config['train']['batch_size'] * config['train'].get('accum_iter', 1) * (dist.get_world_size() if dist.is_initialized() else 1)
-             auto_scale_factor = eff_batch_size / 256.0 if config['train'].get('auto_scale_lr', True) else 1.0
-             
-             # Divide the target by the auto scale factor so when the scaler multiplies it back, it's correct
-             current_base_lr = 1.2e-4 / auto_scale_factor
-             
-             current_total_steps = phase_total_steps
-             current_warmup_steps = phase_warmup_steps
-             current_lr_start_step = 20 * num_steps_per_epoch
-        else:
-             current_base_lr = base_lr
-             current_total_steps = total_steps
-             current_warmup_steps = warmup_steps
-             current_lr_start_step = 0
+        # --- Standard Learning Rate Scheduling ---
+        current_base_lr = base_lr
+        current_total_steps = total_steps
+        current_warmup_steps = warmup_steps
+        current_lr_start_step = 0
 
         if is_main_process():
             logger.info(f"Epoch {epoch} Configuration: Mask Ratio = {current_mask_ratio:.4f}, Base LR Target = {current_base_lr}")

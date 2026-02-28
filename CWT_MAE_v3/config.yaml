@@ -11,7 +11,7 @@ train:
   
   # --- Batch Size & Memory Optimization ---
   # [显存优化] 压榨 80G 显存
-  batch_size: 40            # 单卡 Batch Size
+  batch_size: 128            # 单卡 Batch Size
   
   # [关键修改] 梯度累积步数
   # 有效 Batch Size = batch_size * accum_iter * num_gpus
@@ -34,8 +34,8 @@ train:
   # --- Logging & Checkpointing ---
   log_interval: 50          # 日志打印间隔 (steps)
   save_freq: 5              # 模型保存间隔 (epochs)
-  save_dir: "./checkpoint_768_5channel_flash" # Checkpoint 保存路径
-  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint_768_5channel_flash/checkpoint_epoch_30.pth"                # 断点续训路径 (e.g., "./checkpoint/checkpoint_last.pth")
+  save_dir: "./checkpoint_256_5channel_flash" # Checkpoint 保存路径
+  resume: ""                # 断点续训路径 (e.g., "./checkpoint/checkpoint_last.pth")
 
 # ------------------------------------------------------------------------------
 # 2. Dataset Configuration (数据设置)
@@ -68,24 +68,18 @@ model:
   patch_size_freq: 8        # 频率维度的 Patch 大小
 
   # --- Transformer Encoder (ViT) ---
-  embed_dim: 768            # Encoder 嵌入维度
+  embed_dim: 256            # Encoder 嵌入维度
   depth: 12                 # Encoder 层数
-  num_heads: 12             # Encoder 注意力头数
+  num_heads: 4              # Encoder 注意力头数
   mlp_rank_ratio: 0.5       # MLP 扩展比例 (Note: Check implementation for usage)
 
   # --- Transformer Decoder (MAE) ---
-  decoder_embed_dim: 512    # Decoder 嵌入维度
+  decoder_embed_dim: 128    # Decoder 嵌入维度
   decoder_depth: 8          # Decoder 层数
-  decoder_num_heads: 16     # Decoder 注意力头数
+  decoder_num_heads: 4      # Decoder 注意力头数
 
-  # --- Masking Strategy (Curriculum Learning) ---
-  # [NEW] 动态 Mask Ratio 策略 (Curriculum Learning)
-  # 初始阶段使用较低的 Mask Ratio 帮助模型快速收敛，然后逐渐增加难度，直到达到目标 Mask Ratio
-  # 配合 Tubelet Masking，0.6 是一个非常好的起点
-  mask_ratio_start_epoch: 5      # 从第 5 个 Epoch 开始增加难度
-  mask_ratio_warmup_epochs: 20   # 持续 20 个 Epoch 线性增加
-  mask_ratio_min: 0.5            # 初始 Mask Ratio (简单模式)
-  mask_ratio_max: 0.75           # 最终目标 Mask Ratio (困难模式)
+  # --- Masking Strategy ---
+  mask_ratio: 0.75          # Mask Ratio
 
   # --- Signal Difference (Optional) ---
   # 是否使用信号差分特征 (d1, d2)
