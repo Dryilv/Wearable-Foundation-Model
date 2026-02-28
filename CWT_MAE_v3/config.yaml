@@ -1,105 +1,80 @@
 # ==============================================================================
-# CWT-MAE Training Configuration
+# CWT-MAE Training Configuration (Optimized for 80GB GPU)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. Training & Optimization (训练与优化)
+# 1. Training & Optimization
 # ------------------------------------------------------------------------------
 train:
-  # --- Training Duration ---
-  epochs: 100               # 总训练轮数
+  epochs: 200               # [建议] MAE 通常需要较长训练周期，100 可能未收敛，建议 200-400
   
-  # --- Batch Size & Memory Optimization ---
-  # [显存优化] 压榨 80G 显存
-  batch_size: 128            # 单卡 Batch Size
+  # [显存优化] 80GB 显卡火力全开
+  # 单塔模式下内部 Batch 会翻倍，但 256 依然很轻松。
+  # 如果显存不够，降到 128；如果显存还有剩，大胆开到 512。
+  batch_size: 256            
   
-  # [关键修改] 梯度累积步数
-  # 有效 Batch Size = batch_size * accum_iter * num_gpus
-  # e.g., 40 * 8 * 1 = 320 (单卡) or 40 * 8 * 8 = 2560 (8卡)
-  accum_iter: 1             # 梯度累积步数，用于增大有效 Batch Size，保证 MAE 预训练的稳定性
+  accum_iter: 1             
 
-  # --- Learning Rate & Scheduler ---
-  base_lr: 1.5e-4           # 基础学习率 (会被 auto_scale_lr 调整)
-  min_lr: 1.0e-6            # 最小学习率 (Cosine Annealing 终点)
-  warmup_epochs: 5          # 预热轮数
-  auto_scale_lr: True       # 是否根据 Batch Size 自动缩放学习率 (Linear Scaling Rule)
+  # [学习率调整] 配合较大的 Batch Size
+  base_lr: 1.5e-4           # 配合 auto_scale_lr，实际 lr ≈ 1.5e-4 * 256 / 256 = 1.5e-4
+  min_lr: 1.0e-6            
+  warmup_epochs: 10         # [建议] 增加预热轮数，保证对比学习初期稳定
+  auto_scale_lr: True       
 
-  # --- Optimizer Regularization ---
-  weight_decay: 0.05        # 权重衰减 (AdamW)
-  clip_grad: 3.0            # 梯度裁剪阈值，防止梯度爆炸
+  weight_decay: 0.05        
+  clip_grad: 3.0            
+  use_amp: True             
 
-  # --- Precision ---
-  use_amp: True             # 是否使用混合精度训练 (Automatic Mixed Precision)
-
-  # --- Logging & Checkpointing ---
-  log_interval: 50          # 日志打印间隔 (steps)
-  save_freq: 5              # 模型保存间隔 (epochs)
-  save_dir: "./checkpoint_256_5channel_flash_l" # Checkpoint 保存路径
-  resume: ""                # 断点续训路径 (e.g., "./checkpoint/checkpoint_last.pth")
+  log_interval: 50          
+  save_freq: 10             # 减少保存频率，节省硬盘
+  save_dir: "./checkpoint_vit_base_contrastive" 
+  resume: ""                
 
 # ------------------------------------------------------------------------------
-# 2. Dataset Configuration (数据设置)
+# 2. Dataset Configuration
 # ------------------------------------------------------------------------------
 data:
-  index_path: "train_index_cleaned.json"  # 数据索引文件路径
-  
-  # [关键修改] 统一对齐到 3000 点
-  signal_len: 3000          # 输入信号长度 (Time steps)
-  
-  num_workers: 16           # DataLoader 工作线程数
-  
-  # --- Sliding Window (Optional) ---
-  use_sliding_window: False # 是否使用滑动窗口切分长信号
-  window_stride: 1500       # 滑动窗口步长 (如果开启，建议设为 signal_len / 2)
+  index_path: "train_index_cleaned.json"
+  signal_len: 3000          
+  num_workers: 16           
+  use_sliding_window: False 
+  window_stride: 1500       
 
 # ------------------------------------------------------------------------------
-# 3. Model Architecture (模型架构)
+# 3. Model Architecture (升级为 ViT-Base 规格)
 # ------------------------------------------------------------------------------
 model:
-  # --- Input Processing (CWT & Patching) ---
-  cwt_scales: 64            # CWT (连续小波变换) 的频带数量 (Frequency dim)
-  use_conv_stem: True       # 是否使用卷积 Stem 替代简单的 Linear Patch Embed
+  # --- Input Processing ---
+  cwt_scales: 64            
+  use_conv_stem: True       
   
-  # [关键修改] 避免 Token 爆炸
-  # Patch Size 设置决定了 Token 数量: (signal_len / patch_size_time) * (cwt_scales / patch_size_freq)
-  # Time=30, Freq=8 -> Tokens = (3000/30) * (64/8) = 100 * 8 = 800 tokens/channel
-  # 既保留了 0.3s 的精细时间分辨率，又将计算量控制在合理范围
-  patch_size_time: 30       # 时间维度的 Patch 大小
-  patch_size_freq: 8        # 频率维度的 Patch 大小
+  # 保持你优秀的 Token 计算逻辑 (800 Tokens)
+  patch_size_time: 30       
+  patch_size_freq: 8        
 
-  # --- Transformer Encoder (ViT) ---
-  embed_dim: 256            # Encoder 嵌入维度
-  depth: 12                 # Encoder 层数
-  num_heads: 4              # Encoder 注意力头数
-  mlp_rank_ratio: 0.5       # MLP 扩展比例 (Note: Check implementation for usage)
+  # --- Transformer Encoder (升级至 ViT-Base) ---
+  # 256 -> 768: 提升特征表达能力，这对跨模态对齐至关重要
+  embed_dim: 768            
+  depth: 12                 
+  num_heads: 12             # 768 / 64 = 12 heads
+  mlp_rank_ratio: 4.0       # [标准] ViT 标准 MLP ratio 是 4.0，0.5 太小了！
 
-  # --- Transformer Decoder (MAE) ---
-  decoder_embed_dim: 128    # Decoder 嵌入维度
-  decoder_depth: 8          # Decoder 层数
-  decoder_num_heads: 4      # Decoder 注意力头数
+  # --- Transformer Decoder ---
+  decoder_embed_dim: 512    # 配合 Encoder 升级
+  decoder_depth: 8          
+  decoder_num_heads: 16     # 512 / 32 = 16 heads
 
   # --- Masking Strategy ---
-  mask_ratio: 0.75          # Mask Ratio
+  mask_ratio: 0.75          
 
-  # --- Signal Difference (Optional) ---
-  # 是否使用信号差分特征 (d1, d2)
-  # True: 3通道 (原始+一阶+二阶), 精度更高但慢; False: 1通道 (原始), 速度极快, 显存占用低
+  # --- Signal Difference ---
   use_diff: True
-  
-  # [关键修改] 差分通道 Loss 权重
-  # 格式: [原始信号权重, 一阶差分权重, 二阶差分权重]
-  # 仅在 use_diff: True 时生效，建议降低差分信号的权重，因为它们含噪较大且难预测
   diff_loss_weight: [1.0, 0.5, 0.1]
 
   # --- Loss Weighting ---
-  # 时域 Loss 权重 (相对于频域 Loss)
-  # 新版代码中时域 Loss 仅计算 Mask 部分，数值会变小，0.1 可作为起点，视 wandb 曲线调整
-  time_loss_weight: 0.5
+  time_loss_weight: 1.0     # [建议] 稍微提高时域权重，因为加入了残差连接，时域重建更重要了
   
-  # --- Data Usage ---
-  data_ratio: 1.0           # 使用数据的比例 (0.0-1.0)，用于快速测试或少样本训练
-
   # --- Contrastive Learning ---
-  proj_dim: 256             # 投影头维度
-  temperature: 0.07         # 对比损失温度系数
-  contrastive_weight: 1.0   # 对比损失权重 (alpha)
+  proj_dim: 256             
+  temperature: 0.07         
+  contrastive_weight: 1.0
