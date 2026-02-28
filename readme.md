@@ -1,65 +1,102 @@
-# CWT-MAE 模型版本对比说明111
+# CWT-MAE-RoPE: Continuous Wavelet Transform Masked Autoencoder
 
-本项目包含两个版本的 CWT-MAE (Continuous Wavelet Transform Masked Autoencoder) 模型实现。以下是 `CWT_MAE_v1` 和 `CWT_MAE_v2` 的详细区别对比。
+这是一个结合了连续小波变换 (CWT) 和掩码自编码器 (MAE) 的先进时间序列预训练模型。该模型专为处理多通道时间序列信号设计，通过结合时频分析与 Transformer 架构，实现了对信号的高效表征学习。
 
-## 核心区别总结
+## 核心特性 (Key Features)
 
-| 特性 | CWT_MAE_v1 | CWT_MAE_v2 |
-| :--- | :--- | :--- |
-| **定位** | **多通道联合建模** (Multi-Channel Joint) | **长序列与特定任务优化** (Long-Sequence & Robust) |
-| **输入处理** | 支持 `(B, M, L)` 多通道输入，通道间共享 Transformer 但保留独立性 | 侧重 `(B, L)` 单通道或通道独立处理，针对长序列优化 |
-| **Patch Embedding** | **Decomposed (Conv Stem)**: 支持卷积 Stem (Conv-BN-GELU) 增强局部特征 | **Fixed Standard Conv**: 修正为标准 Conv2d，优化显存占用，避免大张量溢出 |
-| **信号长度** | 默认 **1000** (支持滑动窗口切片) | 默认 **3000** (长序列建模) |
-| **数据增强** | 基础 Z-Score 归一化，随机裁剪 | **PPG 专用增强** (翻转、缩放、基线漂移、带通滤波、Robust Norm) |
-| **显存/效率** | 适合短序列、多通道数据 | 适合长序列、大规模预训练，内存更安全 |
+- **内置 CWT 变换**: 使用 Ricker 小波将 1D 信号转换为 2D 时频图 (Scalogram)，无需离线预处理。
+- **因子化注意力机制 (Factorized Attention)**: 编码器采用 `TrueFactorizedBlock`，将注意力分解为 **Time Attention** (时间维) 和 **Channel Attention** (通道维)，有效降低计算复杂度并捕捉跨通道相关性。
+- **旋转位置编码 (RoPE)**: 引入 Rotary Embedding 提升长序列建模能力。
+- **双重重建任务**: 同时重建 **时频图 (Spectrogram)** 和 **原始时域信号 (Time-domain signal)**，确保模型兼顾频域特征和时域波形。
+- **Tubelet Masking**: 采用多通道同步掩码策略，防止信息泄漏，特别适合学习通道间的相位关系（如 PTT）。
 
----
+## 架构概览 (Architecture)
 
-## 1. 模型架构差异 (`model.py`)
+1.  **Input**: 原始时间序列信号 `(Batch, Channels, Length)`。
+2.  **Preprocessing**: `cwt_wrap` 执行 CWT 变换及归一化 -> 输出 `(Batch, M, Scales, Length)`。
+3.  **Patch Embed**: 将时频图切分为 Patch。
+4.  **Encoder**: 
+    - 叠加 `TrueFactorizedBlock`。
+    - 使用 RoPE 和 Tubelet Masking。
+5.  **Decoder**: 
+    - 标准 Transformer Block。
+    - 仅处理被 Mask 的区域（训练时）或全部区域。
+6.  **Heads**:
+    - `decoder_pred_spec`: 重建时频图 Patch。
+    - `time_pred`: 通过 `time_reducer` 聚合特征后重建原始信号。
 
-### Patch Embedding 策略
-*   **v1**: 提供了 `use_conv_stem` 选项。开启时使用多层卷积 (Conv-BN-GELU-Conv) 作为 Stem，有助于提取更细粒度的局部波形特征。
-*   **v2**: 采用了 **内存安全版 (Memory-Safe)** 的 Patch Embedding。移除了复杂的分解卷积，直接使用标准的 `nn.Conv2d` 进行下采样。
-    *   *原因*: v1 的分解版本在处理超长序列或大 Batch 时会产生巨大的中间张量 (如 `B x 768 x 64 x 3000`)，导致显存溢出或索引错误。v2 解决了这个问题。
+## 环境依赖 (Requirements)
 
-### RoPE (旋转位置编码)
-*   **v1**: 针对多通道 (`M`) 设计了特殊的 `pos_ids` 构建逻辑。不同通道在同一时刻共享相同的 RoPE 旋转角度，强调了时间对齐的物理意义。
-*   **v2**: 简化了 `pos_ids` 生成逻辑，适配标准的 ViT 输入格式。
+- Python 3.8+
+- PyTorch 1.10+ (推荐 2.0+ 以支持 `torch.compiler`)
 
-### 输入维度
-*   **v1**: 显式处理 `(B, M, L)`，在 Encoder 前将 `M` 个通道展平到 Sequence 维度 (`B * M`)，并在输出时还原。
-*   **v2**: 逻辑更接近标准 ViT，通常处理 `(B, L)` 或将通道视为 Batch 的一部分。
+## 快速开始 (Quick Start)
 
----
+### 1. 初始化模型
 
-## 2. 数据处理与增强 (`dataset.py`)
+```python
+import torch
+from model import CWT_MAE_RoPE
 
-### v1: 通用生理信号加载
-*   **滑动窗口**: 支持 `stride` 参数，可以从长信号中切出多个重叠样本 (Overlapping Windows)。
-*   **基础过滤**: 基于最大绝对值 (`max_abs_value`) 和标准差阈值过滤异常样本。
-*   **归一化**: 使用标准的 `(x - mean) / std` Z-Score 归一化。
+# 定义模型参数
+model = CWT_MAE_RoPE(
+    signal_len=3000,        # 输入信号长度
+    cwt_scales=64,          # CWT 的尺度数量 (对应图像高度)
+    patch_size_time=50,     # 时间维度的 Patch 大小
+    patch_size_freq=4,      # 频率维度的 Patch 大小
+    embed_dim=768,          # 编码器维度
+    depth=12,               # 编码器层数
+    num_heads=12,           # 编码器头数
+    decoder_embed_dim=512,  # 解码器维度
+    decoder_depth=8,        # 解码器层数
+    mask_ratio=0.75,        # 掩码比例
+    use_diff=False          # 是否使用差分通道增强
+)
 
-### v2: 鲁棒性与特定任务 (PPG)
-*   **PPG 专用增强 (`dataset_cls.py`)**:
-    *   **垂直翻转**: 模拟传感器佩戴方向差异。
-    *   **基线漂移**: 加入正弦波噪声模拟呼吸干扰。
-    *   **带通滤波**: 0.5-8Hz 巴特沃斯滤波，去除高频肌电噪声。
-    *   **Robust Norm**: 使用四分位距 (IQR) 进行归一化，比 Z-Score 对异常值更鲁棒。
-*   **长序列支持**: 默认配置为 30秒 (3000点) 信号，移除了滑动窗口逻辑，专注于长时程特征学习。
+# 打印模型结构
+print(model)
+```
 
----
+### 2. 前向传播 (Forward Pass)
 
-## 3. 配置参数 (`config.yaml`)
+```python
+# 创建模拟输入数据 (Batch_Size=2, Channels=1, Length=3000)
+# 注意：如果 use_diff=False，输入可以是 (B, L) 或 (B, 1, L)
+x = torch.randn(2, 3000) 
 
-| 参数 | v1 (默认) | v2 (默认) | 说明 |
+# 前向传播
+loss, loss_dict, pred_spec, pred_time, imgs, mask = model(x)
+
+print(f"Total Loss: {loss.item()}")
+print(f"Spec Loss: {loss_dict['loss_spec'].item()}")
+print(f"Time Loss: {loss_dict['loss_time'].item()}")
+print(f"Predicted Spectrogram Shape: {pred_spec.shape}")
+print(f"Predicted Time Signal Shape: {pred_time.shape}")
+```
+
+## 参数说明 (Arguments)
+
+| 参数名 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `signal_len` | 1000 | 3000 | v2 训练序列更长 |
-| `patch_size_time` | 25 | 50 | v2 使用更大的 Patch 以适配长序列 |
-| `batch_size` | 128 | 256 | v2 优化后支持更大 Batch |
-| `use_conv_stem` | True | (移除) | v1 强调局部特征，v2 强调显存效率 |
-| `mlp_rank_ratio` | 0.5 | 0.5 | 两者均使用 Tensorized Linear 压缩参数 |
+| `signal_len` | int | 3000 | 输入信号的时间步长度 |
+| `cwt_scales` | int | 64 | CWT 变换的尺度数（生成图像的高度） |
+| `patch_size_time` | int | 50 | Patch 在时间轴上的长度 |
+| `patch_size_freq` | int | 4 | Patch 在频率轴上的长度 |
+| `embed_dim` | int | 768 | Encoder 的嵌入维度 |
+| `depth` | int | 12 | Encoder 的 Transformer 层数 |
+| `mask_ratio` | float | 0.75 | 预训练时的掩码比例 |
+| `time_loss_weight` | float | 1.0 | 时域重建损失的权重 |
+| `use_diff` | bool | False | 是否计算一阶/二阶差分作为额外通道 |
 
-## 建议使用场景
+## 损失函数 (Loss Function)
 
-*   **选择 v1**: 如果你的数据是**多通道同步信号** (如 12导联 ECG, 多通道 EEG)，且显存允许，v1 的 Conv Stem 和多通道 RoPE 设计可能带来更好的细节捕捉能力。
-*   **选择 v2**: 如果你需要处理**长序列** (如 30秒 PPG/ECG)，或者显存受限，或者进行**下游分类任务** (特别是 PPG)，v2 的内存优化和强大的数据增强模块是更好的选择。
+总损失由两部分组成：
+```python
+Loss = Loss_Spec + time_loss_weight * Loss_Time
+```
+1.  **Loss_Spec**: 预测的时频图 Patch 与真实 CWT 结果之间的 MSE Loss（仅计算被 Mask 的部分）。
+2.  **Loss_Time**: 预测的时域信号与归一化后的原始信号之间的 MSE Loss。
+
+## 许可证 (License)
+
+MIT License
