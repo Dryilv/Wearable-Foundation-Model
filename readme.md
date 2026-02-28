@@ -97,6 +97,53 @@ Loss = Loss_Spec + time_loss_weight * Loss_Time
 1.  **Loss_Spec**: 预测的时频图 Patch 与真实 CWT 结果之间的 MSE Loss（仅计算被 Mask 的部分）。
 2.  **Loss_Time**: 预测的时域信号与归一化后的原始信号之间的 MSE Loss。
 
+
+## 下游任务微调 (Downstream Fine-tuning)
+
+本仓库提供了完善的下游分类任务微调支持，封装在 `TF_MAE_Classifier` 类中。支持 **隐式思维链 (Latent Reasoning/CoT)** 和 **ArcFace 度量学习** 等高级特性。
+
+### 1. 微调模型架构
+
+微调模型 (`model_finetune.py`) 基于预训练的 Encoder，并移除 Decoder，接上特定的任务头：
+
+- **Encoder**: 加载预训练权重的 `CWT_MAE_RoPE` (冻结或全参数微调)。
+- **Head Options**:
+    - **Linear Head**: 标准的线性分类头 (Global Average Pooling -> Linear)。
+    - **Latent Reasoning Head (CoT)**: 使用一组可学习的 "Reasoning Tokens" 通过 Cross-Attention 聚合特征，模拟隐式推理过程，提升复杂信号分类性能。
+    - **ArcFace Head**: 用于度量学习，增大类间距离，减小类内距离，适合细粒度分类或开集识别。
+
+### 2. 运行微调
+
+使用 `finetune.py` 脚本启动单机多卡 (DDP) 微调。
+
+#### 示例命令
+
+```bash
+torchrun --nproc_per_node=4 finetune.py \
+    --data_root "./data/downstream_dataset" \
+    --split_file "./data/split.json" \
+    --pretrained_path "./checkpoints/mae_pretrain.pth" \
+    --save_dir "./checkpoints_finetune" \
+    --num_classes 2 \
+    --batch_size 32 \
+    --epochs 50 \
+    --lr 1e-4 \
+    --use_cot \
+    --num_reasoning_tokens 16 \
+    --channel_policy "default_5ch"
+```
+
+#### 关键参数
+
+| 参数名 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `--pretrained_path` | str | 预训练模型权重路径 (.pth) |
+| `--use_cot` | bool | 启用 Latent Reasoning Head (Chain-of-Thought) |
+| `--num_reasoning_tokens` | int | CoT 模式下的推理 Token 数量 (默认 16) |
+| `--use_arcface` | bool | 启用 ArcFace Loss (需配合特定 Loss 使用) |
+| `--channel_policy` | str | 数据通道策略: `default_5ch` (全量), `ppg_only`, `ecg_ppg` |
+| `--clean_indices_path` | str | (可选) 包含清洗后样本索引的 .npy 文件路径 |
+
 ## 许可证 (License)
 
 MIT License

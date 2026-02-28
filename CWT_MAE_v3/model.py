@@ -1,11 +1,10 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
 # ===================================================================
-# 1. CWT 模块 (保持不变，非常优秀的特征工程)
+# 1. CWT 模块 (保持不变，优秀的特征工程)
 # ===================================================================
 @torch.compiler.disable
 def create_ricker_wavelets(points, scales):
@@ -57,7 +56,6 @@ def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0, use_diff=True):
         
         signals = torch.stack([base, d1_cut, d2_cut], dim=1) 
     else:
-        # 极速模式：仅使用原始信号，移除一阶和二阶差分
         base = x_flat
         signals = base.unsqueeze(1) # (BM, 1, L)
         
@@ -108,6 +106,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 class DecomposedPatchEmbed(nn.Module):
+    """处理 2D CWT 图像的 Patch Embedding"""
     def __init__(self, img_size=(64, 500), patch_size=(4, 50), in_chans=3, embed_dim=768, norm_layer=None):
         super().__init__()
         self.img_size = img_size
@@ -120,6 +119,24 @@ class DecomposedPatchEmbed(nn.Module):
     def forward(self, x):
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+class RawSignalPatchEmbed(nn.Module):
+    """
+    【新增】处理 1D 原始信号的 Patch Embedding
+    将原始信号切分为与 CWT 时间步完全对齐的 Patch
+    """
+    def __init__(self, patch_size_time=50, embed_dim=768, norm_layer=None):
+        super().__init__()
+        # 使用 1D 卷积进行无重叠切分，步长与 CWT 的时间维度 patch_size 保持一致
+        self.proj = nn.Conv1d(1, embed_dim, kernel_size=patch_size_time, stride=patch_size_time)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+
+    def forward(self, x):
+        # Input: (B*M, 1, L)
+        x = self.proj(x)              # -> (B*M, D, W_grid)
+        x = x.transpose(1, 2)         # -> (B*M, W_grid, D)
         x = self.norm(x)
         return x
 
@@ -148,13 +165,9 @@ class RoPEAttention(nn.Module):
         return x
 
 # ===================================================================
-# 3. 【SOTA 核心】真正的时空因子化 Block (已修复 RoPE 适配)
+# 3. 时空因子化 Block
 # ===================================================================
 class TrueFactorizedBlock(nn.Module):
-    """
-    SOTA 架构：Time Attention -> Temporal Smoothing -> Cross-Channel Attention
-    完美解决 PTT (脉搏传导时间) 延迟问题，且计算复杂度从 O((MN)^2) 降至 O(M*N^2 + N*M^2)
-    """
     def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm_time = norm_layer(dim)
@@ -179,8 +192,6 @@ class TrueFactorizedBlock(nn.Module):
         # --- 1. Time Attention ---
         x_time = x.view(B * M, N, D)
         
-        # [FIX: 智能 RoPE 适配]
-        # 如果 rope_cos 已经是 B*M (非同步掩码)，则不 repeat；如果是 B (同步掩码)，则 repeat
         if rope_cos is not None and rope_sin is not None:
             cos_t = rope_cos if rope_cos.shape[0] == B * M else rope_cos.repeat_interleave(M, dim=0)
             sin_t = rope_sin if rope_sin.shape[0] == B * M else rope_sin.repeat_interleave(M, dim=0)
@@ -190,18 +201,13 @@ class TrueFactorizedBlock(nn.Module):
         x_time = x_time + self.time_attn(self.norm_time(x_time), cos_t, sin_t)
         
         # --- 2. Cross-Channel Attention ---
+        # 在单塔对比学习模式下，M=1，此部分会自动跳过，符合预期
         if M > 1:
             x_c = x_time.view(B, M, N, D)
-            
-            # 局部时间平滑 (融合相邻时间步特征)
-            x_smooth = x_c.view(B * M, N, D).transpose(1, 2) # (B*M, D, N)
+            x_smooth = x_c.view(B * M, N, D).transpose(1, 2) 
             x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).view(B, M, N, D)
-            
-            # 跨通道交互 (把时间压入 Batch)
             x_channel = x_smooth.transpose(1, 2).reshape(B * N, M, D)
             attn_out = self.channel_attn(self.norm_channel(x_channel))
-            
-            # 残差连接 (加在平滑前的特征上)
             x_c = x_c + attn_out.view(B, N, M, D).transpose(1, 2)
             x = x_c.reshape(B, MN, D)
         else:
@@ -212,7 +218,6 @@ class TrueFactorizedBlock(nn.Module):
         return x
 
 class Block(nn.Module):
-    # Decoder 使用的标准 Block
     def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -228,7 +233,7 @@ class Block(nn.Module):
         return x
 
 # ===================================================================
-# 4. 主模型: SOTA CWT-MAE (包含混合掩码策略)
+# 4. 核心骨干网络: CWT-MAE (带残差融合)
 # ===================================================================
 class CWT_MAE_RoPE(nn.Module):
     def __init__(
@@ -248,7 +253,7 @@ class CWT_MAE_RoPE(nn.Module):
         time_loss_weight=1.0,
         use_diff=False,
         diff_loss_weight=None,
-        max_modalities=16
+        max_modalities=16 # 单塔模式下 M=1
     ):
         super().__init__()
         self.mask_ratio = mask_ratio
@@ -258,19 +263,15 @@ class CWT_MAE_RoPE(nn.Module):
         self.use_diff = use_diff
         
         if diff_loss_weight is None:
-            self.diff_loss_weight = [1.0, 1.0, 1.0] if use_diff else [1.0]
+            self.diff_loss_weight =[1.0, 1.0, 1.0] if use_diff else [1.0]
         else:
             self.diff_loss_weight = diff_loss_weight
-        
-        expected_chans = 3 if use_diff else 1
-        if len(self.diff_loss_weight) != expected_chans:
-            print(f"Warning: diff_loss_weight length {len(self.diff_loss_weight)} != expected {expected_chans}. Using default.")
-            self.diff_loss_weight = [1.0] * expected_chans
             
         self.register_buffer('channel_loss_weights', torch.tensor(self.diff_loss_weight).view(1, 1, 1, -1))
         
         in_chans = 3 if use_diff else 1
         
+        # 2D CWT Patch Embedder
         self.patch_embed = DecomposedPatchEmbed(
             img_size=(cwt_scales, signal_len),
             patch_size=(patch_size_freq, patch_size_time),
@@ -279,6 +280,13 @@ class CWT_MAE_RoPE(nn.Module):
         )
         self.num_patches = self.patch_embed.num_patches
         self.grid_size = self.patch_embed.grid_size 
+
+        # 【新增】1D Raw Signal Patch Embedder
+        self.raw_patch_embed = RawSignalPatchEmbed(
+            patch_size_time=patch_size_time,
+            embed_dim=embed_dim,
+            norm_layer=norm_layer
+        )
 
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         
@@ -328,7 +336,6 @@ class CWT_MAE_RoPE(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     def tubelet_masking(self, x, mask_ratio, M, N_patches):
-        """【SOTA】管道掩码：强制所有通道在同一时间步被 Mask，杜绝信息泄漏"""
         B, _, D = x.shape
         H_grid, W_grid = self.grid_size
         len_keep_w = int(W_grid * (1 - mask_ratio))
@@ -364,25 +371,51 @@ class CWT_MAE_RoPE(nn.Module):
         return x_masked, mask, global_ids_restore, ids_keep
 
     def mixed_masking(self, x, mask_ratio, M, N_patches):
-        """
-        [MODIFIED] 仅保留 Tubelet Masking：同步掩码，学习 PTT 和相位差。
-        """
         return self.tubelet_masking(x, mask_ratio, M, N_patches) + (M,)
 
-    def forward_encoder(self, x, mask_ratio=None):
-        B, M, C, H, W = x.shape
+    # 【核心修改】forward_encoder 增加残差融合逻辑
+    def forward_encoder(self, x_raw, imgs, mask_ratio=None):
+        B, M, C, H, W = imgs.shape
         
-        x = x.view(B * M, C, H, W)
-        x = self.patch_embed(x) 
-        x = x.view(B, M, -1, x.shape[-1]) 
+        # 1. CWT 特征提取
+        x_cwt = imgs.view(B * M, C, H, W)
+        x_cwt = self.patch_embed(x_cwt) # (B*M, H*W, D)
+        
+        # 2. 原始信号处理
+        if x_raw.dim() == 2:
+            x_raw = x_raw.unsqueeze(1)  
+        elif x_raw.dim() == 3 and x_raw.shape[1] != 1 and x_raw.shape[0] == B:
+            x_raw = x_raw.view(B * M, 1, -1)
+        elif x_raw.dim() == 3 and x_raw.shape[1] == M:
+            x_raw = x_raw.view(B * M, 1, -1)
+        else:
+            x_raw = x_raw.reshape(B * M, 1, -1)
+            
+        # 实例归一化，防止原始信号数值过大
+        mean_raw = x_raw.mean(dim=-1, keepdim=True)
+        std_raw = torch.clamp(x_raw.std(dim=-1, keepdim=True), min=1e-5)
+        x_raw_norm = (x_raw - mean_raw) / std_raw
+        
+        # 1D 特征提取
+        x_raw_embed = self.raw_patch_embed(x_raw_norm) # (B*M, W_grid, D)
+        
+        # 3. 广播式残差融合 (Broadcasted Residual Connection)
+        H_grid, W_grid = self.grid_size
+        D = x_cwt.shape[-1]
+        
+        x_cwt_2d = x_cwt.view(B * M, H_grid, W_grid, D)
+        x_raw_2d = x_raw_embed.unsqueeze(1) # (B*M, 1, W_grid, D)
+        
+        # 广播相加：1D 特征复制到所有频率带
+        x_fused = x_cwt_2d + x_raw_2d 
+        x = x_fused.view(B, M, -1, D) 
         N_patches = x.shape[2]
 
-        # 1. Add Time Position Embeddings
+        # 4. 位置编码
         x = x + self.pos_embed.unsqueeze(1)
-
         x = x.view(B, M * N_patches, -1)
 
-        # 2. Mixed Masking
+        # 5. Masking
         current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
         if current_mask_ratio == 0.0:
             x_masked = x
@@ -393,24 +426,18 @@ class CWT_MAE_RoPE(nn.Module):
         else:
             x_masked, mask, global_ids_restore, ids_keep, M_enc = self.mixed_masking(x, current_mask_ratio, M, N_patches)
 
-        # 4. RoPE Position IDs (基于真实的 Time 相对坐标)
-        H_grid, W_grid = self.grid_size
-        
-        # [FIX: 完美适配 2D/3D ids_keep]
+        # 6. RoPE
         is_async = (ids_keep.dim() == 3)
         if is_async:
-            # Async Masking: ids_keep is (B, M, len_keep)
-            pos_ids_flat = (ids_keep % W_grid).view(B * M_enc, -1) # (B*M, len_keep)
+            pos_ids_flat = (ids_keep % W_grid).view(B * M_enc, -1) 
         else:
-            # Sync Masking or Asymmetric: ids_keep is (B, len_keep)
-            pos_ids_flat = (ids_keep % W_grid) # (B, len_keep)
+            pos_ids_flat = (ids_keep % W_grid) 
             
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids_flat)
         
-        # 5. Transformer Blocks
+        # 7. Transformer Blocks
         len_keep = ids_keep.shape[-1]
         for blk in self.blocks:
-            # 统一传入 M_enc，Block 内部会自动处理 RoPE 的形状并执行跨通道交互
             x_masked = blk(x_masked, M_enc, len_keep, rope_cos=rope_cos, rope_sin=rope_sin)
         x_masked = self.norm(x_masked)
         
@@ -501,16 +528,16 @@ class CWT_MAE_RoPE(nn.Module):
 
     def forward(self, x, mask_ratio=None):
         imgs = self.prepare_tokens(x)
-
-        latent, mask, ids, M = self.forward_encoder(imgs, mask_ratio=mask_ratio)
+        # 传入 x (原始信号) 和 imgs (CWT)
+        latent, mask, ids, M = self.forward_encoder(x, imgs, mask_ratio=mask_ratio)
         decoder_features = self.forward_decoder(latent, ids, M)
         
         pred_spec = self.decoder_pred_spec(decoder_features)
         loss_spec = self.forward_loss_spec(imgs, pred_spec, mask)
         
-        B, M, N, D = decoder_features.shape
+        B, M_dec, N, D = decoder_features.shape
         H_grid, W_grid = self.grid_size
-        feat_2d = decoder_features.reshape(B * M, N, D).transpose(1, 2).reshape(B * M, D, H_grid, W_grid)
+        feat_2d = decoder_features.reshape(B * M_dec, N, D).transpose(1, 2).reshape(B * M_dec, D, H_grid, W_grid)
         
         feat_time_agg = self.time_reducer[0](feat_2d) 
         feat_time_agg = self.time_reducer[1](feat_time_agg) 
@@ -518,7 +545,7 @@ class CWT_MAE_RoPE(nn.Module):
         feat_time_agg = feat_time_agg.squeeze(2).transpose(1, 2)
         feat_time_agg = self.time_reducer[2](feat_time_agg) 
         
-        pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M, -1)
+        pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M_dec, -1)
         
         loss_time = self.forward_loss_time(x, pred_time, mask)
         
@@ -526,3 +553,100 @@ class CWT_MAE_RoPE(nn.Module):
         loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
 
         return loss, loss_dict, pred_spec, pred_time, imgs, mask
+
+
+# ===================================================================
+# 5. 【新增】单塔对比学习包装器 (Single-Tower Contrastive Wrapper)
+# ===================================================================
+class SingleTowerContrastiveMAE(nn.Module):
+    """
+    方案一：单塔权重共享 + 批次内对比学习
+    使用同一个 CWT_MAE_RoPE 骨干网络同时处理 PPG 和 ECG，并在隐空间对齐它们。
+    """
+    def __init__(self, base_model_config, proj_dim=256, temperature=0.07, alpha=1.0):
+        super().__init__()
+        # 强制 M=1，因为我们在 Batch 维度拼接信号，而不是通道维度
+        base_model_config['max_modalities'] = 1
+        self.encoder = CWT_MAE_RoPE(**base_model_config)
+        
+        embed_dim = base_model_config.get('embed_dim', 768)
+        
+        # 对比学习的非线性投影头 (Projection Head)
+        self.proj_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, proj_dim)
+        )
+        self.temperature = temperature
+        self.alpha = alpha # 对比损失的权重 (控制 MAE 重建和对比对齐的比例)
+
+    def forward(self, x_ppg, x_ecg, mask_ratio=None):
+        """
+        训练时的前向传播
+        x_ppg: (B, L) 或 (B, 1, L)
+        x_ecg: (B, L) 或 (B, 1, L)
+        """
+        if x_ppg.dim() == 2: x_ppg = x_ppg.unsqueeze(1)
+        if x_ecg.dim() == 2: x_ecg = x_ecg.unsqueeze(1)
+        
+        B = x_ppg.shape[0]
+        
+        # 1. 在 Batch 维度拼接，形成 (2B, 1, L) 的输入
+        x_both = torch.cat([x_ppg, x_ecg], dim=0) 
+        
+        # 2. 计算 MAE 重建损失 (带有 Mask)
+        # 这保证了模型依然能学到信号的底层细节
+        loss_mae, loss_dict_mae, _, _, _, _ = self.encoder(x_both, mask_ratio=mask_ratio)
+        
+        # 3. 提取全局特征用于对比学习 (不带 Mask，保证特征完整性)
+        # 准备 CWT tokens
+        imgs_both = self.encoder.prepare_tokens(x_both)
+        # 提取特征 (mask_ratio=0.0)
+        latent, _, _, _ = self.encoder.forward_encoder(x_both, imgs_both, mask_ratio=0.0) 
+        # latent shape: (2B, N_patches, D)
+        
+        # 全局平均池化 (Global Average Pooling) 得到全局表征
+        global_feat = latent.mean(dim=1) # (2B, D)
+        
+        # 投影到对比空间并归一化
+        z = self.proj_head(global_feat) # (2B, proj_dim)
+        z = F.normalize(z, dim=-1)
+        
+        # 切分回 PPG 和 ECG 的特征
+        z_ppg, z_ecg = z.chunk(2, dim=0) # 各自 shape: (B, proj_dim)
+        
+        # 4. 计算 InfoNCE 对比损失 (双向)
+        # PPG 找 ECG
+        logits_pe = torch.matmul(z_ppg, z_ecg.T) / self.temperature
+        # ECG 找 PPG
+        logits_ep = torch.matmul(z_ecg, z_ppg.T) / self.temperature
+        
+        labels = torch.arange(B, device=z.device)
+        loss_nce_pe = F.cross_entropy(logits_pe, labels)
+        loss_nce_ep = F.cross_entropy(logits_ep, labels)
+        
+        # 双向对比损失求平均
+        loss_contrastive = (loss_nce_pe + loss_nce_ep) / 2
+        
+        # 5. 计算总损失
+        total_loss = loss_mae + self.alpha * loss_contrastive
+        
+        loss_dict = {
+            'loss_total': total_loss,
+            'loss_mae': loss_mae,
+            'loss_contrastive': loss_contrastive,
+            **loss_dict_mae
+        }
+        
+        return total_loss, loss_dict
+
+    def extract_features(self, x):
+        """
+        推理/下游任务微调时使用：仅输入单模态信号 (如仅 PPG)
+        返回对齐后的全局特征
+        """
+        if x.dim() == 2: x = x.unsqueeze(1)
+        imgs = self.encoder.prepare_tokens(x)
+        latent, _, _, _ = self.encoder.forward_encoder(x, imgs, mask_ratio=0.0)
+        global_feat = latent.mean(dim=1)
+        return global_feat

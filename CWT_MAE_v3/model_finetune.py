@@ -248,33 +248,15 @@ class TF_MAE_Classifier(nn.Module):
         # 兼容单通道输入 (B, L) -> (B, 1, L)
         if x.dim() == 2: x = x.unsqueeze(1)
 
-        # 1. CWT 变换 (B, M, L) -> (B, M, 3, Scales, L)
-        # 注意：cwt_wrap 现在支持多通道
-        # [Fix] 显式传递 use_diff 参数，确保与 Encoder 初始化一致
-        use_diff = getattr(self.encoder_model, 'use_diff', False)
-        imgs = cwt_wrap(x, num_scales=self.encoder_model.cwt_scales, lowest_scale=0.1, step=1.0, use_diff=use_diff)
-        
-        # 2. Instance Norm (独立对每个通道、每个样本归一化)
-        imgs_f32 = imgs.float()
-        # mean/std over (H, W) -> (B, M, 3, 1, 1)
-        mean = imgs_f32.mean(dim=(3, 4), keepdim=True)
-        std = imgs_f32.std(dim=(3, 4), keepdim=True)
-        std = torch.clamp(std, min=1e-5)
-        imgs = (imgs_f32 - mean) / std
-        
-        # 数值鲁棒性增强：防止 CWT 产生的极端值引发梯度爆炸
-        imgs = torch.nan_to_num(imgs, nan=0.0, posinf=100.0, neginf=-100.0)
-        imgs = torch.clamp(imgs, min=-100.0, max=100.0)
-
-        # 确保输入数据类型与模型权重一致
-        target_dtype = next(self.encoder_model.parameters()).dtype
-        imgs = imgs.to(dtype=target_dtype)
+        # 1. Prepare Tokens (CWT + Normalization)
+        # 使用 encoder 自带的 prepare_tokens 方法，保持逻辑一致
+        imgs = self.encoder_model.prepare_tokens(x)
 
         # 3. Forward Encoder
-        # 新版 forward_encoder 返回: x, mask, ids, M
+        # 新版 forward_encoder 需要传入原始信号 x 用于 1D 特征融合
         # x 的形状是 (B, M*N_patches + 1, D)
         self.encoder_model.mask_ratio = 0.0
-        latent, _, _, _ = self.encoder_model.forward_encoder(imgs)
+        latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs)
         
         # 4. 提取特征
         # patch_tokens: (B, M*N_patches, D)

@@ -49,7 +49,7 @@ def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, e
         # forward_encoder 返回: x, mask, ids, M
         # x: (B, M*N + 1, D)
         imgs = model.module.prepare_tokens(dummy_batch) if hasattr(model, 'module') else model.prepare_tokens(dummy_batch)
-        latent, _, _, _ = model.module.forward_encoder(imgs) if hasattr(model, 'module') else model.forward_encoder(imgs)
+        latent, _, _, _ = model.module.forward_encoder(dummy_batch, imgs) if hasattr(model, 'module') else model.forward_encoder(dummy_batch, imgs)
         embed_dim = latent.shape[-1]
         
     probe = LinearProbe(embed_dim, num_classes).to(device)
@@ -73,7 +73,7 @@ def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, e
             
             with torch.no_grad():
                 imgs = model.module.prepare_tokens(batch) if hasattr(model, 'module') else model.prepare_tokens(batch)
-                latent, _, _, _ = model.module.forward_encoder(imgs) if hasattr(model, 'module') else model.forward_encoder(imgs)
+                latent, _, _, _ = model.module.forward_encoder(batch, imgs) if hasattr(model, 'module') else model.forward_encoder(batch, imgs)
                 # Global Average Pooling over tokens (excluding CLS if used, or just mean)
                 # latent: (B, SeqLen, D)
                 features = latent[:, 1:, :].mean(dim=1) 
@@ -102,7 +102,7 @@ def train_linear_probe(model, train_loader, val_loader, device, num_classes=2, e
             labels = labels.to(device)
             
             imgs = model.module.prepare_tokens(batch) if hasattr(model, 'module') else model.prepare_tokens(batch)
-            latent, _, _, _ = model.module.forward_encoder(imgs) if hasattr(model, 'module') else model.forward_encoder(imgs)
+            latent, _, _, _ = model.module.forward_encoder(batch, imgs) if hasattr(model, 'module') else model.forward_encoder(batch, imgs)
             features = latent[:, 1:, :].mean(dim=1)
             
             logits = probe(features)
@@ -126,7 +126,7 @@ def evaluate_features_quality(model, val_loader, device, save_dir, epoch, num_sa
         for batch, labels in val_loader:
             batch = batch.to(device)
             imgs = model.module.prepare_tokens(batch) if hasattr(model, 'module') else model.prepare_tokens(batch)
-            latent, _, _, _ = model.module.forward_encoder(imgs) if hasattr(model, 'module') else model.forward_encoder(imgs)
+            latent, _, _, _ = model.module.forward_encoder(batch, imgs) if hasattr(model, 'module') else model.forward_encoder(batch, imgs)
             # GAP
             features = latent[:, 1:, :].mean(dim=1).cpu().numpy()
             all_features.append(features)

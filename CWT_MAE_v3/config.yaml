@@ -98,3 +98,8 @@ model:
   
   # --- Data Usage ---
   data_ratio: 1.0           # 使用数据的比例 (0.0-1.0)，用于快速测试或少样本训练
+
+  # --- Contrastive Learning ---
+  proj_dim: 256             # 投影头维度
+  temperature: 0.07         # 对比损失温度系数
+  contrastive_weight: 1.0   # 对比损失权重 (alpha)

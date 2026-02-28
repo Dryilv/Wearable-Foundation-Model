@@ -26,7 +26,7 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
-from model import CWT_MAE_RoPE 
+from model import CWT_MAE_RoPE, SingleTowerContrastiveMAE
 from dataset import PhysioSignalDataset, DataSplitter, fixed_channel_collate_fn
 from utils_metrics import ExperimentTracker, train_linear_probe, evaluate_features_quality
 from utils import save_reconstruction_images
@@ -159,10 +159,14 @@ def validate(model, dataloader, device, config):
             batch = batch.to(device, non_blocking=True)
             
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, loss_dict, _, _, _, _ = model(batch)
+                # Split channels
+                x_ecg = batch[:, 0, :]
+                x_ppg = batch[:, 1, :]
+                loss, loss_dict = model(x_ppg, x_ecg)
+                
             metric_logger['loss'].update(loss.item())
-            metric_logger['loss_spec'].update(loss_dict['loss_spec'].item())
-            metric_logger['loss_time'].update(loss_dict['loss_time'].item())
+            metric_logger['loss_spec'].update(loss_dict.get('loss_spec', torch.tensor(0.0)).item())
+            metric_logger['loss_time'].update(loss_dict.get('loss_time', torch.tensor(0.0)).item())
             
     # Gather metrics from all processes
     # 这里简单起见，只看主进程的，或者依赖 SmoothedValue 的 global_avg (如果它是跨进程同步的？当前实现不是)
@@ -191,6 +195,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_spec'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_time'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
+    metric_logger['loss_mae'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
+    metric_logger['loss_contrastive'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_consist'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     metric_logger['grad_norm'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
@@ -266,12 +272,19 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, loss_dict, _, _, _, _ = model(batch, mask_ratio=mask_ratio)
+                # Split channels: 0 -> ECG, 1 -> PPG
+                # batch shape: (B, 2, L)
+                x_ecg = batch[:, 0, :]
+                x_ppg = batch[:, 1, :]
+                
+                loss, loss_dict = model(x_ppg, x_ecg, mask_ratio=mask_ratio)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
-            loss_spec_val = loss_dict['loss_spec'].item()
-            loss_time_val = loss_dict['loss_time'].item()
+            loss_spec_val = loss_dict.get('loss_spec', torch.tensor(0.0)).item()
+            loss_time_val = loss_dict.get('loss_time', torch.tensor(0.0)).item()
+            loss_mae_val = loss_dict.get('loss_mae', torch.tensor(0.0)).item()
+            loss_contrastive_val = loss_dict.get('loss_contrastive', torch.tensor(0.0)).item()
             
             if not math.isfinite(loss_value):
                 print(f"Loss is {loss_value}, stopping training")
@@ -312,6 +325,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         metric_logger['loss'].update(loss_value)
         metric_logger['loss_spec'].update(loss_spec_val)
         metric_logger['loss_time'].update(loss_time_val)
+        metric_logger['loss_mae'].update(loss_mae_val)
+        metric_logger['loss_contrastive'].update(loss_contrastive_val)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
         metric_logger['throughput'].update(throughput)
 
@@ -336,8 +351,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             logger.info(
                 f"{header} Step: [{step}/{num_steps_per_epoch}] "
                 f"Loss: {metric_logger['loss']} "
-                f"Spec: {metric_logger['loss_spec']} "
-                f"Time: {metric_logger['loss_time']} "
+                f"MAE: {metric_logger['loss_mae']} "
+                f"CL: {metric_logger['loss_contrastive']} "
                 f"LR: {metric_logger['lr']} "
                 f"Grad: {metric_logger['grad_norm']} "
                 f"Speed: {metric_logger['throughput'].avg:.1f} samples/s "
@@ -350,6 +365,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     # Return metrics dict
     return {
         'loss': metric_logger['loss'].global_avg,
+        'loss_mae': metric_logger['loss_mae'].global_avg,
+        'loss_contrastive': metric_logger['loss_contrastive'].global_avg,
         'grad_norm': metric_logger['grad_norm'].global_avg,
         'throughput': metric_logger['throughput'].global_avg * (dist.get_world_size() if dist.is_initialized() else 1)
     }
@@ -454,22 +471,33 @@ def main():
         logger.info(f"Base LR: {base_lr}, Min LR: {min_lr}")
         logger.info(f"Train Size: {len(train_dataset)}")
 
-    # 初始化模型 (无 max_num_channels)
-    model = CWT_MAE_RoPE(
-        signal_len=config['data']['signal_len'],
-        cwt_scales=config['model'].get('cwt_scales', 64),
-        patch_size_time=config['model'].get('patch_size_time', 50),
-        patch_size_freq=config['model'].get('patch_size_freq', 4),
-        embed_dim=config['model']['embed_dim'],
-        depth=config['model']['depth'],
-        num_heads=config['model']['num_heads'],
-        decoder_embed_dim=config['model']['decoder_embed_dim'],
-        decoder_depth=config['model']['decoder_depth'],
-        decoder_num_heads=config['model']['decoder_num_heads'],
-        mask_ratio=config['model'].get('mask_ratio', 0.75),
-        time_loss_weight=config['model'].get('time_loss_weight', 1.0),
-        use_diff=config['model'].get('use_diff', False),
-        diff_loss_weight=config['model'].get('diff_loss_weight', None)
+    # 初始化模型 (SingleTowerContrastiveMAE)
+    # 构造 base_model_config
+    base_model_config = {
+        'signal_len': config['data']['signal_len'],
+        'cwt_scales': config['model'].get('cwt_scales', 64),
+        'patch_size_time': config['model'].get('patch_size_time', 50),
+        'patch_size_freq': config['model'].get('patch_size_freq', 4),
+        'embed_dim': config['model']['embed_dim'],
+        'depth': config['model']['depth'],
+        'num_heads': config['model']['num_heads'],
+        'decoder_embed_dim': config['model']['decoder_embed_dim'],
+        'decoder_depth': config['model']['decoder_depth'],
+        'decoder_num_heads': config['model']['decoder_num_heads'],
+        'mask_ratio': config['model'].get('mask_ratio', 0.75),
+        'time_loss_weight': config['model'].get('time_loss_weight', 1.0),
+        'use_diff': config['model'].get('use_diff', False),
+        'diff_loss_weight': config['model'].get('diff_loss_weight', None)
+    }
+
+    if is_main_process():
+        logger.info("Initializing SingleTowerContrastiveMAE...")
+    
+    model = SingleTowerContrastiveMAE(
+        base_model_config=base_model_config,
+        proj_dim=config['model'].get('proj_dim', 256),
+        temperature=config['model'].get('temperature', 0.07),
+        alpha=config['model'].get('contrastive_weight', 1.0)
     )
     model.to(device)
 
@@ -588,6 +616,8 @@ def main():
             # Log Metrics
             metrics_dict = {
                 'train_loss': train_metrics['loss'],
+                'loss_mae': train_metrics['loss_mae'],
+                'loss_contrastive': train_metrics['loss_contrastive'],
                 'grad_norm': train_metrics['grad_norm'],
                 'gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 / 1024,
                 'throughput': train_metrics['throughput'],
