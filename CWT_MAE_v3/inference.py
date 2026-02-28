@@ -122,9 +122,7 @@ class AdaptivePatientDataset(Dataset):
 
     def __getitem__(self, idx):
         sig = self.windows[idx]
-        # 假设 5 通道: ECG, ACCx3, PPG
-        modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
-        return torch.from_numpy(sig), modality_ids # (M, L), (M,)
+        return torch.from_numpy(sig) # (M, L)
 
 # ==========================================
 # 3. 主推理逻辑 (多分类修改版)
@@ -222,12 +220,11 @@ def main():
         
         with torch.no_grad():
             for batch in loader:
-                x, modality_ids = batch
+                x = batch
                 x = x.to(device)
-                modality_ids = modality_ids.to(device)
                 
                 with autocast(device_type='cuda', dtype=amp_dtype):
-                    logits = model(x, modality_ids=modality_ids)
+                    logits = model(x)
                     # 强制 float32 保证精度
                     probs = F.softmax(logits.float(), dim=1)
                     all_probs_list.append(probs.cpu().numpy())

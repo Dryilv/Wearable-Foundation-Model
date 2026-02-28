@@ -280,7 +280,6 @@ class CWT_MAE_RoPE(nn.Module):
         self.num_patches = self.patch_embed.num_patches
         self.grid_size = self.patch_embed.grid_size 
 
-        self.modality_prompts = nn.Parameter(torch.zeros(max_modalities, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
@@ -318,7 +317,6 @@ class CWT_MAE_RoPE(nn.Module):
         torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.decoder_pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.mask_token, std=.02)
-        torch.nn.init.trunc_normal_(self.modality_prompts, std=.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -365,122 +363,13 @@ class CWT_MAE_RoPE(nn.Module):
         
         return x_masked, mask, global_ids_restore, ids_keep
 
-    def async_masking(self, x, mask_ratio, M, N_patches):
-        """
-        [NEW: Async Masking] 非同步掩码：不同通道的时间步掩码是独立的
-        逻辑：噪声在 [Batch, Channel, Time] 三个维度独立生成
-        """
-        B, _, D = x.shape
-        H_grid, W_grid = self.grid_size
-        len_keep_w = int(W_grid * (1 - mask_ratio))
-        len_keep = len_keep_w * H_grid
-        
-        # 1. 仅在时间维度生成噪声，但对每个通道独立生成
-        noise_w = torch.rand(B, M, W_grid, device=x.device)
-        
-        # 2. 扩展到频域 H_grid (同一时间步的频率成分同生共死)
-        noise = noise_w.unsqueeze(2).repeat(1, 1, H_grid, 1)
-        
-        # 3. 展平为 Patch 维度
-        noise = noise.reshape(B, M, N_patches)
-        
-        # 4. 生成 ids_shuffle 和 ids_restore
-        ids_shuffle = torch.argsort(noise, dim=2) 
-        ids_restore = torch.argsort(ids_shuffle, dim=2)
-        
-        # 5. 生成 ids_keep (B, M, len_keep)
-        ids_keep = ids_shuffle[:, :, :len_keep]
-        
-        # 6. Gather x_masked
-        x_reshaped = x.view(B, M, N_patches, D)
-        ids_keep_expanded = ids_keep.unsqueeze(-1).expand(-1, -1, -1, D)
-        x_masked = torch.gather(x_reshaped, dim=2, index=ids_keep_expanded)
-        x_masked = x_masked.reshape(B, M * len_keep, D)
-        
-        # 7. 生成 Mask 矩阵
-        mask = torch.ones([B, M, N_patches], device=x.device)
-        mask[:, :, :len_keep] = 0
-        mask = torch.gather(mask, dim=2, index=ids_restore)
-        mask = mask.reshape(B, M * N_patches)
-        
-        # 8. 构建全局 global_ids_restore
-        offset = torch.arange(M, device=x.device).view(1, M, 1) * N_patches
-        global_ids_restore = ids_restore + offset
-        global_ids_restore = global_ids_restore.reshape(B, M * N_patches)
-        
-        return x_masked, mask, global_ids_restore, ids_keep
-
     def mixed_masking(self, x, mask_ratio, M, N_patches):
         """
-        [NEW: Mixed Masking] 混合掩码策略
-        1. Tubelet Masking (40%): 同步掩码，学习 PTT 和相位差。
-        2. Async Masking (20%): 非同步掩码，学习通道独立性与微观对齐。
-        3. ECG 100% Masking (20%): 跨模态生成。
-        4. PPG 100% Masking (20%): 反向翻译。
+        [MODIFIED] 仅保留 Tubelet Masking：同步掩码，学习 PTT 和相位差。
         """
-        B, total_tokens, D = x.shape
-        N = N_patches
-        
-        # 随机选择策略 (Per Batch)
-        rand_val = torch.rand(1).item()
-        
-        # -------------------------------------------------------
-        # Strategy 1: Tubelet Masking (40%)
-        # -------------------------------------------------------
-        if rand_val < 0.4:
-            return self.tubelet_masking(x, mask_ratio, M, N_patches) + (M,)
+        return self.tubelet_masking(x, mask_ratio, M, N_patches) + (M,)
 
-        # -------------------------------------------------------
-        # Strategy 2: Async Masking (20%)
-        # -------------------------------------------------------
-        elif rand_val < 0.6:
-            return self.async_masking(x, mask_ratio, M, N_patches) + (M,)
-
-        # -------------------------------------------------------
-        # Strategy 3 & 4: Asymmetric Masking (40% Total)
-        # -------------------------------------------------------
-        if rand_val < 0.8: 
-            # Strategy 3: ECG Masked, PPG Visible
-            keep_channel_idx = 1 
-            target_mask_ratio = 0.2 
-            masked_channel_idx = 0
-        else:
-            # Strategy 4: PPG Masked, ECG Visible
-            keep_channel_idx = 0
-            target_mask_ratio = 0.0 
-            masked_channel_idx = 1
-            
-        x_reshaped = x.view(B, M, N, D)
-        x_keep = x_reshaped[:, keep_channel_idx, :, :] 
-        x_keep = x_keep.reshape(B, 1, N, D) 
-        
-        x_masked, mask_keep, ids_restore_keep_local, ids_keep_local = \
-            self.tubelet_masking(x_keep.reshape(B, N, D), target_mask_ratio, M=1, N_patches=N)
-        
-        len_keep = x_masked.shape[1]
-        mask_full_ones = torch.ones((B, N), device=x.device)
-        
-        if keep_channel_idx == 0:
-            mask = torch.cat([mask_keep, mask_full_ones], dim=1)
-        else:
-            mask = torch.cat([mask_full_ones, mask_keep], dim=1)
-            
-        K = len_keep
-        ids_restore_keep = ids_restore_keep_local.clone()
-        mask_tokens_mask = ids_restore_keep >= K
-        ids_restore_keep[mask_tokens_mask] = ids_restore_keep[mask_tokens_mask] + N
-        
-        ids_restore_masked = torch.arange(K, K + N, device=x.device).unsqueeze(0).expand(B, -1)
-        
-        if keep_channel_idx == 0:
-            global_ids_restore = torch.cat([ids_restore_keep, ids_restore_masked], dim=1)
-        else:
-            global_ids_restore = torch.cat([ids_restore_masked, ids_restore_keep], dim=1)
-            
-        M_enc = 1
-        return x_masked, mask, global_ids_restore, ids_keep_local, M_enc
-
-    def forward_encoder(self, x, modality_ids=None, mask_ratio=None):
+    def forward_encoder(self, x, mask_ratio=None):
         B, M, C, H, W = x.shape
         
         x = x.view(B * M, C, H, W)
@@ -491,19 +380,9 @@ class CWT_MAE_RoPE(nn.Module):
         # 1. Add Time Position Embeddings
         x = x + self.pos_embed.unsqueeze(1)
 
-        # 2. 注入动态模态提示词 (Modality Prompts)
-        if modality_ids is None:
-            modality_ids = torch.zeros((B, M), dtype=torch.long, device=x.device)
-        else:
-            modality_ids = torch.clamp(modality_ids, 0, self.modality_prompts.shape[0] - 1)
-            
-        mod_embeds = self.modality_prompts[modality_ids] 
-        mod_embeds = mod_embeds.unsqueeze(2).expand(-1, -1, N_patches, -1)
-        x = x + mod_embeds
-
         x = x.view(B, M * N_patches, -1)
 
-        # 3. Mixed Masking
+        # 2. Mixed Masking
         current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
         if current_mask_ratio == 0.0:
             x_masked = x
@@ -620,10 +499,10 @@ class CWT_MAE_RoPE(nn.Module):
         imgs = torch.clamp(imgs, min=-100.0, max=100.0)
         return imgs.to(dtype=next(self.parameters()).dtype)
 
-    def forward(self, x, modality_ids=None, mask_ratio=None):
+    def forward(self, x, mask_ratio=None):
         imgs = self.prepare_tokens(x)
 
-        latent, mask, ids, M = self.forward_encoder(imgs, modality_ids, mask_ratio=mask_ratio)
+        latent, mask, ids, M = self.forward_encoder(imgs, mask_ratio=mask_ratio)
         decoder_features = self.forward_decoder(latent, ids, M)
         
         pred_spec = self.decoder_pred_spec(decoder_features)

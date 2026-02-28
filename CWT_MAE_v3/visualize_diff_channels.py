@@ -40,7 +40,7 @@ def visualize_all_channels():
     # idx = 0 
     
     print(f"正在分析样本 Index: {idx} ...")
-    signal_tensor, modality_ids, label = dataset[idx]
+    signal_tensor, label = dataset[idx]
     # signal_tensor shape: (5, 3000)
     
     num_channels = signal_tensor.shape[0]

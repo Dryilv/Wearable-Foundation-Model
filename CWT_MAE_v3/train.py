@@ -153,15 +153,13 @@ def validate(model, dataloader, device, config):
         for batch_data in dataloader:
             if len(batch_data) == 3:
                 batch, modality_ids, labels = batch_data
-                modality_ids = modality_ids.to(device, non_blocking=True)
             else:
                 batch, labels = batch_data
-                modality_ids = None
                 
             batch = batch.to(device, non_blocking=True)
             
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, loss_dict, _, _, _, _ = model(batch, modality_ids=modality_ids)
+                loss, loss_dict, _, _, _, _ = model(batch)
             metric_logger['loss'].update(loss.item())
             metric_logger['loss_spec'].update(loss_dict['loss_spec'].item())
             metric_logger['loss_time'].update(loss_dict['loss_time'].item())
@@ -226,10 +224,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         
         if len(batch_data) == 3:
             batch, modality_ids, labels = batch_data
-            modality_ids = modality_ids.to(device, non_blocking=True)
         else:
             batch, labels = batch_data
-            modality_ids = None
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
@@ -270,7 +266,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                loss, loss_dict, _, _, _, _ = model(batch, modality_ids=modality_ids, mask_ratio=mask_ratio)
+                loss, loss_dict, _, _, _, _ = model(batch, mask_ratio=mask_ratio)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
@@ -512,13 +508,11 @@ def main():
 
     # 获取一个 Batch 用于固定可视化
     vis_batch = None
-    vis_modality_ids = None
     if is_main_process():
         try:
-            # Retrieve the first batch; the dataloader returns (signals, modality_ids, labels)
+            # Retrieve the first batch; the dataloader returns (signals, labels)
             batch = next(iter(train_dataloader)) # Use train loader for vis
             vis_batch = batch[0].to(device)
-            vis_modality_ids = batch[1].to(device)
         except StopIteration:
             pass
 
@@ -612,8 +606,7 @@ def main():
                     model, 
                     vis_batch, 
                     epoch, 
-                    config['train']['save_dir'],
-                    modality_ids=vis_modality_ids
+                    config['train']['save_dir']
                 )
             
             # 保存 Checkpoint

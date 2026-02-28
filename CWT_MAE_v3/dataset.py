@@ -248,18 +248,8 @@ class PhysioSignalDataset(Dataset):
 
                 # 转为 Tensor
                 signal_tensor = torch.from_numpy(processed_signal) 
-
-                # 5. [新增] 构建 Modality IDs
-                # Original 5 channels: 0:ECG, 1:ACC_X, 2:ACC_Y, 3:ACC_Z, 4:PPG
-                # Kept only: 0:ECG and 4:PPG
-                # New 2 channels: 0:ECG, 1:PPG
-                # Modality IDs mapping:
-                # 0 -> ECG (Type 0)
-                # 1 -> PPG (Type 2)
-                # Note: Type 2 for PPG to maintain consistency with previous encoding
-                modality_ids = torch.tensor([0, 2], dtype=torch.long)
                 
-                return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
+                return signal_tensor, torch.tensor(label, dtype=torch.long)
 
             except Exception as e:
                 print(f"Error loading sample {idx}: {e}")
@@ -281,13 +271,11 @@ class PhysioSignalDataset(Dataset):
             safe_signal = safe_signal[:, :self.signal_len]
             # 简单的归一化
             safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
-            modality_ids = torch.tensor([0, 2], dtype=torch.long)
-            return torch.from_numpy(safe_signal).float(), modality_ids, torch.tensor(0, dtype=torch.long)
+            return torch.from_numpy(safe_signal).float(), torch.tensor(0, dtype=torch.long)
         except:
             # 极度兜底：返回全一信号而非全零
             fallback_signal = torch.ones((2, self.signal_len), dtype=torch.float32) * 0.01
-            modality_ids = torch.tensor([0, 2], dtype=torch.long)
-            return fallback_signal, modality_ids, torch.tensor(0, dtype=torch.long)
+            return fallback_signal, torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal, fixed_start=None):
         """
@@ -323,14 +311,12 @@ class PhysioSignalDataset(Dataset):
 def fixed_channel_collate_fn(batch):
     """
     针对 5 通道对齐数据的 Collate Function。
-    Output: (B, 5, L), (B, 5), (B,)
+    Output: (B, 5, L), (B,)
     """
     signals = [item[0] for item in batch]
-    modality_ids = [item[1] for item in batch]
-    labels = [item[2] for item in batch]
+    labels = [item[1] for item in batch]
     
     padded_signals = torch.stack(signals) # (B, 5, L)
-    padded_modality_ids = torch.stack(modality_ids) # (B, 5)
     labels = torch.stack(labels)
     
-    return padded_signals, padded_modality_ids, labels
+    return padded_signals, labels

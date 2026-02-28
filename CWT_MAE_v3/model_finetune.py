@@ -239,18 +239,14 @@ class TF_MAE_Classifier(nn.Module):
         
         state_dict[key] = patch_tokens
 
-    def forward(self, x, modality_ids=None, label=None, return_features=False):
+    def forward(self, x, label=None, return_features=False):
         """
         x: (B, M, L) 多通道输入
-        modality_ids: (B, M) 模态 ID
         label: (B,) 标签，用于 ArcFace 训练
         return_features: 是否返回特征向量而不是 Logits
         """
         # 兼容单通道输入 (B, L) -> (B, 1, L)
         if x.dim() == 2: x = x.unsqueeze(1)
-        if modality_ids is None and x.shape[1] > 1:
-             # 如果未提供且通道 > 1，默认 0
-             modality_ids = torch.zeros((x.shape[0], x.shape[1]), dtype=torch.long, device=x.device)
 
         # 1. CWT 变换 (B, M, L) -> (B, M, 3, Scales, L)
         # 注意：cwt_wrap 现在支持多通道
@@ -278,7 +274,7 @@ class TF_MAE_Classifier(nn.Module):
         # 新版 forward_encoder 返回: x, mask, ids, M
         # x 的形状是 (B, M*N_patches + 1, D)
         self.encoder_model.mask_ratio = 0.0
-        latent, _, _, _ = self.encoder_model.forward_encoder(imgs, modality_ids=modality_ids)
+        latent, _, _, _ = self.encoder_model.forward_encoder(imgs)
         
         # 4. 提取特征
         # patch_tokens: (B, M*N_patches, D)

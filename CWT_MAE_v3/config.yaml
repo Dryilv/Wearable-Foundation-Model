@@ -34,7 +34,7 @@ train:
   # --- Logging & Checkpointing ---
   log_interval: 50          # 日志打印间隔 (steps)
   save_freq: 5              # 模型保存间隔 (epochs)
-  save_dir: "./checkpoint_256_5channel_flash" # Checkpoint 保存路径
+  save_dir: "./checkpoint_256_5channel_flash_l" # Checkpoint 保存路径
   resume: ""                # 断点续训路径 (e.g., "./checkpoint/checkpoint_last.pth")
 
 # ------------------------------------------------------------------------------
@@ -84,7 +84,7 @@ model:
   # --- Signal Difference (Optional) ---
   # 是否使用信号差分特征 (d1, d2)
   # True: 3通道 (原始+一阶+二阶), 精度更高但慢; False: 1通道 (原始), 速度极快, 显存占用低
-  use_diff: False
+  use_diff: True
   
   # [关键修改] 差分通道 Loss 权重
   # 格式: [原始信号权重, 一阶差分权重, 二阶差分权重]
