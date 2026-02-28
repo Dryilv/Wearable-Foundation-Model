@@ -26,7 +26,7 @@ train:
   use_amp: True             
 
   log_interval: 50          
-  save_freq: 10             # 减少保存频率，节省硬盘
+  save_freq: 1             # 改为每轮保存
   save_dir: "./checkpoint_vit_base_contrastive" 
   resume: ""                
 
