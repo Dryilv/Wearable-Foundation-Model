@@ -323,7 +323,7 @@ def main():
     parser.add_argument('--use_diff', action='store_true', help="Use differential channels (d1, d2)")
     
     # [新增] CoT 参数
-    parser.add_argument('--use_cot ', action='store_true', help="Enable Chain-of-Thought Reasoning Head")
+    parser.add_argument('--use_cot', action='store_true', help="Enable Chain-of-Thought Reasoning Head")
     parser.add_argument('--num_reasoning_tokens', type=int, default=16)
 
     # [新增] ArcFace 参数
