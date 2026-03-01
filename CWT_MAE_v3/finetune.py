@@ -163,11 +163,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
             if is_arcface:
                 # ArcFace needs labels to calculate margin
                 # Apply mixup logic manually: calc loss for target_a and target_b then mix
-                logits_a = model(inputs, modality_ids=modality_ids, label=targets_a)
-                logits_b = model(inputs, modality_ids=modality_ids, label=targets_b)
+                logits_a = model(inputs, label=targets_a)
+                logits_b = model(inputs, label=targets_b)
                 loss = lam * criterion(logits_a, targets_a) + (1 - lam) * criterion(logits_b, targets_b)
             else:
-                logits = model(inputs, modality_ids=modality_ids)
+                logits = model(inputs)
                 loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
         
         if use_amp and amp_dtype == torch.float16:
@@ -217,7 +217,7 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
                 x, y = x.to(device), y.to(device)
             
             with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                logits = model(x, modality_ids=modality_ids)
+                logits = model(x)
                 loss = criterion(logits, y)
             
             if dist.is_initialized():
@@ -323,7 +323,7 @@ def main():
     parser.add_argument('--use_diff', action='store_true', help="Use differential channels (d1, d2)")
     
     # [新增] CoT 参数
-    parser.add_argument('--use_cot', action='store_true', help="Enable Chain-of-Thought Reasoning Head")
+    parser.add_argument('--use_cot ', action='store_true', help="Enable Chain-of-Thought Reasoning Head")
     parser.add_argument('--num_reasoning_tokens', type=int, default=16)
 
     # [新增] ArcFace 参数
