@@ -397,7 +397,7 @@ class CWT_MAE_RoPE(nn.Module):
         x_raw_norm = (x_raw - mean_raw) / std_raw
         
         # 1D 特征提取
-        x_raw_embed = self.raw_patch_embed(x_raw_norm) # (B*M, W_grid, D)
+        x_raw_embed = self.raw_patch_embed(x_raw_norm.to(dtype=next(self.parameters()).dtype)) # (B*M, W_grid, D)
         
         # 3. 广播式残差融合 (Broadcasted Residual Connection)
         H_grid, W_grid = self.grid_size
