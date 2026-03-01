@@ -3,6 +3,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -310,6 +311,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.05)
+    parser.add_argument('--warmup_epochs', type=int, default=5, help="Number of warmup epochs")
+    parser.add_argument('--min_lr', type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing")
 
     # CWT-MAE 模型参数
     parser.add_argument('--embed_dim', type=int, default=768) 
@@ -438,16 +441,28 @@ def main():
     # Layer-wise LR Decay
     param_groups = get_layer_wise_lr(model.module, base_lr=args.lr, layer_decay=0.65)
     optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
+    
+    # LR Scheduler (Warmup + Cosine)
+    if args.warmup_epochs > 0:
+        scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=args.warmup_epochs)
+        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=args.min_lr)
+        scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[args.warmup_epochs])
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+    
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     best_metric = 0.0
 
     for epoch in range(args.epochs):
         if is_main_process():
-            print(f"\nEpoch {epoch+1}/{args.epochs}")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"\nEpoch {epoch+1}/{args.epochs} | LR: {current_lr:.2e}")
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch, use_amp=True)
+        
+        scheduler.step()
 
         val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th = validate(
             model, val_loader, criterion, device, args.num_classes, 
