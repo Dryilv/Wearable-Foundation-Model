@@ -1,49 +1,31 @@
-# CWT-MAE-RoPE v3: Next-Gen Physiological Signal Pre-training
-# CWT-MAE-RoPE v3: 下一代生理信号预训练模型
+# CWT-MAE-RoPE v3: Physiological Signal Pre-training
+# CWT-MAE-RoPE v3: 生理信号预训练模型
 
 > **Status**: Active | **Version**: v3.0.0 | **License**: MIT  
 > **Focus**: Multi-Channel Physiological Signals (ECG, PPG, EEG) | **Task**: Self-Supervised Learning & Classification
 
-## 1. Version Evolution Overview (版本演进概览)
-
-本项目经历了从基础验证 (v1) 到 架构优化 (v2) 再到 深度协同 (v3) 的三次重大迭代。以下是各版本的核心差异对比：
-
-| 特性 / 版本 (Version) | **v1 (Baseline)** | **v2 (Enhanced)** | **v3 (Current SOTA)** |
-| :--- | :--- | :--- | :--- |
-| **核心架构 (Core Arch)** | Transformer + RoPE | Tensorized Linear + RoPE | **TrueFactorizedBlock** (Time+Channel) |
-| **注意力机制 (Attention)** | Standard Self-Attn ($O(N^2)$) | Standard (Low Rank Approx) | **Factorized** + **FlashAttention** ($O(N)$) |
-| **重建任务 (Reconstruction)** | 仅时频图 (Spectrogram) | 仅时频图 (Spectrogram) | **双重重建** (Spectrogram + Time Domain) |
-| **掩码策略 (Masking)** | Random Masking | Random Masking | **Tubelet Masking** (Multi-channel Sync) |
-| **跨模态对齐 (Alignment)** | 无 (Concat only) | 无 | **Single-Tower Contrastive** (PPG-ECG) |
-| **参数量 (Params)** | ~85M | ~42M (Tensorized) | **~55M** (Balanced Efficiency) |
-| **训练显存 (Memory)** | High (100%) | Medium (85%) | **Low (75%)** (via `torch.compile` + FlashAttn) |
-| **推理速度 (Speed)** | 1.0x | 1.2x | **1.45x** (>15% faster than v2) |
-| **下游性能 (Performance)** | Baseline | +2.3% (avg) | **+5.8%** (avg) vs v1 |
-
----
-
-## 2. Innovations (创新点专章)
+## 1. Innovations (创新点专章)
 
 v3 版本引入了三项核心技术突破，旨在解决生理信号建模中的特有挑战。
 
-### 2.1 时空因子化注意力 (True Factorized Attention)
+### 1.1 时空因子化注意力 (True Factorized Attention)
 - **问题 (Problem)**: 传统 Transformer 在处理长序列（L=3000）多通道（M=12）信号时，计算复杂度为 $O((ML)^2)$，导致显存爆炸且难以捕捉通道间细微的相位依赖。
 - **解决方案 (Solution)**: 提出 `TrueFactorizedBlock`，将注意力分解为 **Time Attention** (处理时序依赖) 和 **Channel Attention** (处理跨通道相关性)。
 - **效果 (Effect)**: 计算复杂度降至 $O(M \cdot L^2 + L \cdot M^2)$，在保持全局感受野的同时，**训练速度提升 15%**，并显著增强了对多导联 ECG 空间特征的提取能力。
 
-### 2.2 双重域重建 (Dual-Domain Reconstruction)
+### 1.2 双重域重建 (Dual-Domain Reconstruction)
 - **问题 (Problem)**: 仅重建 CWT 时频图会丢失原始信号的相位信息（Phase Information），导致模型对波形畸变不敏感。
 - **解决方案 (Solution)**: 引入 **Time-Domain Loss**，通过 `time_reducer` 和 `time_pred` 头直接从隐变量重建原始 1D 信号，与 `decoder_pred_spec` (频域) 共同优化。
 - **效果 (Effect)**: 使得模型既能识别频域能量分布（如心率变异性），又能捕捉时域形态异常（如 ST 段抬高），**下游分类 F1 分数提升 3.5%**。
 
-### 2.3 单塔对比学习 (Single-Tower Contrastive Learning)
+### 1.3 单塔对比学习 (Single-Tower Contrastive Learning)
 - **问题 (Problem)**: PPG 和 ECG 虽然测量同一生理过程，但信号形态差异巨大，传统 MAE 难以学习二者的语义对应关系。
 - **解决方案 (Solution)**: 设计 `SingleTowerContrastiveMAE`，在 Batch 维度拼接不同模态，通过共享权重的 Encoder 提取特征，并引入 **InfoNCE Loss** 强制 PPG 和 ECG 在隐空间对齐。
 - **效果 (Effect)**: 实现了“少样本微调”能力的飞跃，在仅使用 10% 标注数据时，PPG 分类准确率提升 **8.2%**。
 
 ---
 
-## 3. Pain Points Resolution (历史痛点解决清单)
+## 2. Pain Points Resolution (历史痛点解决清单)
 
 针对 v2 及早期版本在实际落地中遇到的核心痛点，v3 进行了针对性修复：
 
@@ -61,55 +43,9 @@ v3 版本引入了三项核心技术突破，旨在解决生理信号建模中�
 
 ---
 
-## 4. Architecture Diagram (技术架构图)
+## 3. Reproduction & Migration (复现与迁移指南)
 
-```mermaid
-graph TD
-    subgraph "Input & Preprocessing"
-        A[Raw Signal (B, M, L)] --> B[CWT Transform]
-        B --> C[Scalogram (B, M, F, L)]
-        A --> D[Raw Patch Embed (1D)]
-        C --> E[CWT Patch Embed (2D)]
-    end
-
-    subgraph "Encoder (v3 Core)"
-        E --> F[Broadcast Fusion (+)]
-        D --> F
-        F --> G[RoPE Positional Embed]
-        G --> H[Tubelet Masking]
-        H --> I[TrueFactorizedBlock x12]
-        
-        subgraph "TrueFactorizedBlock"
-            I1[Time Attention (Flash)] --> I2[Channel Attention]
-            I2 --> I3[MLP]
-        end
-        I --> I1
-    end
-
-    subgraph "Decoder & Heads"
-        I3 --> J[Decoder Block x8]
-        J --> K1[Spectrogram Head]
-        J --> K2[Time Domain Head]
-        
-        K1 --> L1[Loss Spec (Freq)]
-        K2 --> L2[Loss Time (Time)]
-    end
-
-    style I fill:#f9f,stroke:#333,stroke-width:2px
-    style K2 fill:#bbf,stroke:#333,stroke-width:2px
-    style H fill:#bbf,stroke:#333,stroke-width:2px
-```
-
-**模块说明**:
-- **Broadcast Fusion**: 将 1D 原始信号特征广播并叠加到 2D CWT 特征上，实现时频融合。
-- **TrueFactorizedBlock**: 核心算子，包含 `norm_time`, `time_attn`, `norm_channel`, `channel_attn`。初始化采用 `trunc_normal_(std=.02)`，激活函数为 `GELU`。
-- **Time Domain Head**: 由 `time_reducer` (Conv2d降维) 和 `time_pred` (Linear) 组成。
-
----
-
-## 5. Reproduction & Migration (复现与迁移指南)
-
-### 5.1 环境依赖 (Requirements)
+### 3.1 环境依赖 (Requirements)
 建议使用 Docker 或 Conda 环境：
 ```bash
 conda create -n cwt_mae python=3.9
@@ -119,7 +55,7 @@ pip install torch>=2.0.0 torchvision torchaudio --index-url https://download.pyt
 pip install numpy scipy matplotlib pyyaml scikit-learn tqdm
 ```
 
-### 5.2 快速复现 (Quick Start)
+### 3.2 快速复现 (Quick Start)
 
 **预训练 (Pre-training)**:
 ```bash
@@ -137,7 +73,7 @@ python CWT_MAE_v3/finetune.py \
     --batch_size 64
 ```
 
-### 5.3 常见报错排查 (Troubleshooting)
+### 3.3 常见报错排查 (Troubleshooting)
 
 | 错误信息 (Error) | 可能原因 (Cause) | 解决方案 (Solution) |
 | :--- | :--- | :--- |
@@ -147,41 +83,35 @@ python CWT_MAE_v3/finetune.py \
 
 ---
 
-## 6. Performance Benchmarks (性能基准)
+## 4. Downstream Task Support (下游任务支持)
 
-以下展示 v3 模型在三个主流公开数据集上的性能对比（Fine-tuning 模式）。
+本仓库提供了完善的下游分类任务微调支持，封装在 `TF_MAE_Classifier` 类中，支持多种高级分类头和训练策略。
 
-**Experimental Settings**:
-- **Hardware**: 4x NVIDIA RTX 3090 (24GB)
-- **Batch Size**: 64
-- **Seed**: 42
-- **Optimizer**: AdamW (lr=1e-3, weight_decay=0.05)
+### 4.1 Advanced Classification Heads (高级分类头)
+- **Latent Reasoning Head (CoT)**:
+    - 启用方式: `--use_cot`
+    - 原理: 引入一组可学习的 "Reasoning Tokens"，通过 Cross-Attention 聚合序列特征，模拟隐式推理过程。
+    - 适用场景: 复杂生理信号分类（如心律失常检测），需捕捉长距离依赖。
+- **ArcFace Head**:
+    - 启用方式: `--use_arcface`
+    - 原理: 引入角度间隔损失 (Angular Margin Loss)，最大化类间距离，最小化类内距离。
+    - 适用场景: 细粒度分类或开集识别（Open-set Recognition）。
 
-### SOTA Comparison
+### 4.2 Training Enhancements (训练增强策略)
+- **Mixup Augmentation**:
+    - 在训练过程中对样本及其标签进行线性插值，增强模型对噪声的鲁棒性。
+- **Threshold Search (Binary Classification)**:
+    - 针对二分类任务，验证阶段会自动搜索最佳 F1-Score 对应的阈值 (Threshold)，而非默认的 0.5。
 
-$$
-\begin{array}{l|c|c|c|c}
-\hline
-\textbf{Dataset} & \textbf{Metric} & \textbf{ResNet-1d} & \textbf{CWT-MAE v2} & \textbf{CWT-MAE v3 (Ours)} \\
-\hline
-\text{PTB-XL (ECG)} & \text{AUROC} & 0.915 & 0.928 & \textbf{0.942} \scriptsize{(+1.4\%)} \\
-\text{MIMIC-III (PPG)} & \text{F1-Score} & 0.782 & 0.805 & \textbf{0.831} \scriptsize{(+2.6\%)} \\
-\text{WESAD (Stress)} & \text{Accuracy} & 92.5\% & 94.1\% & \textbf{96.8\%} \scriptsize{(+2.7\%)} \\
-\hline
-\end{array}
-$$
-
-> *Note: v3 显著提升了在噪声较大 (MIMIC-III) 和跨被试 (WESAD) 场景下的泛化能力。*
+### 4.3 Flexible Channel Policies (灵活通道策略)
+通过 `--channel_policy` 参数支持不同导联组合：
+- `default_5ch`: 标准 5 通道配置 (ECG + 3xACC + PPG)。
+- `ppg_only`: 仅使用 PPG 通道，适用于穿戴设备场景。
+- `ecg_ppg`: 融合 ECG 和 PPG 双模态数据。
 
 ---
 
-## 7. Roadmap & Contributors (路线图与贡献者)
-
-### Roadmap
-- [x] **v3.0**: Factorized Attention, Dual Reconstruction, Contrastive Learning.
-- [ ] **v3.1**: 集成 Mamba (SSM) 替换部分 Transformer 层以支持超长序列 (10k+)。
-- [ ] **v3.2**: 发布基于 1000万+ 样本预训练的 "Physio-LLM" 基础模型权重。
-- [ ] **v4.0**: 端侧轻量化版本 (int8 量化)，支持移动端实时推理。
+## 5. Contributors (贡献者)
 
 ### Contribution
 欢迎提交 Pull Request！
