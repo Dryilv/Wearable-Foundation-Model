@@ -321,8 +321,6 @@ def main():
     parser.add_argument('--cwt_scales', type=int, default=64)
     parser.add_argument('--patch_size_time', type=int, default=30)
     parser.add_argument('--patch_size_freq', type=int, default=8)
-    parser.add_argument('--mlp_rank_ratio', type=float, default=0.5)
-    parser.add_argument('--use_factorized_attn', action='store_true', default=True, help="Enable Factorized Sync-Attention")
     parser.add_argument('--use_diff', action='store_true', help="Use differential channels (d1, d2)")
     
     # [新增] CoT 参数

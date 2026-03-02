@@ -27,7 +27,7 @@ train:
 
   log_interval: 50          
   save_freq: 1             # 改为每轮保存
-  save_dir: "./checkpoint_vit_base_contrastive" 
+  save_dir: "./checkpoint_vit_base_contrastive_1000samplelen" 
   resume: ""                
 
 # ------------------------------------------------------------------------------
@@ -35,10 +35,10 @@ train:
 # ------------------------------------------------------------------------------
 data:
   index_path: "train_index_cleaned.json"
-  signal_len: 3000          
+  signal_len: 1000          
   num_workers: 16           
-  use_sliding_window: False 
-  window_stride: 1500       
+  use_sliding_window: True 
+  window_stride: 500       
 
 # ------------------------------------------------------------------------------
 # 3. Model Architecture (升级为 ViT-Base 规格)
