@@ -473,6 +473,15 @@ class CWT_MAE_RoPE(nn.Module):
         B, M, C, H, W = imgs.shape
         p_h, p_w = self.patch_embed.patch_size
         
+        # Calculate valid dimensions that are divisible by patch size
+        H_valid = (H // p_h) * p_h
+        W_valid = (W // p_w) * p_w
+        
+        # Crop imgs if necessary
+        if H != H_valid or W != W_valid:
+            imgs = imgs[..., :H_valid, :W_valid]
+            H, W = H_valid, W_valid
+            
         target = imgs.view(B, M, C, H // p_h, p_h, W // p_w, p_w)
         target = target.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
         target = target.view(B, M, -1, C * p_h * p_w)
@@ -497,6 +506,10 @@ class CWT_MAE_RoPE(nn.Module):
         mean = x_raw.mean(dim=-1, keepdim=True)
         std = torch.clamp(x_raw.std(dim=-1, keepdim=True), min=1e-5)
         target = torch.clamp((x_raw - mean) / std, min=-10.0, max=10.0)
+        
+        # Crop target if it is longer than pred_time (due to patching)
+        if target.shape[-1] > pred_time.shape[-1]:
+            target = target[..., :pred_time.shape[-1]]
         
         B, M, _ = pred_time.shape
         H_grid, W_grid = self.grid_size

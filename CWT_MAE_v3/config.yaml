@@ -49,7 +49,7 @@ model:
   use_conv_stem: True       
   
   # 保持你优秀的 Token 计算逻辑 (800 Tokens)
-  patch_size_time: 30       
+  patch_size_time: 25       
   patch_size_freq: 8        
 
   # --- Transformer Encoder (升级至 ViT-Base) ---
