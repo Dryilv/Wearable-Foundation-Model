@@ -14,6 +14,10 @@ import torch.nn.functional as F
 import numpy as np
 from torch.amp import autocast, GradScaler
 
+import warnings
+from sklearn.exceptions import UndefinedMetricWarning
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+
 from dataset_finetune import DownstreamClassificationDataset
 from model_finetune import TF_MAE_Classifier
 from utils import get_layer_wise_lr
@@ -141,7 +145,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
-    iterator = tqdm(loader, desc=f"Epoch {epoch} Train") if is_main_process() else loader
+    iterator = tqdm(loader, desc=f"Epoch {epoch + 1} Train") if is_main_process() else loader
     
     for batch in iterator:
         if len(batch) == 3:
