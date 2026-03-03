@@ -205,11 +205,14 @@ def save_reconstruction_images(model, x_time, epoch, save_dir):
         output = real_model(x_time)
         
         # Unpack output (Handling potentially varying return values)
-        # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask
-        if len(output) == 6:
+        # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask, latent
+        if len(output) == 7:
+            loss, loss_dict, pred_spec, pred_time, imgs, mask, latent = output
+        elif len(output) == 6:
+            # Fallback for old signature (loss, loss_dict, pred_spec, pred_time, imgs, mask)
             loss, loss_dict, pred_spec, pred_time, imgs, mask = output
         elif len(output) == 5:
-            # Fallback for old signature or other models
+            # Fallback for even older signature or other models
             loss, pred_spec, pred_time, imgs, mask = output
         else:
             raise ValueError(f"Unexpected model output length: {len(output)}")
