@@ -195,7 +195,14 @@ class TF_MAE_Classifier(nn.Module):
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
 
         # 清洗 Key 名称
-        new_state_dict = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            # 1. 移除 DDP/Compile 前缀
+            name = k.replace('module.', '').replace('_orig_mod.', '')
+            # 2. 移除 SingleTowerContrastiveMAE 的 'encoder.' 前缀
+            if name.startswith('encoder.'):
+                name = name[len('encoder.'):]
+            new_state_dict[name] = v
         
         # 过滤 Decoder 权重和不匹配的权重
         encoder_dict = {}
@@ -213,8 +220,18 @@ class TF_MAE_Classifier(nn.Module):
             self._interpolate_pos_embed(encoder_dict, 'pos_embed', self.encoder_model.pos_embed)
 
         msg = self.encoder_model.load_state_dict(encoder_dict, strict=False)
-        print(f"Weights loaded. Missing keys (expected decoder keys): {msg.missing_keys}")
-        print(f"Unexpected keys: {msg.unexpected_keys}")
+        
+        # Filter out expected missing keys (decoder stuff)
+        actual_missing = [k for k in msg.missing_keys if not any(x in k for x in ["decoder", "mask_token", "time_reducer", "time_pred", "rope_decoder"])]
+        
+        print(f"Weights loaded.")
+        if actual_missing:
+            print(f"WARNING: Missing encoder keys: {actual_missing}")
+        else:
+            print("Encoder weights loaded successfully.")
+            
+        if msg.unexpected_keys:
+             print(f"Unexpected keys: {msg.unexpected_keys}")
 
     def _interpolate_pos_embed(self, state_dict, key, new_pos_embed):
         if key not in state_dict: return
