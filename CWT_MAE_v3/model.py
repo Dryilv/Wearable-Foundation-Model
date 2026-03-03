@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import torch.fft
 
 # ===================================================================
 # 1. CWT 模块 (保持不变，优秀的特征工程)
@@ -30,12 +31,38 @@ def cwt_ricker(x, scales):
     wavelet_len = min(10 * largest_scale, sequence_length)
     if wavelet_len % 2 == 0: wavelet_len += 1 
     wavelet_len = int(wavelet_len)
+    
     wavelets = create_ricker_wavelets(wavelet_len, scales)
     wavelets = wavelets.to(dtype=x.dtype)
-    padding = wavelet_len // 2
-    cwt_output = F.conv1d(x, wavelets, padding=padding)
-    if cwt_output.shape[-1] > sequence_length:
-        cwt_output = cwt_output[..., :sequence_length]
+    
+    # FFT Convolution
+    pad_len = wavelet_len // 2
+    n_fft = sequence_length + wavelet_len - 1
+    
+    # x: (B, 1, L) -> X_f: (B, 1, n_fft)
+    X_f = torch.fft.rfft(x, n=n_fft)
+    
+    # wavelets: (S, 1, W) -> W_f: (S, 1, n_fft)
+    W_f = torch.fft.rfft(wavelets, n=n_fft)
+    
+    # Out_f: (B, S, n_fft) broadcasting
+    # X_f: (B, 1, n_fft)
+    # W_f: (S, 1, n_fft) -> need to align dimensions for broadcasting if not automatic
+    # target: (B, S, n_fft)
+    # X_f.unsqueeze(1): (B, 1, 1, n_fft)
+    # W_f.unsqueeze(0): (1, S, 1, n_fft)
+    # But wait, conv1d logic:
+    # x is (B, 1, L), wavelets is (S, 1, W). Output is (B, S, L).
+    # Convolution in frequency domain: element-wise multiplication.
+    
+    X_f = X_f.view(batch_size, 1, -1)
+    W_f = W_f.view(1, num_scales, -1)
+    
+    Out_f = X_f * W_f # (B, S, n_fft)
+    
+    out = torch.fft.irfft(Out_f, n=n_fft)
+    cwt_output = out[..., pad_len : pad_len + sequence_length]
+    
     return cwt_output
 
 @torch.compiler.disable
@@ -93,8 +120,8 @@ class RotaryEmbedding(nn.Module):
         seq_len = torch.max(pos_ids) + 1
         if seq_len > self.max_seq_len:
             self._update_cache(int(seq_len * 1.5))
-        cos = F.embedding(pos_ids, self.cos_cached).to(x.dtype)
-        sin = F.embedding(pos_ids, self.sin_cached).to(x.dtype)
+        cos = self.cos_cached[pos_ids].to(x.dtype)
+        sin = self.sin_cached[pos_ids].to(x.dtype)
         return cos.unsqueeze(2), sin.unsqueeze(2)
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -118,7 +145,7 @@ class DecomposedPatchEmbed(nn.Module):
 
     def forward(self, x):
         x = self.proj(x)
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2).contiguous()
         x = self.norm(x)
         return x
 
@@ -205,8 +232,8 @@ class TrueFactorizedBlock(nn.Module):
         if M > 1:
             x_c = x_time.view(B, M, N, D)
             x_smooth = x_c.view(B * M, N, D).transpose(1, 2) 
-            x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).view(B, M, N, D)
-            x_channel = x_smooth.transpose(1, 2).reshape(B * N, M, D)
+            x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).contiguous().reshape(B, M, N, D)
+            x_channel = x_smooth.transpose(1, 2).contiguous().reshape(B * N, M, D)
             attn_out = self.channel_attn(self.norm_channel(x_channel))
             x_c = x_c + attn_out.view(B, N, M, D).transpose(1, 2)
             x = x_c.reshape(B, MN, D)
@@ -287,6 +314,8 @@ class CWT_MAE_RoPE(nn.Module):
             embed_dim=embed_dim,
             norm_layer=norm_layer
         )
+        
+        self.raw_signal_scale = nn.Parameter(torch.ones(1, 1, 1, embed_dim) * 0.1)
 
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         
@@ -407,7 +436,7 @@ class CWT_MAE_RoPE(nn.Module):
         x_raw_2d = x_raw_embed.unsqueeze(1) # (B*M, 1, W_grid, D)
         
         # 广播相加：1D 特征复制到所有频率带
-        x_fused = x_cwt_2d + x_raw_2d 
+        x_fused = x_cwt_2d + x_raw_2d * self.raw_signal_scale
         x = x_fused.view(B, M, -1, D) 
         N_patches = x.shape[2]
 
@@ -494,11 +523,7 @@ class CWT_MAE_RoPE(nn.Module):
         loss = loss * self.channel_loss_weights
         loss = loss.sum(dim=-1) 
         
-        mask_sum = mask.sum()
-        if mask_sum > 0:
-            loss = (loss * mask).sum() / mask_sum
-        else:
-            loss = loss.mean() * 0.0
+        loss = (loss * mask).sum() / (mask.sum() + 1e-8)
         return loss
 
     def forward_loss_time(self, x_raw, pred_time, mask):
@@ -521,11 +546,7 @@ class CWT_MAE_RoPE(nn.Module):
         mask_time = mask_time.reshape(B, M, -1) 
         
         loss = (pred_time.float() - target) ** 2
-        mask_time_sum = mask_time.sum()
-        if mask_time_sum > 0:
-            loss = (loss * mask_time).sum() / mask_time_sum
-        else:
-            loss = loss.mean() * 0.0
+        loss = (loss * mask_time).sum() / (mask_time.sum() + 1e-8)
         return loss
 
     def prepare_tokens(self, x):
@@ -565,7 +586,7 @@ class CWT_MAE_RoPE(nn.Module):
         loss = loss_spec + self.time_loss_weight * loss_time
         loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
 
-        return loss, loss_dict, pred_spec, pred_time, imgs, mask
+        return loss, loss_dict, pred_spec, pred_time, imgs, mask, latent
 
 
 # ===================================================================
@@ -609,15 +630,10 @@ class SingleTowerContrastiveMAE(nn.Module):
         
         # 2. 计算 MAE 重建损失 (带有 Mask)
         # 这保证了模型依然能学到信号的底层细节
-        loss_mae, loss_dict_mae, _, _, _, _ = self.encoder(x_both, mask_ratio=mask_ratio)
+        # 返回 latent (仅包含可见 token)
+        loss_mae, loss_dict_mae, _, _, _, _, latent = self.encoder(x_both, mask_ratio=mask_ratio)
         
-        # 3. 提取全局特征用于对比学习 (不带 Mask，保证特征完整性)
-        # 准备 CWT tokens
-        imgs_both = self.encoder.prepare_tokens(x_both)
-        # 提取特征 (mask_ratio=0.0)
-        latent, _, _, _ = self.encoder.forward_encoder(x_both, imgs_both, mask_ratio=0.0) 
-        # latent shape: (2B, N_patches, D)
-        
+        # 3. 提取全局特征用于对比学习 (直接复用 latent)
         # 全局平均池化 (Global Average Pooling) 得到全局表征
         global_feat = latent.mean(dim=1) # (2B, D)
         

@@ -1,6 +1,6 @@
 # CWT-MAE-RoPE v3: Physiological Signal Pre-training
 # CWT-MAE-RoPE v3: 生理信号预训练模型
-
+我们采用了类似 FLIP 的策略，在 Masked 视图上进行跨模态对比学习，不仅提升了训练效率，还增强了表征的鲁棒性。
 > **Status**: Active | **Version**: v3.0.0 | **License**: MIT  
 > **Focus**: Multi-Channel Physiological Signals (ECG, PPG, EEG) | **Task**: Self-Supervised Learning & Classification
 
