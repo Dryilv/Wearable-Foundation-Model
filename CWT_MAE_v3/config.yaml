@@ -11,9 +11,9 @@ train:
   # [显存优化] 80GB 显卡火力全开
   # 单塔模式下内部 Batch 会翻倍，但 256 依然很轻松。
   # 如果显存不够，降到 128；如果显存还有剩，大胆开到 512。
-  batch_size: 64            
+  batch_size: 128           
   
-  accum_iter: 16             
+  accum_iter: 1             
 
   # [学习率调整] 配合较大的 Batch Size
   base_lr: 1.5e-4           # 配合 auto_scale_lr，实际 lr ≈ 1.5e-4 * 256 / 256 = 1.5e-4
@@ -27,7 +27,7 @@ train:
 
   log_interval: 50          
   save_freq: 1             # 改为每轮保存
-  save_dir: "./checkpoint_vit_base_contrastive_1000samplelen" 
+  save_dir: "./checkpoint_vit_base_contrastive_optimistic" 
   resume: ""                
 
 # ------------------------------------------------------------------------------
@@ -78,3 +78,22 @@ model:
   proj_dim: 256             
   temperature: 0.07         
   contrastive_weight: 1.0
+
+# ------------------------------------------------------------------------------
+# 4. 3-Stage Training Strategy
+# ------------------------------------------------------------------------------
+stage:
+  stage1_epochs: 10         # Stage 1: Feature Construction (Epoch 0-10)
+  stage2_epochs: 20         # Stage 2: Alignment Transition (Epoch 10-20)
+  
+  # Stage 1 Weights
+  stage1_alpha: 0.0         # Contrastive Loss Weight
+  stage1_mae: 1.0           # MAE Loss Weight
+  
+  # Stage 2 Weights (Target Alpha, Linear Warmup)
+  stage2_target_alpha: 1.0  # Final Alpha for Stage 2 & 3
+  stage2_mae: 1.0           # MAE Loss Weight
+  
+  # Stage 3 Weights (Semantic Refinement)
+  stage3_alpha: 1.0         # Contrastive Loss Weight
+  stage3_mae: 0.1           # MAE Loss Weight

@@ -614,11 +614,13 @@ class SingleTowerContrastiveMAE(nn.Module):
         self.temperature = temperature
         self.alpha = alpha # 对比损失的权重 (控制 MAE 重建和对比对齐的比例)
 
-    def forward(self, x_ppg, x_ecg, mask_ratio=None):
+    def forward(self, x_ppg, x_ecg, mask_ratio=None, alpha=None, mae_weight=1.0):
         """
         训练时的前向传播
         x_ppg: (B, L) 或 (B, 1, L)
         x_ecg: (B, L) 或 (B, 1, L)
+        alpha: 动态覆盖 self.alpha
+        mae_weight: 动态调整 MAE Loss 权重
         """
         if x_ppg.dim() == 2: x_ppg = x_ppg.unsqueeze(1)
         if x_ecg.dim() == 2: x_ecg = x_ecg.unsqueeze(1)
@@ -658,7 +660,8 @@ class SingleTowerContrastiveMAE(nn.Module):
         loss_contrastive = (loss_nce_pe + loss_nce_ep) / 2
         
         # 5. 计算总损失
-        total_loss = loss_mae + self.alpha * loss_contrastive
+        current_alpha = alpha if alpha is not None else self.alpha
+        total_loss = (loss_mae * mae_weight) + (current_alpha * loss_contrastive)
         
         loss_dict = {
             'loss_total': total_loss,

@@ -189,7 +189,8 @@ def validate(model, dataloader, device, config):
     return val_loss, val_loss_spec, val_loss_time
 
 def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global, 
-                    total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0):
+                    total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0,
+                    alpha=None, mae_weight=1.0):
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
@@ -277,7 +278,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
                 x_ecg = batch[:, 0, :]
                 x_ppg = batch[:, 1, :]
                 
-                loss, loss_dict = model(x_ppg, x_ecg, mask_ratio=mask_ratio)
+                loss, loss_dict = model(x_ppg, x_ecg, mask_ratio=mask_ratio, alpha=alpha, mae_weight=mae_weight)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
@@ -512,8 +513,25 @@ def main():
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True)
 
-    param_groups = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(param_groups, lr=base_lr, weight_decay=float(config['train']['weight_decay']))
+    # 优化器参数分组：区分基座网络和投影头
+    base_params = []
+    proj_head_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'proj_head' in name:
+            proj_head_params.append(param)
+        else:
+            base_params.append(param)
+            
+    if is_main_process():
+        logger.info(f"Optimizer groups: Base Params={len(base_params)}, Proj Head Params={len(proj_head_params)}")
+
+    optimizer = optim.AdamW([
+        {'params': base_params, 'lr': base_lr},
+        {'params': proj_head_params, 'lr': base_lr * 10.0} 
+    ], weight_decay=float(config['train']['weight_decay']))
     
     # GradScaler 用于混合精度
     scaler = GradScaler(enabled=config['train']['use_amp'])
@@ -557,10 +575,35 @@ def main():
         current_total_steps = total_steps
         current_warmup_steps = warmup_steps
         current_lr_start_step = 0
-
+        
+        # --- 3-Stage Training Strategy ---
+        stage_cfg = config.get('stage', {})
+        s1_end = stage_cfg.get('stage1_epochs', 10)
+        s2_end = stage_cfg.get('stage2_epochs', 20)
+        
+        target_alpha = stage_cfg.get('stage2_target_alpha', 1.0)
+        
+        if epoch < s1_end:
+            current_alpha = stage_cfg.get('stage1_alpha', 0.0)
+            current_mae_weight = stage_cfg.get('stage1_mae', 1.0)
+            stage_name = f"Stage 1: Feature Construction (Epoch 0-{s1_end})"
+        elif s1_end <= epoch < s2_end:
+            # Linear warmup for alpha
+            progress = (epoch - s1_end) / float(s2_end - s1_end)
+            start_alpha = stage_cfg.get('stage1_alpha', 0.0)
+            current_alpha = start_alpha + (target_alpha - start_alpha) * progress
+            current_mae_weight = stage_cfg.get('stage2_mae', 1.0)
+            stage_name = f"Stage 2: Alignment Transition (Epoch {s1_end}-{s2_end})"
+        else:
+            current_alpha = stage_cfg.get('stage3_alpha', 1.0)
+            current_mae_weight = stage_cfg.get('stage3_mae', 0.1)
+            stage_name = f"Stage 3: Semantic Refinement (Epoch {s2_end}+)"
+            
         if is_main_process():
             logger.info(f"Epoch {epoch} Configuration: Mask Ratio = {current_mask_ratio:.4f}, Base LR Target = {current_base_lr}")
-
+            logger.info(f"Training Stage: {stage_name}")
+            logger.info(f"Weights: Alpha (Contrastive) = {current_alpha:.4f}, MAE Weight = {current_mae_weight:.4f}")
+            
         # Train
         train_metrics = train_one_epoch(
             model, train_dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global,
@@ -569,7 +612,9 @@ def main():
             base_lr=current_base_lr,
             min_lr=min_lr,
             mask_ratio=current_mask_ratio,
-            lr_start_step=current_lr_start_step
+            lr_start_step=current_lr_start_step,
+            alpha=current_alpha,
+            mae_weight=current_mae_weight
         )
         
         # Validation Removed
