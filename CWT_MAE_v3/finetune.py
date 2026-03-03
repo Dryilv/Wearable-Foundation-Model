@@ -323,7 +323,7 @@ def main():
     parser.add_argument('--depth', type=int, default=12)
     parser.add_argument('--num_heads', type=int, default=12)
     parser.add_argument('--cwt_scales', type=int, default=64)
-    parser.add_argument('--patch_size_time', type=int, default=30)
+    parser.add_argument('--patch_size_time', type=int, default=25)
     parser.add_argument('--patch_size_freq', type=int, default=8)
     parser.add_argument('--use_diff', action='store_true', help="Use differential channels (d1, d2)")
     
@@ -340,9 +340,9 @@ def main():
     parser.add_argument('--clean_test_indices_path', type=str, default=None)
     
     # [新增] 通道策略
-    parser.add_argument('--channel_policy', type=str, default='default_5ch',
-                        choices=['default_5ch', 'ppg_only', 'ecg_ppg'],
-                        help="Data channel configuration: 'default_5ch' (ECG, 3xACC, PPG), 'ppg_only' (PPG), 'ecg_ppg' (ECG, PPG)")
+    parser.add_argument('--channel_policy', type=str, default='ecg_ppg',
+                        choices=['ecg_only', 'ppg_only', 'ecg_ppg'],
+                        help="Data channel configuration: 'ecg_only' (ECG), 'ppg_only' (PPG), 'ecg_ppg' (ECG, PPG)")
     
     args = parser.parse_args()
 

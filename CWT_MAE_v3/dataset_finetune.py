@@ -139,38 +139,48 @@ class DownstreamClassificationDataset(Dataset):
             # 0: ECG, 1: ACC, 2: PPG
             M = signal_tensor.shape[0]
             
-            if self.channel_policy == 'ppg_only':
-                # 假设输入只有 PPG (或用户提供单通道数据)
-                if M == 1:
-                    modality_ids = torch.tensor([2], dtype=torch.long)
-                elif M == 5: # 兼容 5 通道数据取 PPG (最后一行)
+            if self.channel_policy == 'ecg_only':
+                # 仅 ECG
+                if M == 5:
+                    signal_tensor = signal_tensor[0:1, :]
+                    modality_ids = torch.tensor([0], dtype=torch.long)
+                elif M == 1:
+                    # 假设本身就是单通道 ECG
+                    modality_ids = torch.tensor([0], dtype=torch.long)
+                else:
+                    # 未知情况，默认取第一个
+                    signal_tensor = signal_tensor[0:1, :]
+                    modality_ids = torch.tensor([0], dtype=torch.long)
+
+            elif self.channel_policy == 'ppg_only':
+                # 仅 PPG
+                if M == 5: 
                     signal_tensor = signal_tensor[4:5, :]
                     modality_ids = torch.tensor([2], dtype=torch.long)
+                elif M == 1:
+                    # 假设本身就是单通道 PPG
+                    modality_ids = torch.tensor([2], dtype=torch.long)
                 else:
-                    # 未知单通道，默认设为 PPG
+                    # 未知情况，默认取最后一个作为 PPG
+                    signal_tensor = signal_tensor[-1:, :]
                     modality_ids = torch.tensor([2], dtype=torch.long)
 
             elif self.channel_policy == 'ecg_ppg':
-                # 假设输入是 ECG, PPG (或用户提供 2 通道数据)
-                if M == 2:
-                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
-                elif M == 5: # 兼容 5 通道数据取 ECG, PPG
+                # ECG + PPG
+                if M == 5: 
                     signal_tensor = signal_tensor[[0, 4], :]
                     modality_ids = torch.tensor([0, 2], dtype=torch.long)
+                elif M == 2:
+                    # 假设本身就是双通道
+                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
                 else:
-                    # 未知双通道，默认设为 ECG, PPG
+                    # 未知情况，默认取首尾
+                    signal_tensor = signal_tensor[[0, -1], :]
                     modality_ids = torch.tensor([0, 2], dtype=torch.long)
             
-            elif self.channel_policy == 'default_5ch':
-                if M == 5:
-                    modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
-                else:
-                    # Fallback for non-5-channel data in default mode
-                    modality_ids = torch.zeros(M, dtype=torch.long)
-            
             else:
-                # Fallback for unknown policy
-                modality_ids = torch.zeros(M, dtype=torch.long)
+                # Fallback (虽然 argparse 限制了 choice，但为了健壮性)
+                modality_ids = torch.zeros(signal_tensor.shape[0], dtype=torch.long)
             
             # 更新 M (可能被切片修改)
             M = signal_tensor.shape[0]
