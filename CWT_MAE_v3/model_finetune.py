@@ -231,7 +231,10 @@ class TF_MAE_Classifier(nn.Module):
             print("Encoder weights loaded successfully.")
             
         if msg.unexpected_keys:
-             print(f"Unexpected keys: {msg.unexpected_keys}")
+             # Filter out proj_head keys which are expected to be unused (from contrastive learning)
+             actual_unexpected = [k for k in msg.unexpected_keys if "proj_head" not in k]
+             if actual_unexpected:
+                 print(f"Unexpected keys: {actual_unexpected}")
 
     def _interpolate_pos_embed(self, state_dict, key, new_pos_embed):
         if key not in state_dict: return
