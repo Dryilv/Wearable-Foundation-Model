@@ -184,9 +184,9 @@ class RoPEAttention(nn.Module):
         if rope_cos is not None and rope_sin is not None:
              q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
         
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous()
         x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).contiguous().reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
