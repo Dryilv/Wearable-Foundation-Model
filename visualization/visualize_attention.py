@@ -292,3 +292,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
+usage:
+
+python visualization/visualize_attention.py `
+  --checkpoint "path/to/your/finetuned_checkpoint.pth" `
+  --data_root "path/to/your/dataset_root" `
+  --split_file "path/to/your/split.json" `
+  --config "CWT_MAE_v3/config.yaml" `
+  --output "attention_result.png" `
+  --mode "val" `
+  --index 0
+'''
