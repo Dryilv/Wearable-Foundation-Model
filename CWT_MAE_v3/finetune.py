@@ -1,6 +1,9 @@
 import os
 import argparse
 import yaml
+import json
+import random
+import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -46,6 +49,58 @@ def cleanup_distributed():
 
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
+
+def unwrap_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+def set_seed(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+def setup_logger(save_dir):
+    logger = logging.getLogger("finetune")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+    if is_main_process():
+        file_handler = logging.FileHandler(os.path.join(save_dir, "finetune.log"), encoding="utf-8")
+        stream_handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+    else:
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_metric, best_threshold, scaler):
+    payload = {
+        'epoch': epoch,
+        'model': unwrap_model(model).state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'best_metric': best_metric,
+        'best_threshold': best_threshold
+    }
+    if scaler is not None:
+        payload['scaler'] = scaler.state_dict()
+    torch.save(payload, path)
+
+def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None):
+    checkpoint = torch.load(path, map_location='cpu')
+    state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+    unwrap_model(model).load_state_dict(state_dict, strict=True)
+    if optimizer is not None and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    if scheduler is not None and 'scheduler' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    if scaler is not None and 'scaler' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler'])
+    return checkpoint
 
 def reduce_tensor(tensor):
     rt = tensor.clone()
@@ -134,7 +189,7 @@ def mixup_data(x, y, alpha=1.0, device='cuda'):
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=True, mixup_alpha=0.2):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, mixup_alpha=0.2, grad_clip_norm=3.0):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
@@ -144,18 +199,16 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
     
     # 优先使用 bfloat16
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
-
     iterator = tqdm(loader, desc=f"Epoch {epoch + 1} Train") if is_main_process() else loader
     
     for batch in iterator:
         if len(batch) == 3:
             x, modality_ids, y = batch
-            x, modality_ids, y = x.to(device), modality_ids.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         else:
             x, y = batch
             modality_ids = None
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         
         # Mixup
         inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=mixup_alpha, device=device)
@@ -163,7 +216,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
         optimizer.zero_grad()
         
         # Check if ArcFace is enabled (DDP wrapper -> module)
-        is_arcface = hasattr(model.module, 'use_arcface') and model.module.use_arcface
+        real_model = unwrap_model(model)
+        is_arcface = hasattr(real_model, 'use_arcface') and real_model.use_arcface
 
         with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
             if is_arcface:
@@ -177,14 +231,16 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
                 loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
         
         if use_amp and amp_dtype == torch.float16:
+            if scaler is None:
+                raise RuntimeError("GradScaler is required for float16 AMP training.")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
 
         if dist.is_initialized():
@@ -200,7 +256,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
 
     return total_loss / count
 
-def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True):
+def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True, search_threshold=True, fixed_threshold=0.5):
     model.eval()
     total_loss = 0
     count = 0
@@ -216,11 +272,11 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         for batch in iterator:
             if len(batch) == 3:
                 x, modality_ids, y = batch
-                x, modality_ids, y = x.to(device), modality_ids.to(device), y.to(device)
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             else:
                 x, y = batch
                 modality_ids = None
-                x, y = x.to(device), y.to(device)
+                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             
             with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 logits = model(x)
@@ -261,20 +317,19 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_probs_np = all_probs_np / row_sums
 
         # 阈值搜索 (Binary Classification)
-        best_threshold = 0.5
+        best_threshold = fixed_threshold
         if num_classes == 2:
             y_scores = all_probs_np[:, 1]
-            thresholds = np.arange(0.01, 1.00, 0.01)
-            best_f1_search = -1.0
-            
-            for th in thresholds:
-                preds_th = (y_scores >= th).astype(int)
-                f1_th = f1_score(all_labels_np, preds_th, average='macro')
-                if f1_th > best_f1_search:
-                    best_f1_search = f1_th
-                    best_threshold = th
-            
-            print(f"\n[Threshold Search] Best Threshold: {best_threshold:.2f} | Best Macro F1: {best_f1_search:.4f}")
+            if search_threshold:
+                thresholds = np.arange(0.01, 1.00, 0.01)
+                best_f1_search = -1.0
+                for th in thresholds:
+                    preds_th = (y_scores >= th).astype(int)
+                    f1_th = f1_score(all_labels_np, preds_th, average='macro')
+                    if f1_th > best_f1_search:
+                        best_f1_search = f1_th
+                        best_threshold = th
+                print(f"\n[Threshold Search] Best Threshold: {best_threshold:.2f} | Best Macro F1: {best_f1_search:.4f}")
             final_preds = (y_scores >= best_threshold).astype(int)
         else:
             final_preds = np.argmax(all_probs_np, axis=1)
@@ -312,6 +367,9 @@ def main():
     train_cfg = config['train']
     data_cfg = config['data']
     model_cfg = config['model']
+    seed = train_cfg.get('seed', 42)
+    deterministic = train_cfg.get('deterministic', False)
+    set_seed(seed, deterministic=deterministic)
 
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
@@ -319,28 +377,53 @@ def main():
     if is_main_process():
         os.makedirs(train_cfg['save_dir'], exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
-        
-    # Enable cuDNN benchmark for stable performance and potentially avoid kernel issues
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True # Allow TF32 on Ampere
-    torch.backends.cudnn.allow_tf32 = True
+    logger = setup_logger(train_cfg['save_dir'])
+    torch.backends.cuda.matmul.allow_tf32 = train_cfg.get('allow_tf32', True)
+    torch.backends.cudnn.allow_tf32 = train_cfg.get('allow_tf32', True)
+    if not deterministic:
+        torch.backends.cudnn.benchmark = train_cfg.get('cudnn_benchmark', True)
 
-    # Dataset 初始化
+    with open(data_cfg['split_file'], 'r') as f:
+        split_info = json.load(f)
+    requested_val_mode = train_cfg.get('val_mode', 'val')
+    requested_test_mode = train_cfg.get('test_mode', 'test')
+    val_mode = requested_val_mode if requested_val_mode in split_info else ('test' if 'test' in split_info else requested_val_mode)
+    test_mode = requested_test_mode if requested_test_mode in split_info else (val_mode if val_mode in split_info else requested_test_mode)
+    threshold_calibration_only = (val_mode == test_mode)
+    eval_split_name = "阈值校准集" if threshold_calibration_only else "验证集"
+    if is_main_process():
+        print(f"Validation split: {val_mode} | Test split: {test_mode}")
+        if threshold_calibration_only:
+            print("No separate validation split detected. The same split is used to tune inference threshold.")
+
     train_ds = DownstreamClassificationDataset(
         data_cfg['data_root'], data_cfg['split_file'], mode='train', 
         signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
-        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg')
+        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg'),
+        on_error=data_cfg.get('on_error', 'raise'),
+        max_error_logs=data_cfg.get('max_error_logs', 20)
     )
     val_ds = DownstreamClassificationDataset(
-        data_cfg['data_root'], data_cfg['split_file'], mode='test', 
+        data_cfg['data_root'], data_cfg['split_file'], mode=val_mode, 
         signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
-        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg')
+        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg'),
+        on_error=data_cfg.get('on_error', 'raise'),
+        max_error_logs=data_cfg.get('max_error_logs', 20)
+    )
+    test_ds = DownstreamClassificationDataset(
+        data_cfg['data_root'], data_cfg['split_file'], mode=test_mode, 
+        signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
+        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg'),
+        on_error=data_cfg.get('on_error', 'raise'),
+        max_error_logs=data_cfg.get('max_error_logs', 20)
     )
 
     val_dataset_len = len(val_ds)
+    test_dataset_len = len(test_ds)
 
     # 数据清洗逻辑 (可选)
     clean_indices_path = data_cfg.get('clean_indices_path')
+    clean_val_indices_path = data_cfg.get('clean_val_indices_path')
     clean_test_indices_path = data_cfg.get('clean_test_indices_path')
     if clean_indices_path and os.path.exists(clean_indices_path):
         if is_main_process():
@@ -349,33 +432,59 @@ def main():
         clean_indices = clean_indices[clean_indices < len(train_ds)]
         train_ds = Subset(train_ds, clean_indices)
         
+    if clean_val_indices_path and os.path.exists(clean_val_indices_path):
+        if is_main_process():
+            print(f"\n[Val Cleaning] Loading indices from {clean_val_indices_path}...")
+        clean_val_indices = np.load(clean_val_indices_path)
+        clean_val_indices = clean_val_indices[clean_val_indices < len(val_ds)]
+        val_ds = Subset(val_ds, clean_val_indices)
+        val_dataset_len = len(val_ds)
+
     if clean_test_indices_path and os.path.exists(clean_test_indices_path):
         if is_main_process():
             print(f"\n[Test Cleaning] Loading indices from {clean_test_indices_path}...")
         clean_test_indices = np.load(clean_test_indices_path)
-        clean_test_indices = clean_test_indices[clean_test_indices < len(val_ds)]
-        val_ds = Subset(val_ds, clean_test_indices)
-        val_dataset_len = len(val_ds)
+        clean_test_indices = clean_test_indices[clean_test_indices < len(test_ds)]
+        test_ds = Subset(test_ds, clean_test_indices)
+        test_dataset_len = len(test_ds)
 
-    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
-    val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
+    if dist.is_initialized():
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
+        test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False)
+    else:
+        train_sampler = None
+        val_sampler = None
+        test_sampler = None
 
     # DataLoader: 必须使用 variable_channel_collate_fn_cls
+    pin_memory = data_cfg.get('pin_memory', True)
     train_loader = DataLoader(
         train_ds, 
         batch_size=train_cfg['batch_size'], 
         sampler=train_sampler, 
+        shuffle=train_sampler is None,
         num_workers=data_cfg.get('num_workers', 4), 
-        pin_memory=True,
+        pin_memory=pin_memory,
         collate_fn=variable_channel_collate_fn_cls # 关键修改
     )
     val_loader = DataLoader(
         val_ds, 
         batch_size=train_cfg['batch_size'], 
         sampler=val_sampler, 
+        shuffle=False,
         num_workers=data_cfg.get('num_workers', 4), 
-        pin_memory=True,
+        pin_memory=pin_memory,
         collate_fn=variable_channel_collate_fn_cls # 关键修改
+    )
+    test_loader = DataLoader(
+        test_ds, 
+        batch_size=train_cfg['batch_size'], 
+        sampler=test_sampler, 
+        shuffle=False,
+        num_workers=data_cfg.get('num_workers', 4), 
+        pin_memory=pin_memory,
+        collate_fn=variable_channel_collate_fn_cls
     )
 
     if is_main_process():
@@ -407,17 +516,21 @@ def main():
     )
     model.to(device)
     
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    find_unused_parameters = train_cfg.get('find_unused_parameters', False)
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=find_unused_parameters)
 
     # Layer-wise LR Decay
     param_groups = get_layer_wise_lr(
-        model.module,
+        unwrap_model(model),
         base_lr=train_cfg['base_lr'],
         layer_decay=train_cfg.get('layer_decay', 0.65)
     )
     optimizer = optim.AdamW(param_groups, weight_decay=train_cfg['weight_decay'])
     
     # LR Scheduler (Warmup + Cosine)
+    if train_cfg['warmup_epochs'] > train_cfg['epochs']:
+        raise ValueError(f"warmup_epochs ({train_cfg['warmup_epochs']}) must be <= epochs ({train_cfg['epochs']})")
     if train_cfg['warmup_epochs'] > 0:
         scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=train_cfg['warmup_epochs'])
         scheduler_cosine = CosineAnnealingLR(
@@ -435,19 +548,39 @@ def main():
     
     criterion = nn.CrossEntropyLoss(label_smoothing=train_cfg.get('label_smoothing', 0.1))
 
-    best_metric = 0.0
+    best_metric = float("-inf")
+    best_threshold = 0.5
+    best_epoch = -1
+    start_epoch = 0
+    no_improve_epochs = 0
     total_epochs = train_cfg['epochs']
     use_amp = train_cfg.get('use_amp', True)
     mixup_alpha = train_cfg.get('mixup_alpha', 0.2)
+    grad_clip_norm = train_cfg.get('grad_clip_norm', 3.0)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    early_stop_patience = train_cfg.get('early_stop_patience', 0)
+    resume_path = train_cfg.get('resume_path')
+    if (not resume_path) and train_cfg.get('auto_resume', True):
+        candidate = os.path.join(train_cfg['save_dir'], "last_checkpoint.pth")
+        if os.path.exists(candidate):
+            resume_path = candidate
+    if resume_path and os.path.exists(resume_path):
+        resume_ckpt = load_checkpoint(resume_path, model, optimizer=optimizer, scheduler=scheduler, scaler=scaler)
+        start_epoch = int(resume_ckpt.get('epoch', -1)) + 1
+        best_metric = float(resume_ckpt.get('best_metric', best_metric))
+        best_threshold = float(resume_ckpt.get('best_threshold', best_threshold))
+        if is_main_process():
+            logger.info(f"resume_from={resume_path} start_epoch={start_epoch}")
 
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         if is_main_process():
             current_lr = optimizer.param_groups[0]['lr']
             print(f"\nEpoch {epoch+1}/{total_epochs} | LR: {current_lr:.2e}")
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
-            use_amp=use_amp, mixup_alpha=mixup_alpha
+            scaler=scaler, use_amp=use_amp, mixup_alpha=mixup_alpha, grad_clip_norm=grad_clip_norm
         )
         
         scheduler.step()
@@ -455,29 +588,94 @@ def main():
         val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th = validate(
             model, val_loader, criterion, device, data_cfg['num_classes'], 
             total_len=val_dataset_len, 
-            use_amp=use_amp
+            use_amp=use_amp,
+            search_threshold=(data_cfg['num_classes'] == 2),
+            fixed_threshold=best_threshold
         )
 
         if is_main_process():
             print(f"Train Loss: {train_loss:.4f}")
-            print(f"Val   Loss: {val_loss:.4f}")
+            print(f"{eval_split_name} Loss: {val_loss:.4f}")
             print("-" * 60)
             if data_cfg['num_classes'] == 2:
                 print(f"Applied Threshold: {best_th:.2f}")
-            print(f"最终测试集准确率 (Accuracy): {val_acc:.4f}")
+            print(f"{eval_split_name}准确率 (Accuracy): {val_acc:.4f}")
             print(f"AUC Score: {val_auc:.4f}")
             print("-" * 60)
-            print("最终测试集分类报告 (Classification Report):")
+            print(f"{eval_split_name}分类报告 (Classification Report):")
             print(val_report)
             print("-" * 60)
 
-        # 优先使用 AUC 或 F1 作为保存指标
-        metric_to_track = val_f1 if data_cfg['num_classes'] > 2 else val_auc
+        metric_to_track = val_f1 if data_cfg['num_classes'] == 2 else (val_f1 if data_cfg['num_classes'] > 2 else val_auc)
         
         if metric_to_track > best_metric:
             best_metric = metric_to_track
-            torch.save(model.module.state_dict(), os.path.join(train_cfg['save_dir'], "best_model.pth"))
+            best_threshold = best_th
+            best_epoch = epoch + 1
+            torch.save(unwrap_model(model).state_dict(), os.path.join(train_cfg['save_dir'], "best_model.pth"))
             print(f">>> Best model saved! (Metric: {best_metric:.4f})")
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+        if is_main_process():
+            torch.save(unwrap_model(model).state_dict(), os.path.join(train_cfg['save_dir'], "last_model.pth"))
+            save_checkpoint(
+                os.path.join(train_cfg['save_dir'], "last_checkpoint.pth"),
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                best_metric=best_metric,
+                best_threshold=best_threshold,
+                scaler=scaler
+            )
+        if is_main_process():
+            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f1={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={best_th:.4f}")
+        if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
+            if is_main_process():
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                logger.info(f"early_stopping epoch={epoch+1}")
+            break
+
+    best_model_path = os.path.join(train_cfg['save_dir'], "best_model.pth")
+    if os.path.exists(best_model_path):
+        state_dict = torch.load(best_model_path, map_location=device)
+        unwrap_model(model).load_state_dict(state_dict, strict=True)
+
+    if is_main_process():
+        threshold_payload = {
+            "threshold": float(best_threshold),
+            "epoch": int(best_epoch),
+            "split_used": val_mode
+        }
+        threshold_path = os.path.join(train_cfg['save_dir'], "best_threshold.json")
+        with open(threshold_path, "w", encoding="utf-8") as f:
+            json.dump(threshold_payload, f, ensure_ascii=False, indent=2)
+        print(f"Best threshold saved to: {threshold_path}")
+
+    if not threshold_calibration_only:
+        test_loss, test_acc, test_prec, test_rec, test_f1, test_auc, test_report, _ = validate(
+            model, test_loader, criterion, device, data_cfg['num_classes'],
+            total_len=test_dataset_len,
+            use_amp=use_amp,
+            search_threshold=False,
+            fixed_threshold=best_threshold
+        )
+
+    if is_main_process():
+        print(f"\nBest Epoch: {best_epoch}")
+        if threshold_calibration_only:
+            print(f"Inference Threshold: {best_threshold:.2f} (from split: {val_mode})")
+        else:
+            print(f"Test  Loss: {test_loss:.4f}")
+            if data_cfg['num_classes'] == 2:
+                print(f"Test Applied Threshold: {best_threshold:.2f}")
+            print(f"最终测试集准确率 (Accuracy): {test_acc:.4f}")
+            print(f"AUC Score: {test_auc:.4f}")
+            print("-" * 60)
+            print("最终测试集分类报告 (Classification Report):")
+            print(test_report)
+            print("-" * 60)
     
     cleanup_distributed()
 

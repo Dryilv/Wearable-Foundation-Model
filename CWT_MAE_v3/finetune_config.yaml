@@ -4,11 +4,22 @@ train:
   base_lr: 1.0e-4
   min_lr: 1.0e-6
   warmup_epochs: 5
+  val_mode: "test"
+  test_mode: "test"
   weight_decay: 0.05
   layer_decay: 0.65
   label_smoothing: 0.1
   use_amp: true
   mixup_alpha: 0.2
+  grad_clip_norm: 3.0
+  find_unused_parameters: false
+  early_stop_patience: 0
+  auto_resume: true
+  resume_path: null
+  seed: 42
+  deterministic: false
+  cudnn_benchmark: true
+  allow_tf32: true
   save_dir: "./checkpoints_cls768"
 
 data:
@@ -17,8 +28,12 @@ data:
   signal_len: 3000
   num_classes: 2
   num_workers: 4
+  pin_memory: true
   channel_policy: "ecg_ppg"
+  on_error: "raise"
+  max_error_logs: 20
   clean_indices_path: null
+  clean_val_indices_path: null
   clean_test_indices_path: null
 
 model:

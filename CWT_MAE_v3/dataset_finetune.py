@@ -52,13 +52,16 @@ class MultiChannelAugmentor:
 # 2. Dataset 定义
 # ===================================================================
 class DownstreamClassificationDataset(Dataset):
-    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2, channel_policy='default_5ch'):
+    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2, channel_policy='default_5ch', on_error='raise', max_error_logs=20):
         self.data_root = data_root
         self.signal_len = signal_len
         self.mode = mode
         self.task_index = task_index
         self.num_classes = num_classes
         self.channel_policy = channel_policy
+        self.on_error = on_error
+        self.max_error_logs = max_error_logs
+        self.error_count = 0
 
         # 训练集开启增强
         self.augmentor = MultiChannelAugmentor(p=0.5) if mode == 'train' else None
@@ -195,8 +198,11 @@ class DownstreamClassificationDataset(Dataset):
             return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
 
         except Exception as e:
-            # print(f"Error loading {filename}: {e}") # 生产环境建议 log 而非 print
-            # 返回全0兜底，防止训练中断
+            self.error_count += 1
+            if self.error_count <= self.max_error_logs:
+                print(f"[{self.mode}] Error loading {filename}: {e}")
+            if self.on_error == 'raise':
+                raise
             modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
             return torch.zeros(5, self.signal_len), modality_ids, torch.tensor(0, dtype=torch.long)
 
