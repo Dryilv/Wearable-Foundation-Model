@@ -1,5 +1,6 @@
 import os
 import argparse
+import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -133,7 +134,7 @@ def mixup_data(x, y, alpha=1.0, device='cuda'):
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=True):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=True, mixup_alpha=0.2):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
@@ -157,7 +158,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, use_amp=
             x, y = x.to(device), y.to(device)
         
         # Mixup
-        inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=0.2, device=device)
+        inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=mixup_alpha, device=device)
         
         optimizer.zero_grad()
         
@@ -303,54 +304,20 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
 # -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, required=True)
-    parser.add_argument('--split_file', type=str, required=True)
-    parser.add_argument('--pretrained_path', type=str, default=None)
-    parser.add_argument('--save_dir', type=str, default="./checkpoints_cls768")
-    
-    parser.add_argument('--num_classes', type=int, default=2)
-    parser.add_argument('--signal_len', type=int, default=3000)
-
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=0.05)
-    parser.add_argument('--warmup_epochs', type=int, default=5, help="Number of warmup epochs")
-    parser.add_argument('--min_lr', type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing")
-
-    # CWT-MAE 模型参数
-    parser.add_argument('--embed_dim', type=int, default=768) 
-    parser.add_argument('--depth', type=int, default=12)
-    parser.add_argument('--num_heads', type=int, default=12)
-    parser.add_argument('--cwt_scales', type=int, default=64)
-    parser.add_argument('--patch_size_time', type=int, default=25)
-    parser.add_argument('--patch_size_freq', type=int, default=8)
-    parser.add_argument('--use_diff', action='store_true', help="Use differential channels (d1, d2)")
-    
-    # [新增] CoT 参数
-    parser.add_argument('--use_cot', action='store_true', help="Enable Chain-of-Thought Reasoning Head")
-    parser.add_argument('--num_reasoning_tokens', type=int, default=16)
-
-    # [新增] ArcFace 参数
-    parser.add_argument('--use_arcface', action='store_true', help="Enable ArcFace Metric Learning")
-    parser.add_argument('--arcface_s', type=float, default=30.0, help="ArcFace scale factor")
-    parser.add_argument('--arcface_m', type=float, default=0.50, help="ArcFace margin")
-
-    parser.add_argument('--clean_indices_path', type=str, default=None)
-    parser.add_argument('--clean_test_indices_path', type=str, default=None)
-    
-    # [新增] 通道策略
-    parser.add_argument('--channel_policy', type=str, default='ecg_ppg',
-                        choices=['ecg_only', 'ppg_only', 'ecg_ppg'],
-                        help="Data channel configuration: 'ecg_only' (ECG), 'ppg_only' (PPG), 'ecg_ppg' (ECG, PPG)")
-    
+    parser.add_argument('--config', default='finetune_config.yaml', type=str)
     args = parser.parse_args()
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+
+    train_cfg = config['train']
+    data_cfg = config['data']
+    model_cfg = config['model']
 
     local_rank, rank, world_size = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
     
     if is_main_process():
-        os.makedirs(args.save_dir, exist_ok=True)
+        os.makedirs(train_cfg['save_dir'], exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
         
     # Enable cuDNN benchmark for stable performance and potentially avoid kernel issues
@@ -360,30 +327,32 @@ def main():
 
     # Dataset 初始化
     train_ds = DownstreamClassificationDataset(
-        args.data_root, args.split_file, mode='train', 
-        signal_len=args.signal_len, num_classes=args.num_classes,
-        channel_policy=args.channel_policy
+        data_cfg['data_root'], data_cfg['split_file'], mode='train', 
+        signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
+        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg')
     )
     val_ds = DownstreamClassificationDataset(
-        args.data_root, args.split_file, mode='test', 
-        signal_len=args.signal_len, num_classes=args.num_classes,
-        channel_policy=args.channel_policy
+        data_cfg['data_root'], data_cfg['split_file'], mode='test', 
+        signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
+        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg')
     )
 
     val_dataset_len = len(val_ds)
 
     # 数据清洗逻辑 (可选)
-    if args.clean_indices_path and os.path.exists(args.clean_indices_path):
+    clean_indices_path = data_cfg.get('clean_indices_path')
+    clean_test_indices_path = data_cfg.get('clean_test_indices_path')
+    if clean_indices_path and os.path.exists(clean_indices_path):
         if is_main_process():
-            print(f"\n[Data Cleaning] Loading clean indices from {args.clean_indices_path}...")
-        clean_indices = np.load(args.clean_indices_path)
+            print(f"\n[Data Cleaning] Loading clean indices from {clean_indices_path}...")
+        clean_indices = np.load(clean_indices_path)
         clean_indices = clean_indices[clean_indices < len(train_ds)]
         train_ds = Subset(train_ds, clean_indices)
         
-    if args.clean_test_indices_path and os.path.exists(args.clean_test_indices_path):
+    if clean_test_indices_path and os.path.exists(clean_test_indices_path):
         if is_main_process():
-            print(f"\n[Test Cleaning] Loading indices from {args.clean_test_indices_path}...")
-        clean_test_indices = np.load(args.clean_test_indices_path)
+            print(f"\n[Test Cleaning] Loading indices from {clean_test_indices_path}...")
+        clean_test_indices = np.load(clean_test_indices_path)
         clean_test_indices = clean_test_indices[clean_test_indices < len(val_ds)]
         val_ds = Subset(val_ds, clean_test_indices)
         val_dataset_len = len(val_ds)
@@ -394,89 +363,106 @@ def main():
     # DataLoader: 必须使用 variable_channel_collate_fn_cls
     train_loader = DataLoader(
         train_ds, 
-        batch_size=args.batch_size, 
+        batch_size=train_cfg['batch_size'], 
         sampler=train_sampler, 
-        num_workers=4, 
+        num_workers=data_cfg.get('num_workers', 4), 
         pin_memory=True,
         collate_fn=variable_channel_collate_fn_cls # 关键修改
     )
     val_loader = DataLoader(
         val_ds, 
-        batch_size=args.batch_size, 
+        batch_size=train_cfg['batch_size'], 
         sampler=val_sampler, 
-        num_workers=4, 
+        num_workers=data_cfg.get('num_workers', 4), 
         pin_memory=True,
         collate_fn=variable_channel_collate_fn_cls # 关键修改
     )
 
     if is_main_process():
-        print(f"Initializing CWT-MAE Classifier (RoPE + Tensorized + CoT={args.use_cot})...")
+        print(f"Initializing CWT-MAE Classifier (RoPE + Tensorized + CoT={model_cfg.get('use_cot', True)})...")
         
     model = TF_MAE_Classifier(
-        pretrained_path=args.pretrained_path,
-        num_classes=args.num_classes,
+        pretrained_path=model_cfg.get('pretrained_path'),
+        num_classes=data_cfg['num_classes'],
         # Encoder 参数
-        signal_len=args.signal_len,
-        cwt_scales=args.cwt_scales,
-        patch_size_time=args.patch_size_time,
-        patch_size_freq=args.patch_size_freq,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        use_diff=args.use_diff,
+        signal_len=data_cfg['signal_len'],
+        cwt_scales=model_cfg.get('cwt_scales', 64),
+        patch_size_time=model_cfg.get('patch_size_time', 25),
+        patch_size_freq=model_cfg.get('patch_size_freq', 8),
+        embed_dim=model_cfg.get('embed_dim', 768),
+        depth=model_cfg.get('depth', 12),
+        num_heads=model_cfg.get('num_heads', 12),
+        use_diff=model_cfg.get('use_diff', False),
         # Decoder 参数 (虽然会被删除，但初始化 Encoder 时需要)
-        decoder_embed_dim=512, 
-        decoder_depth=8,
-        decoder_num_heads=16,
+        decoder_embed_dim=model_cfg.get('decoder_embed_dim', 512), 
+        decoder_depth=model_cfg.get('decoder_depth', 8),
+        decoder_num_heads=model_cfg.get('decoder_num_heads', 16),
         # CoT 参数
-        use_cot=args.use_cot,
-        num_reasoning_tokens=args.num_reasoning_tokens,
+        use_cot=model_cfg.get('use_cot', True),
+        num_reasoning_tokens=model_cfg.get('num_reasoning_tokens', 16),
         # ArcFace 参数
-        use_arcface=args.use_arcface,
-        arcface_s=args.arcface_s,
-        arcface_m=args.arcface_m
+        use_arcface=model_cfg.get('use_arcface', False),
+        arcface_s=model_cfg.get('arcface_s', 30.0),
+        arcface_m=model_cfg.get('arcface_m', 0.50)
     )
     model.to(device)
     
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     # Layer-wise LR Decay
-    param_groups = get_layer_wise_lr(model.module, base_lr=args.lr, layer_decay=0.65)
-    optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
+    param_groups = get_layer_wise_lr(
+        model.module,
+        base_lr=train_cfg['base_lr'],
+        layer_decay=train_cfg.get('layer_decay', 0.65)
+    )
+    optimizer = optim.AdamW(param_groups, weight_decay=train_cfg['weight_decay'])
     
     # LR Scheduler (Warmup + Cosine)
-    if args.warmup_epochs > 0:
-        scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=args.warmup_epochs)
-        scheduler_cosine = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=args.min_lr)
-        scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[args.warmup_epochs])
+    if train_cfg['warmup_epochs'] > 0:
+        scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=train_cfg['warmup_epochs'])
+        scheduler_cosine = CosineAnnealingLR(
+            optimizer,
+            T_max=train_cfg['epochs'] - train_cfg['warmup_epochs'],
+            eta_min=train_cfg['min_lr']
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[scheduler_warmup, scheduler_cosine],
+            milestones=[train_cfg['warmup_epochs']]
+        )
     else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
+        scheduler = CosineAnnealingLR(optimizer, T_max=train_cfg['epochs'], eta_min=train_cfg['min_lr'])
     
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=train_cfg.get('label_smoothing', 0.1))
 
     best_metric = 0.0
+    total_epochs = train_cfg['epochs']
+    use_amp = train_cfg.get('use_amp', True)
+    mixup_alpha = train_cfg.get('mixup_alpha', 0.2)
 
-    for epoch in range(args.epochs):
+    for epoch in range(total_epochs):
         if is_main_process():
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"\nEpoch {epoch+1}/{args.epochs} | LR: {current_lr:.2e}")
+            print(f"\nEpoch {epoch+1}/{total_epochs} | LR: {current_lr:.2e}")
 
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, use_amp=True)
+            model, train_loader, criterion, optimizer, device, epoch,
+            use_amp=use_amp, mixup_alpha=mixup_alpha
+        )
         
         scheduler.step()
 
         val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th = validate(
-            model, val_loader, criterion, device, args.num_classes, 
+            model, val_loader, criterion, device, data_cfg['num_classes'], 
             total_len=val_dataset_len, 
-            use_amp=True
+            use_amp=use_amp
         )
 
         if is_main_process():
             print(f"Train Loss: {train_loss:.4f}")
             print(f"Val   Loss: {val_loss:.4f}")
             print("-" * 60)
-            if args.num_classes == 2:
+            if data_cfg['num_classes'] == 2:
                 print(f"Applied Threshold: {best_th:.2f}")
             print(f"最终测试集准确率 (Accuracy): {val_acc:.4f}")
             print(f"AUC Score: {val_auc:.4f}")
@@ -486,11 +472,11 @@ def main():
             print("-" * 60)
 
         # 优先使用 AUC 或 F1 作为保存指标
-        metric_to_track = val_f1 if args.num_classes > 2 else val_auc
+        metric_to_track = val_f1 if data_cfg['num_classes'] > 2 else val_auc
         
         if metric_to_track > best_metric:
             best_metric = metric_to_track
-            torch.save(model.module.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
+            torch.save(model.module.state_dict(), os.path.join(train_cfg['save_dir'], "best_model.pth"))
             print(f">>> Best model saved! (Metric: {best_metric:.4f})")
     
     cleanup_distributed()

@@ -1,0 +1,40 @@
+train:
+  epochs: 30
+  batch_size: 32
+  base_lr: 1.0e-4
+  min_lr: 1.0e-6
+  warmup_epochs: 5
+  weight_decay: 0.05
+  layer_decay: 0.65
+  label_smoothing: 0.1
+  use_amp: true
+  mixup_alpha: 0.2
+  save_dir: "./checkpoints_cls768"
+
+data:
+  data_root: ""
+  split_file: ""
+  signal_len: 3000
+  num_classes: 2
+  num_workers: 4
+  channel_policy: "ecg_ppg"
+  clean_indices_path: null
+  clean_test_indices_path: null
+
+model:
+  pretrained_path: null
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  cwt_scales: 64
+  patch_size_time: 25
+  patch_size_freq: 8
+  use_diff: false
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+  use_cot: false
+  num_reasoning_tokens: 16
+  use_arcface: false
+  arcface_s: 30.0
+  arcface_m: 0.5
