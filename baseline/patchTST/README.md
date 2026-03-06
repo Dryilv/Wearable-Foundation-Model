@@ -6,8 +6,10 @@ This project implements the PatchTST model for self-supervised pre-training on p
 
 - `train.py`: Main training script with DDP and AMP support.
 - `patchtst_model.py`: PatchTST model definition.
+- `finetune_linear_probe.py`: Linear probing script for downstream classification.
 - `dataset.py`: Data loading logic (same as CWT-MAE v3).
 - `config.yaml`: Configuration file for hyperparameters.
+- `finetune_linear_probe_config.yaml`: Config for downstream linear probing.
 - `utils.py`: Helper functions for logging and visualization.
 - `utils_metrics.py`: Metrics tracking.
 
@@ -41,6 +43,15 @@ This project implements the PatchTST model for self-supervised pre-training on p
 
 3. **Visualization**:
    Reconstruction results will be saved in `checkpoints_patchtst/vis_results` during training.
+
+4. **Downstream Linear Probe Classification**:
+   ```bash
+   python finetune_linear_probe.py --config finetune_linear_probe_config.yaml
+   ```
+   For distributed training:
+   ```bash
+   torchrun --nproc_per_node=2 finetune_linear_probe.py --config finetune_linear_probe_config.yaml
+   ```
 
 ## Configuration
 
