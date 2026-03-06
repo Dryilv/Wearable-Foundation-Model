@@ -217,7 +217,7 @@ class TrueFactorizedBlock(nn.Module):
         B, MN, D = x.shape
         
         # --- 1. Time Attention ---
-        x_time = x.view(B * M, N, D)
+        x_time = x.contiguous().view(B * M, N, D)
         
         if rope_cos is not None and rope_sin is not None:
             cos_t = rope_cos if rope_cos.shape[0] == B * M else rope_cos.repeat_interleave(M, dim=0)
