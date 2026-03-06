@@ -520,13 +520,24 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=find_unused_parameters)
 
-    # Layer-wise LR Decay
-    param_groups = get_layer_wise_lr(
-        unwrap_model(model),
-        base_lr=train_cfg['base_lr'],
-        layer_decay=train_cfg.get('layer_decay', 0.65)
-    )
-    optimizer = optim.AdamW(param_groups, weight_decay=train_cfg['weight_decay'])
+    use_layer_wise_lr = train_cfg.get('use_layer_wise_lr', True)
+    if use_layer_wise_lr:
+        param_groups = get_layer_wise_lr(
+            unwrap_model(model),
+            base_lr=train_cfg['base_lr'],
+            layer_decay=train_cfg.get('layer_decay', 0.65)
+        )
+        optimizer = optim.AdamW(param_groups, weight_decay=train_cfg['weight_decay'])
+        if is_main_process():
+            print("Optimizer: AdamW with layer-wise LR decay")
+    else:
+        optimizer = optim.AdamW(
+            unwrap_model(model).parameters(),
+            lr=train_cfg['base_lr'],
+            weight_decay=train_cfg['weight_decay']
+        )
+        if is_main_process():
+            print("Optimizer: AdamW with uniform learning rate")
     
     # LR Scheduler (Warmup + Cosine)
     if train_cfg['warmup_epochs'] > train_cfg['epochs']:
