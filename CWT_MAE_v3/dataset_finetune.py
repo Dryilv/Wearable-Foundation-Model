@@ -6,6 +6,11 @@ import json
 import os
 import random
 from scipy import signal as scipy_signal
+import torch.distributed as dist
+
+
+def is_main_process():
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
 # ===================================================================
 # 1. 通用信号增强器 (适配多通道 & 增强多样性)
@@ -76,7 +81,8 @@ class DownstreamClassificationDataset(Dataset):
             raise ValueError(f"Mode {mode} not found in split file.")
             
         self.file_list = splits[mode]
-        print(f"[{mode}] Loaded {len(self.file_list)} samples.")
+        if is_main_process():
+            print(f"[{mode}] Loaded {len(self.file_list)} samples.")
 
     def __len__(self):
         return len(self.file_list)

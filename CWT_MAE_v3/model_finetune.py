@@ -1,10 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 import math
 
 # 确保 model.py (包含 CWT_MAE_RoPE 和 cwt_wrap) 在同一目录下
 from model import CWT_MAE_RoPE, cwt_wrap
+
+
+def is_main_process():
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
 
 # ===================================================================
 # 1. 隐式思维链模块 (Latent Reasoning / Chain-of-Thought Head)
@@ -148,7 +153,8 @@ class TF_MAE_Classifier(nn.Module):
 
         # 4. 初始化分类头
         if use_cot:
-            print(f">>> Initializing Latent Reasoning Head (CoT) with {num_reasoning_tokens} tokens.")
+            if is_main_process():
+                print(f">>> Initializing Latent Reasoning Head (CoT) with {num_reasoning_tokens} tokens.")
             self.head = LatentReasoningHead(
                 embed_dim=self.embed_dim,
                 num_heads=kwargs.get('num_heads', 12),
@@ -168,7 +174,8 @@ class TF_MAE_Classifier(nn.Module):
 
         # 5. ArcFace Head (Optional)
         if use_arcface:
-            print(f">>> Initializing ArcFace Head (s={arcface_s}, m={arcface_m})")
+            if is_main_process():
+                print(f">>> Initializing ArcFace Head (s={arcface_s}, m={arcface_m})")
             # Input to ArcFace is the output of `head`. 
             # If CoT is used, head outputs `embed_dim` (modified above).
             # If Linear is used, head outputs `embed_dim` (modified above).
@@ -190,7 +197,8 @@ class TF_MAE_Classifier(nn.Module):
                 delattr(self.encoder_model, component)
 
     def _load_pretrained_weights(self, path):
-        print(f"Loading weights from {path}...")
+        if is_main_process():
+            print(f"Loading weights from {path}...")
         checkpoint = torch.load(path, map_location='cpu')
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
 
@@ -224,16 +232,17 @@ class TF_MAE_Classifier(nn.Module):
         # Filter out expected missing keys (decoder stuff)
         actual_missing = [k for k in msg.missing_keys if not any(x in k for x in ["decoder", "mask_token", "time_reducer", "time_pred", "rope_decoder"])]
         
-        print(f"Weights loaded.")
-        if actual_missing:
-            print(f"WARNING: Missing encoder keys: {actual_missing}")
-        else:
-            print("Encoder weights loaded successfully.")
+        if is_main_process():
+            print(f"Weights loaded.")
+            if actual_missing:
+                print(f"WARNING: Missing encoder keys: {actual_missing}")
+            else:
+                print("Encoder weights loaded successfully.")
             
         if msg.unexpected_keys:
              # Filter out proj_head keys which are expected to be unused (from contrastive learning)
              actual_unexpected = [k for k in msg.unexpected_keys if "proj_head" not in k]
-             if actual_unexpected:
+             if actual_unexpected and is_main_process():
                  print(f"Unexpected keys: {actual_unexpected}")
 
     def _interpolate_pos_embed(self, state_dict, key, new_pos_embed):
@@ -241,7 +250,8 @@ class TF_MAE_Classifier(nn.Module):
         old_pos_embed = state_dict[key] 
         if old_pos_embed.shape[1] == new_pos_embed.shape[1]: return
 
-        print(f"Interpolating {key}: {old_pos_embed.shape[1]} -> {new_pos_embed.shape[1]}")
+        if is_main_process():
+            print(f"Interpolating {key}: {old_pos_embed.shape[1]} -> {new_pos_embed.shape[1]}")
         # cls_token = old_pos_embed[:, :1, :]
         patch_tokens = old_pos_embed # Assuming no CLS token in model.py
         
