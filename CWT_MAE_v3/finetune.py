@@ -189,6 +189,44 @@ def mixup_data(x, y, alpha=1.0, device='cuda'):
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean', label_smoothing=0.0):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.reduction = reduction
+        self.label_smoothing = float(label_smoothing)
+        self.alpha_scalar = None
+        if alpha is None:
+            self.register_buffer("alpha_tensor", None)
+        elif isinstance(alpha, (list, tuple)):
+            self.register_buffer("alpha_tensor", torch.tensor(alpha, dtype=torch.float32))
+        else:
+            self.register_buffer("alpha_tensor", None)
+            self.alpha_scalar = float(alpha)
+
+    def forward(self, logits, targets):
+        ce_loss = F.cross_entropy(
+            logits,
+            targets,
+            reduction='none',
+            label_smoothing=self.label_smoothing
+        )
+        pt = torch.exp(-ce_loss)
+        focal_weight = (1.0 - pt) ** self.gamma
+        loss = focal_weight * ce_loss
+
+        if self.alpha_tensor is not None:
+            alpha_t = self.alpha_tensor[targets]
+            loss = alpha_t * loss
+        elif self.alpha_scalar is not None:
+            loss = self.alpha_scalar * loss
+
+        if self.reduction == 'sum':
+            return loss.sum()
+        if self.reduction == 'none':
+            return loss
+        return loss.mean()
+
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, mixup_alpha=0.2, grad_clip_norm=3.0):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
@@ -557,7 +595,25 @@ def main():
     else:
         scheduler = CosineAnnealingLR(optimizer, T_max=train_cfg['epochs'], eta_min=train_cfg['min_lr'])
     
-    criterion = nn.CrossEntropyLoss(label_smoothing=train_cfg.get('label_smoothing', 0.1))
+    use_focal_loss = train_cfg.get('use_focal_loss', False)
+    label_smoothing = train_cfg.get('label_smoothing', 0.1)
+    if use_focal_loss:
+        criterion = FocalLoss(
+            gamma=train_cfg.get('focal_gamma', 2.0),
+            alpha=train_cfg.get('focal_alpha', None),
+            reduction=train_cfg.get('focal_reduction', 'mean'),
+            label_smoothing=label_smoothing
+        )
+        if is_main_process():
+            print(
+                f"Loss: FocalLoss(gamma={train_cfg.get('focal_gamma', 2.0)}, "
+                f"alpha={train_cfg.get('focal_alpha', None)}, "
+                f"label_smoothing={label_smoothing})"
+            )
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        if is_main_process():
+            print(f"Loss: CrossEntropyLoss(label_smoothing={label_smoothing})")
 
     best_metric = float("-inf")
     best_threshold = 0.5

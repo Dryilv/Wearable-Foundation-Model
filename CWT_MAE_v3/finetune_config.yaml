@@ -1,44 +1,71 @@
 train:
+  # ===== 训练轮次与数据划分 =====
   epochs: 30
   batch_size: 32
+  val_mode: "test"
+  test_mode: "test"
+
+  # ===== 优化器与学习率 =====
   base_lr: 1.0e-4
   min_lr: 1.0e-6
   warmup_epochs: 5
-  val_mode: "test"
-  test_mode: "test"
   weight_decay: 0.05
   use_layer_wise_lr: true
   layer_decay: 0.65
+
+  # ===== 损失函数配置 =====
   label_smoothing: 0.1
+  use_focal_loss: false
+  focal_gamma: 2.0
+  focal_alpha: null
+  focal_reduction: "mean"
+
+  # ===== 训练稳定性与加速 =====
   use_amp: true
   mixup_alpha: 0.2
   grad_clip_norm: 3.0
   find_unused_parameters: false
-  early_stop_patience: 0
-  auto_resume: true
-  resume_path: null
+  allow_tf32: true
+  cudnn_benchmark: true
+
+  # ===== 复现性与恢复训练 =====
   seed: 42
   deterministic: false
-  cudnn_benchmark: true
-  allow_tf32: true
+  auto_resume: true
+  resume_path: null
+  early_stop_patience: 0
+
+  # ===== 输出目录 =====
   save_dir: "./checkpoints_cls768"
 
 data:
+  # ===== 数据路径 =====
   data_root: ""
   split_file: ""
+
+  # ===== 数据形态 =====
   signal_len: 3000
   num_classes: 2
+
+  # ===== DataLoader =====
   num_workers: 4
   pin_memory: true
+
+  # ===== 通道与异常处理 =====
   channel_policy: "ecg_ppg"
   on_error: "raise"
   max_error_logs: 20
+
+  # ===== 可选清洗索引 =====
   clean_indices_path: null
   clean_val_indices_path: null
   clean_test_indices_path: null
 
 model:
+  # ===== 预训练权重 =====
   pretrained_path: null
+
+  # ===== 编码器结构 =====
   embed_dim: 768
   depth: 12
   num_heads: 12
@@ -46,11 +73,17 @@ model:
   patch_size_time: 25
   patch_size_freq: 8
   use_diff: false
+
+  # ===== 解码器结构（分类阶段仅用于初始化） =====
   decoder_embed_dim: 512
   decoder_depth: 8
   decoder_num_heads: 16
+
+  # ===== CoT 模块 =====
   use_cot: false
   num_reasoning_tokens: 16
+
+  # ===== ArcFace 头 =====
   use_arcface: false
   arcface_s: 30.0
   arcface_m: 0.5
