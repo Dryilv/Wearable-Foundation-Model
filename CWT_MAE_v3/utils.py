@@ -101,87 +101,61 @@ def init_distributed_mode():
 import torch
 
 def get_layer_wise_lr(model, base_lr, layer_decay):
-    """
-    【修正版】
-    为双编码器模型 (DualEncoder_Classifier) 设置分层学习率。
-    - 分别为 ppg_encoder 和 ecg_encoder 的 Transformer blocks 设置递减的学习率。
-    - 为两个编码器的其他部分 (patch_embed, cls_token, pos_embed) 设置基础学习率 * decay^num_layers。
-    - 为分类头 (head) 和其他参数设置基础学习率。
-    """
     param_groups = {}
+    handled = set()
 
-    # --- 辅助函数，用于处理单个编码器 ---
-    def process_encoder(encoder, prefix, num_layers):
-        # 遍历编码器的所有命名参数
+    def add_group(group_name, param, lr):
+        if group_name not in param_groups:
+            param_groups[group_name] = {'params': [], 'lr': lr}
+        param_groups[group_name]['params'].append(param)
+        handled.add(param)
+
+    def process_encoder(encoder, prefix):
+        num_layers = len(getattr(encoder, 'blocks', []))
         for name, param in encoder.named_parameters():
             if not param.requires_grad:
                 continue
-
-            # 为 Transformer blocks 设置递减学习率
-            if name.startswith('blocks.'):
-                # 从 name 中解析出层号, e.g., 'blocks.5.norm1.weight' -> 5
+            if name.startswith('blocks.') and num_layers > 0:
                 try:
                     layer_id = int(name.split('.')[1])
-                    lr_scale = layer_decay ** (num_layers - 1 - layer_id)
-                    group_name = f'{prefix}_layer_{layer_id}'
-                    
-                    if group_name not in param_groups:
-                        param_groups[group_name] = {'params': [], 'lr': base_lr * lr_scale}
-                    param_groups[group_name]['params'].append(param)
+                    lr_scale = layer_decay ** max(num_layers - 1 - layer_id, 0)
+                    add_group(f'{prefix}_layer_{layer_id}', param, base_lr * lr_scale)
                 except (ValueError, IndexError):
-                    # 如果解析失败，则使用默认学习率
-                    if 'default' not in param_groups:
-                        param_groups['default'] = {'params': [], 'lr': base_lr}
-                    param_groups['default']['params'].append(param)
-
-            # 为 patch_embed, cls_token, pos_embed 设置一个固定的、较低的学习率
+                    add_group('default', param, base_lr)
             elif name.startswith(('patch_embed', 'cls_token', 'pos_embed')):
                 lr_scale = layer_decay ** num_layers
-                group_name = f'{prefix}_embed'
-                
-                if group_name not in param_groups:
-                    param_groups[group_name] = {'params': [], 'lr': base_lr * lr_scale}
-                param_groups[group_name]['params'].append(param)
-            
-            # 其他参数 (如 norm) 使用默认学习率
+                add_group(f'{prefix}_embed', param, base_lr * lr_scale)
             else:
-                if 'default' not in param_groups:
-                    param_groups['default'] = {'params': [], 'lr': base_lr}
-                param_groups['default']['params'].append(param)
+                add_group('default', param, base_lr)
 
-    # --- 主逻辑 ---
-    
-    # 1. 处理 PPG Encoder
+    if hasattr(model, 'encoder_model'):
+        print("Applying layer-wise learning rate decay to encoder_model.")
+        process_encoder(model.encoder_model, 'encoder')
+
     if hasattr(model, 'ppg_encoder'):
         print("Applying layer-wise learning rate decay to ppg_encoder.")
-        num_layers_ppg = len(model.ppg_encoder.blocks)
-        process_encoder(model.ppg_encoder, 'ppg', num_layers_ppg)
-    
-    # 2. 处理 ECG Encoder
+        process_encoder(model.ppg_encoder, 'ppg')
+
     if hasattr(model, 'ecg_encoder'):
         print("Applying layer-wise learning rate decay to ecg_encoder.")
-        num_layers_ecg = len(model.ecg_encoder.blocks)
-        process_encoder(model.ecg_encoder, 'ecg', num_layers_ecg)
+        process_encoder(model.ecg_encoder, 'ecg')
 
-    # 3. 处理分类头 (Head) - 通常使用基础学习率
     if hasattr(model, 'head'):
         print("Applying base learning rate to the classification head.")
-        if 'head' not in param_groups:
-            param_groups['head'] = {'params': [], 'lr': base_lr}
-        param_groups['head']['params'].extend(model.head.parameters())
+        for param in model.head.parameters():
+            if param.requires_grad:
+                add_group('head', param, base_lr)
+    if hasattr(model, 'arcface_head'):
+        for param in model.arcface_head.parameters():
+            if param.requires_grad:
+                add_group('head', param, base_lr)
 
-    # 4. 检查是否有任何参数被遗漏 (安全措施)
-    all_params = set(model.parameters())
-    grouped_params = set()
-    for group in param_groups.values():
-        grouped_params.update(group['params'])
-    
-    ungrouped_params = all_params - grouped_params
+    all_params = {p for p in model.parameters() if p.requires_grad}
+    ungrouped_params = all_params - handled
     if ungrouped_params:
         print(f"Warning: {len(ungrouped_params)} parameters were not assigned to any group. Adding them to default group.")
-        if 'default' not in param_groups:
-            param_groups['default'] = {'params': [], 'lr': base_lr}
-        param_groups['default']['params'].extend(list(ungrouped_params))
+        for param in ungrouped_params:
+            add_group('default', param, base_lr)
 
     return list(param_groups.values())
 # Visualization (已修改：支持 5 通道多变量可视化)

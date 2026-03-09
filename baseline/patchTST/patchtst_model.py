@@ -183,3 +183,91 @@ class PatchTST_Pretrain(nn.Module):
         loss = (loss * mask).sum() / (mask.sum() + 1e-6)
 
         return loss, pred_patches, target_patches, mask
+
+class PatchTST_LinearProbeClassifier(nn.Module):
+    def __init__(
+            self,
+            seq_len=3000,
+            patch_len=50,
+            stride=50,
+            in_channels=5,
+            d_model=768,
+            n_heads=12,
+            e_layers=12,
+            d_ff=3072,
+            dropout=0.1,
+            use_revin=True,
+            num_classes=2,
+            cls_dropout=0.0,
+            pretrained_path=None
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.patch_len = patch_len
+        self.stride = stride
+        self.in_channels = in_channels
+        self.d_model = d_model
+        self.use_revin = use_revin
+        self.num_classes = num_classes
+
+        if self.use_revin:
+            self.revin = RevIN(in_channels, affine=True)
+
+        self.patch_num = int((seq_len - patch_len) / stride + 1)
+
+        self.value_embedding = nn.Linear(patch_len, d_model, bias=False)
+        self.position_embedding = PositionalEncoding(d_model, max_len=self.patch_num)
+        self.dropout = nn.Dropout(dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=e_layers)
+        self.cls_dropout = nn.Dropout(cls_dropout)
+        self.cls_head = nn.Linear(d_model, num_classes)
+
+        if pretrained_path:
+            self.load_pretrained(pretrained_path)
+
+    def load_pretrained(self, pretrained_path):
+        checkpoint = torch.load(pretrained_path, map_location='cpu')
+        state_dict = checkpoint.get('model', checkpoint)
+        clean_state = {}
+        for k, v in state_dict.items():
+            nk = k
+            if nk.startswith('module.'):
+                nk = nk[len('module.'):]
+            if nk.startswith('_orig_mod.'):
+                nk = nk[len('_orig_mod.'):]
+            if nk.startswith('head.'):
+                continue
+            if nk.startswith('cls_head.'):
+                continue
+            clean_state[nk] = v
+        self.load_state_dict(clean_state, strict=False)
+
+    def freeze_backbone(self):
+        for name, p in self.named_parameters():
+            if not name.startswith('cls_head'):
+                p.requires_grad = False
+
+    def forward(self, x):
+        B, L, M = x.shape
+        if self.use_revin:
+            x = self.revin(x, 'norm')
+        x = x.permute(0, 2, 1).contiguous().view(B * M, L, 1)
+        x = x.unfold(dimension=1, size=self.patch_len, step=self.stride).squeeze(2)
+        x = self.value_embedding(x)
+        x = self.position_embedding(x)
+        x = self.dropout(x)
+        x = self.encoder(x)
+        x = x.mean(dim=1)
+        x = x.view(B, M, self.d_model).mean(dim=1)
+        x = self.cls_dropout(x)
+        return self.cls_head(x)

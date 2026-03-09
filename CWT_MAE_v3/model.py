@@ -11,8 +11,8 @@ import torch.fft
 def create_ricker_wavelets(points, scales):
     scales = scales.float()
     t = torch.arange(0, points, device=scales.device).float() - (points - 1.0) / 2
-    t = t.view(1, 1, -1) 
-    scales = scales.view(-1, 1, 1)
+    t = t.reshape(1, 1, -1) 
+    scales = scales.reshape(-1, 1, 1)
     pi_factor = math.pi ** 0.25
     A = 2 / (torch.sqrt(3 * scales) * pi_factor + 1e-6)
     wsq = scales ** 2
@@ -55,8 +55,8 @@ def cwt_ricker(x, scales):
     # x is (B, 1, L), wavelets is (S, 1, W). Output is (B, S, L).
     # Convolution in frequency domain: element-wise multiplication.
     
-    X_f = X_f.view(batch_size, 1, -1)
-    W_f = W_f.view(1, num_scales, -1)
+    X_f = X_f.reshape(batch_size, 1, -1)
+    W_f = W_f.reshape(1, num_scales, -1)
     
     Out_f = X_f * W_f # (B, S, n_fft)
     
@@ -70,7 +70,7 @@ def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0, use_diff=True):
     if x.dim() == 2:
         x = x.unsqueeze(1)
     B, M, L = x.shape
-    x_flat = x.view(B * M, L)
+    x_flat = x.reshape(B * M, L)
     
     if use_diff:
         x_pad = F.pad(x_flat, (1, 1), mode='replicate') 
@@ -87,13 +87,13 @@ def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0, use_diff=True):
         signals = base.unsqueeze(1) # (BM, 1, L)
         
     BM, C, _ = signals.shape
-    signals_flat = signals.view(BM * C, L)
+    signals_flat = signals.reshape(BM * C, L)
     
     scales = torch.arange(num_scales, device=x.device) * step + lowest_scale
     cwt_out = cwt_ricker(signals_flat, scales)
     _, n_scales, _ = cwt_out.shape
     
-    cwt_out = cwt_out.view(B, M, C, n_scales, L)
+    cwt_out = cwt_out.reshape(B, M, C, n_scales, L)
     return cwt_out
 
 # ===================================================================
@@ -217,7 +217,7 @@ class TrueFactorizedBlock(nn.Module):
         B, MN, D = x.shape
         
         # --- 1. Time Attention ---
-        x_time = x.view(B * M, N, D)
+        x_time = x.contiguous().reshape(B * M, N, D)
         
         if rope_cos is not None and rope_sin is not None:
             cos_t = rope_cos if rope_cos.shape[0] == B * M else rope_cos.repeat_interleave(M, dim=0)
@@ -230,15 +230,15 @@ class TrueFactorizedBlock(nn.Module):
         # --- 2. Cross-Channel Attention ---
         # 在单塔对比学习模式下，M=1，此部分会自动跳过，符合预期
         if M > 1:
-            x_c = x_time.view(B, M, N, D)
-            x_smooth = x_c.view(B * M, N, D).transpose(1, 2) 
+            x_c = x_time.reshape(B, M, N, D)
+            x_smooth = x_c.reshape(B * M, N, D).transpose(1, 2) 
             x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).contiguous().reshape(B, M, N, D)
             x_channel = x_smooth.transpose(1, 2).contiguous().reshape(B * N, M, D)
             attn_out = self.channel_attn(self.norm_channel(x_channel))
-            x_c = x_c + attn_out.view(B, N, M, D).transpose(1, 2)
+            x_c = x_c + attn_out.reshape(B, N, M, D).transpose(1, 2)
             x = x_c.reshape(B, MN, D)
         else:
-            x = x_time.view(B, MN, D)
+            x = x_time.reshape(B, MN, D)
             
         # --- 3. MLP ---
         x = x + self.mlp(self.norm_mlp(x))
@@ -294,7 +294,7 @@ class CWT_MAE_RoPE(nn.Module):
         else:
             self.diff_loss_weight = diff_loss_weight
             
-        self.register_buffer('channel_loss_weights', torch.tensor(self.diff_loss_weight).view(1, 1, 1, -1))
+        self.register_buffer('channel_loss_weights', torch.tensor(self.diff_loss_weight).reshape(1, 1, 1, -1))
         
         in_chans = 3 if use_diff else 1
         
@@ -374,7 +374,7 @@ class CWT_MAE_RoPE(nn.Module):
         ids_shuffle_w = torch.argsort(noise_w, dim=1)
         ids_restore_w = torch.argsort(ids_shuffle_w, dim=1)
         
-        h_idx = torch.arange(H_grid, device=x.device).view(1, H_grid, 1)
+        h_idx = torch.arange(H_grid, device=x.device).reshape(1, H_grid, 1)
         ids_restore_w_exp = ids_restore_w.unsqueeze(1)
         noise = (ids_restore_w_exp * H_grid + h_idx).reshape(B, N_patches)
         
@@ -382,7 +382,7 @@ class CWT_MAE_RoPE(nn.Module):
         ids_restore = torch.argsort(ids_shuffle, dim=1) 
         ids_keep = ids_shuffle[:, :len_keep]            
         
-        x_reshaped = x.view(B, M, N_patches, D)
+        x_reshaped = x.reshape(B, M, N_patches, D)
         ids_keep_expanded = ids_keep.unsqueeze(1).unsqueeze(-1).expand(B, M, len_keep, D)
         x_masked = torch.gather(x_reshaped, dim=2, index=ids_keep_expanded)
         x_masked = x_masked.reshape(B, M * len_keep, D)
@@ -407,16 +407,16 @@ class CWT_MAE_RoPE(nn.Module):
         B, M, C, H, W = imgs.shape
         
         # 1. CWT 特征提取
-        x_cwt = imgs.view(B * M, C, H, W)
+        x_cwt = imgs.reshape(B * M, C, H, W)
         x_cwt = self.patch_embed(x_cwt) # (B*M, H*W, D)
         
         # 2. 原始信号处理
         if x_raw.dim() == 2:
             x_raw = x_raw.unsqueeze(1)  
         elif x_raw.dim() == 3 and x_raw.shape[1] != 1 and x_raw.shape[0] == B:
-            x_raw = x_raw.view(B * M, 1, -1)
+            x_raw = x_raw.reshape(B * M, 1, -1)
         elif x_raw.dim() == 3 and x_raw.shape[1] == M:
-            x_raw = x_raw.view(B * M, 1, -1)
+            x_raw = x_raw.reshape(B * M, 1, -1)
         else:
             x_raw = x_raw.reshape(B * M, 1, -1)
             
@@ -432,17 +432,17 @@ class CWT_MAE_RoPE(nn.Module):
         H_grid, W_grid = self.grid_size
         D = x_cwt.shape[-1]
         
-        x_cwt_2d = x_cwt.view(B * M, H_grid, W_grid, D)
+        x_cwt_2d = x_cwt.reshape(B * M, H_grid, W_grid, D)
         x_raw_2d = x_raw_embed.unsqueeze(1) # (B*M, 1, W_grid, D)
         
         # 广播相加：1D 特征复制到所有频率带
         x_fused = x_cwt_2d + x_raw_2d * self.raw_signal_scale
-        x = x_fused.view(B, M, -1, D) 
+        x = x_fused.reshape(B, M, -1, D) 
         N_patches = x.shape[2]
 
         # 4. 位置编码
         x = x + self.pos_embed.unsqueeze(1)
-        x = x.view(B, M * N_patches, -1)
+        x = x.reshape(B, M * N_patches, -1)
 
         # 5. Masking
         current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
@@ -458,7 +458,7 @@ class CWT_MAE_RoPE(nn.Module):
         # 6. RoPE
         is_async = (ids_keep.dim() == 3)
         if is_async:
-            pos_ids_flat = (ids_keep % W_grid).view(B * M_enc, -1) 
+            pos_ids_flat = (ids_keep % W_grid).reshape(B * M_enc, -1) 
         else:
             pos_ids_flat = (ids_keep % W_grid) 
             
@@ -482,9 +482,9 @@ class CWT_MAE_RoPE(nn.Module):
         x_ = torch.cat([x, mask_tokens], dim=1)
         x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D_dec))
 
-        x_patches = x.view(B, M, N_patches, D_dec)
+        x_patches = x.reshape(B, M, N_patches, D_dec)
         x_patches = x_patches + self.decoder_pos_embed.unsqueeze(1)
-        x = x_patches.view(B, Total_Tokens, D_dec)
+        x = x_patches.reshape(B, Total_Tokens, D_dec)
 
         H_grid, W_grid = self.grid_size
         patch_pos = (torch.arange(N_patches, device=x.device) % W_grid).unsqueeze(0).expand(B, -1)
@@ -495,7 +495,7 @@ class CWT_MAE_RoPE(nn.Module):
             x = blk(x, rope_cos=rope_cos, rope_sin=rope_sin)
         x = self.decoder_norm(x)
         
-        x = x.view(B, M, N_patches, D_dec)
+        x = x.reshape(B, M, N_patches, D_dec)
         return x
 
     def forward_loss_spec(self, imgs, pred, mask):
@@ -511,14 +511,14 @@ class CWT_MAE_RoPE(nn.Module):
             imgs = imgs[..., :H_valid, :W_valid]
             H, W = H_valid, W_valid
             
-        target = imgs.view(B, M, C, H // p_h, p_h, W // p_w, p_w)
+        target = imgs.reshape(B, M, C, H // p_h, p_h, W // p_w, p_w)
         target = target.permute(0, 1, 3, 5, 2, 4, 6).contiguous()
-        target = target.view(B, M, -1, C * p_h * p_w)
+        target = target.reshape(B, M, -1, C * p_h * p_w)
         
-        mask = mask.view(B, M, -1)
+        mask = mask.reshape(B, M, -1)
         loss = (pred - target) ** 2
         
-        loss = loss.view(B, M, -1, C, p_h * p_w)
+        loss = loss.reshape(B, M, -1, C, p_h * p_w)
         loss = loss.mean(dim=-1) 
         loss = loss * self.channel_loss_weights
         loss = loss.sum(dim=-1) 
@@ -539,7 +539,7 @@ class CWT_MAE_RoPE(nn.Module):
         B, M, _ = pred_time.shape
         H_grid, W_grid = self.grid_size
         
-        mask_2d = mask.view(B, M, H_grid, W_grid)
+        mask_2d = mask.reshape(B, M, H_grid, W_grid)
         mask_t = torch.round(mask_2d.mean(dim=2)) 
         
         mask_time = mask_t.unsqueeze(-1).expand(-1, -1, -1, self.patch_size_time)
@@ -579,7 +579,7 @@ class CWT_MAE_RoPE(nn.Module):
         feat_time_agg = feat_time_agg.squeeze(2).transpose(1, 2)
         feat_time_agg = self.time_reducer[2](feat_time_agg) 
         
-        pred_time = self.time_pred(feat_time_agg).flatten(1).view(B, M_dec, -1)
+        pred_time = self.time_pred(feat_time_agg).flatten(1).reshape(B, M_dec, -1)
         
         loss_time = self.forward_loss_time(x, pred_time, mask)
         
