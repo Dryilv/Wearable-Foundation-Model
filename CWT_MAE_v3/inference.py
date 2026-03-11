@@ -2,10 +2,12 @@ import os
 import glob
 import pickle
 import argparse
+import contextlib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import autocast 
@@ -21,6 +23,77 @@ def check_basic_validity(signal):
     if not np.isfinite(signal).all(): return False
     if np.std(signal) < 1e-6: return False 
     return True
+
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank():
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
+
+def get_world_size():
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+def is_main_process():
+    return get_rank() == 0
+
+def setup_distributed():
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return False, 0, 1, 0
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if world_size <= 1:
+        return False, rank, world_size, local_rank
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        backend = "nccl"
+    else:
+        backend = "gloo"
+
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+    )
+    dist.barrier()
+    return True, rank, world_size, local_rank
+
+def cleanup_distributed():
+    if is_dist_avail_and_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+def all_gather_pyobj(data, device):
+    if not is_dist_avail_and_initialized():
+        return [data]
+
+    world_size = get_world_size()
+    buffer = pickle.dumps(data)
+    storage = torch.ByteStorage.from_buffer(buffer)
+    tensor = torch.ByteTensor(storage).to(device=device)
+    local_size = torch.tensor([tensor.numel()], device=device, dtype=torch.long)
+
+    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+    max_size = int(torch.stack(size_list).max().item())
+
+    if tensor.numel() < max_size:
+        pad = torch.zeros(max_size - tensor.numel(), dtype=torch.uint8, device=device)
+        tensor = torch.cat([tensor, pad], dim=0)
+
+    tensor_list = [torch.empty(max_size, dtype=torch.uint8, device=device) for _ in range(world_size)]
+    dist.all_gather(tensor_list, tensor)
+
+    data_list = []
+    for t, sz in zip(tensor_list, size_list):
+        n = int(sz.item())
+        bytes_ = t[:n].cpu().numpy().tobytes()
+        data_list.append(pickle.loads(bytes_))
+    return data_list
 
 # ==========================================
 # 2. 自适应推理数据集 (保持不变)
@@ -146,16 +219,22 @@ def main():
     # 推理参数
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--stride', type=int, default=1500)
+    parser.add_argument('--num_workers', type=int, default=4)
     
     # 自适应过滤参数
     parser.add_argument('--iqr_scale', type=float, default=1.5)
 
     args = parser.parse_args()
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    distributed, rank, world_size, local_rank = setup_distributed()
+    if torch.cuda.is_available():
+        device = torch.device("cuda", local_rank if distributed else 0)
+    else:
+        device = torch.device("cpu")
     
     # 1. 加载模型
-    print(f"Loading model from {args.checkpoint} (Num Classes: {args.num_classes})...")
+    if is_main_process():
+        print(f"Loading model from {args.checkpoint} (Num Classes: {args.num_classes})...")
     model = TF_MAE_Classifier(
         pretrained_path=None,
         num_classes=args.num_classes,
@@ -178,13 +257,20 @@ def main():
     
     # 2. 扫描患者
     patient_folders = [f for f in glob.glob(os.path.join(args.data_root, "*")) if os.path.isdir(f)]
-    print(f"Found {len(patient_folders)} patients.")
+    patient_folders = sorted(patient_folders)
+    if is_main_process():
+        print(f"Found {len(patient_folders)} patients.")
     
-    results = []
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    results_local = []
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
     # 3. 逐个患者处理
-    for patient_path in tqdm(patient_folders, desc="Processing Patients"):
+    if distributed:
+        patient_folders = patient_folders[rank::world_size]
+
+    iterator = tqdm(patient_folders, desc="Processing Patients") if is_main_process() else patient_folders
+    for patient_path in iterator:
         patient_id = os.path.basename(patient_path)
         pkl_files = glob.glob(os.path.join(patient_path, "*.pkl"))
         
@@ -211,10 +297,16 @@ def main():
             # 填充空的概率列
             for c in range(args.num_classes):
                 res[f"Prob_Class_{c}"] = 0.0
-            results.append(res)
+            results_local.append(res)
             continue
             
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
         
         all_probs_list = []
         
@@ -222,12 +314,12 @@ def main():
             for batch in loader:
                 x = batch
                 x = x.to(device)
-                
-                with autocast(device_type='cuda', dtype=amp_dtype):
+
+                amp_ctx = autocast(device_type="cuda", dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+                with amp_ctx:
                     logits = model(x)
-                    # 强制 float32 保证精度
-                    probs = F.softmax(logits.float(), dim=1)
-                    all_probs_list.append(probs.cpu().numpy())
+                probs = F.softmax(logits.float(), dim=1)
+                all_probs_list.append(probs.cpu().numpy())
 
         # 拼接所有 batch: Shape [Total_Segments, Num_Classes]
         all_probs = np.vstack(all_probs_list)
@@ -258,22 +350,27 @@ def main():
         for c in range(args.num_classes):
             res_dict[f"Prob_Class_{c}"] = round(mean_probs[c], 4)
             
-        results.append(res_dict)
+        results_local.append(res_dict)
         
-    # 5. 保存结果
-    df = pd.DataFrame(results)
-    
-    # 调整列顺序，把预测结果放前面
-    cols = ["PatientID", "Predicted_Class", "Confidence"] + \
-           [f"Prob_Class_{c}" for c in range(args.num_classes)] + \
-           ["Total_Raw", "Valid_Final", "Std_Threshold_High"]
-    
-    # 确保只取存在的列
-    cols = [c for c in cols if c in df.columns]
-    df = df[cols]
-    
-    df.to_csv(args.output_csv, index=False)
-    print(f"\nInference done. Report saved to {args.output_csv}")
+    gathered = all_gather_pyobj(results_local, device=device if device.type == "cuda" else torch.device("cpu"))
+    if is_main_process():
+        results = []
+        for part in gathered:
+            results.extend(part)
+
+        df = pd.DataFrame(results)
+
+        cols = ["PatientID", "Predicted_Class", "Confidence"] + \
+               [f"Prob_Class_{c}" for c in range(args.num_classes)] + \
+               ["Total_Raw", "Valid_Final", "Std_Threshold_High"]
+
+        cols = [c for c in cols if c in df.columns]
+        df = df[cols]
+
+        df.to_csv(args.output_csv, index=False)
+        print(f"\nInference done. Report saved to {args.output_csv}")
+
+    cleanup_distributed()
 
 if __name__ == "__main__":
     main()
