@@ -95,6 +95,22 @@ def all_gather_pyobj(data, device):
         data_list.append(pickle.loads(bytes_))
     return data_list
 
+def build_balanced_shards(patient_folders, world_size):
+    patient_items = []
+    for patient_path in patient_folders:
+        pkl_files = sorted(glob.glob(os.path.join(patient_path, "*.pkl")))
+        weight = max(1, len(pkl_files))
+        patient_items.append((patient_path, pkl_files, weight))
+
+    patient_items.sort(key=lambda x: x[2], reverse=True)
+    shards = [[] for _ in range(world_size)]
+    loads = [0 for _ in range(world_size)]
+    for item in patient_items:
+        target = min(range(world_size), key=lambda i: loads[i])
+        shards[target].append(item)
+        loads[target] += item[2]
+    return shards, loads
+
 # ==========================================
 # 2. 自适应推理数据集 (保持不变)
 # ==========================================
@@ -220,6 +236,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--stride', type=int, default=1500)
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--prefetch_factor', type=int, default=2)
     
     # 自适应过滤参数
     parser.add_argument('--iqr_scale', type=float, default=1.5)
@@ -256,25 +273,39 @@ def main():
     model.eval()
     
     # 2. 扫描患者
-    patient_folders = [f for f in glob.glob(os.path.join(args.data_root, "*")) if os.path.isdir(f)]
-    patient_folders = sorted(patient_folders)
+    patient_folders = sorted([f for f in glob.glob(os.path.join(args.data_root, "*")) if os.path.isdir(f)])
     if is_main_process():
         print(f"Found {len(patient_folders)} patients.")
-    
+
+    shards, shard_loads = build_balanced_shards(patient_folders, world_size if distributed else 1)
+    rank_items = shards[rank] if distributed else shards[0]
+    local_load = sum(item[2] for item in rank_items)
+
+    if distributed:
+        load_tensor = torch.tensor([local_load], device=device, dtype=torch.long)
+        all_loads = [torch.zeros_like(load_tensor) for _ in range(world_size)]
+        dist.all_gather(all_loads, load_tensor)
+        if is_main_process():
+            loads_text = ", ".join([f"rank{i}={int(t.item())}" for i, t in enumerate(all_loads)])
+            print(f"Balanced workload by pkl count: {loads_text}")
+
     results_local = []
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
 
-    # 3. 逐个患者处理
-    if distributed:
-        patient_folders = patient_folders[rank::world_size]
+    patient_pbar = None
+    batch_pbar = None
+    if is_main_process():
+        patient_pbar = tqdm(total=len(rank_items), desc=f"Rank{rank} Patients", dynamic_ncols=True, smoothing=0.05)
+        batch_pbar = tqdm(total=0, desc=f"Rank{rank} Batches", dynamic_ncols=True, smoothing=0.05, leave=False)
 
-    iterator = tqdm(patient_folders, desc="Processing Patients") if is_main_process() else patient_folders
-    for patient_path in iterator:
+    for patient_path, pkl_files, _ in rank_items:
         patient_id = os.path.basename(patient_path)
-        pkl_files = glob.glob(os.path.join(patient_path, "*.pkl"))
         
-        if not pkl_files: continue
+        if not pkl_files:
+            if patient_pbar is not None:
+                patient_pbar.update(1)
+            continue
             
         dataset = AdaptivePatientDataset(
             pkl_files, 
@@ -298,15 +329,28 @@ def main():
             for c in range(args.num_classes):
                 res[f"Prob_Class_{c}"] = 0.0
             results_local.append(res)
+            if patient_pbar is not None:
+                patient_pbar.update(1)
             continue
             
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_size": args.batch_size,
+            "shuffle": False,
+            "num_workers": args.num_workers,
+            "pin_memory": (device.type == "cuda"),
+        }
+        if args.num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
+
         loader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=(device.type == "cuda"),
+            **loader_kwargs
         )
+
+        if batch_pbar is not None:
+            batch_pbar.total += len(loader)
+            batch_pbar.refresh()
         
         all_probs_list = []
         
@@ -320,6 +364,8 @@ def main():
                     logits = model(x)
                 probs = F.softmax(logits.float(), dim=1)
                 all_probs_list.append(probs.cpu().numpy())
+                if batch_pbar is not None:
+                    batch_pbar.update(1)
 
         # 拼接所有 batch: Shape [Total_Segments, Num_Classes]
         all_probs = np.vstack(all_probs_list)
@@ -351,6 +397,14 @@ def main():
             res_dict[f"Prob_Class_{c}"] = round(mean_probs[c], 4)
             
         results_local.append(res_dict)
+        if patient_pbar is not None:
+            patient_pbar.update(1)
+            patient_pbar.set_postfix_str(f"segments={len(dataset)}")
+
+    if patient_pbar is not None:
+        patient_pbar.close()
+    if batch_pbar is not None:
+        batch_pbar.close()
         
     gathered = all_gather_pyobj(results_local, device=device if device.type == "cuda" else torch.device("cpu"))
     if is_main_process():
