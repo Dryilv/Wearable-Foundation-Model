@@ -245,6 +245,7 @@ def main():
     # 推理参数
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--stride', type=int, default=1000)
+    parser.add_argument('--confidence_threshold', type=float, default=0.75, help="单片段置信度阈值，低于此值归为 Class 0")
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     
@@ -334,12 +335,21 @@ def main():
                 "PatientID": patient_id, 
                 "Predicted_Class": -1, # -1 表示无效
                 "Confidence": 0.0,
+                "Hard_Pred": -1,
+                "Hard_Conf": 0.0,
+                "Filtered_Rate": 0.0,
+                "Confidence_Threshold": args.confidence_threshold,
+                "Strict_Pred": -1,
+                "Strict_Status": "No_Data",
                 "Total_Raw": stats["total_raw"],
-                "Valid_Final": 0
+                "Valid_Final": 0,
+                "Std_Threshold_High": round(stats["threshold_high"], 4)
             }
             # 填充空的概率列
             for c in range(args.num_classes):
-                res[f"Prob_Class_{c}"] = 0.0
+                res[f"Prob_Mean_{c}"] = 0.0
+                res[f"Prob_Max_{c}"] = 0.0
+                res[f"Count_Hard_{c}"] = 0
             results_local.append(res)
             if patient_pbar is not None:
                 patient_pbar.update(1)
@@ -383,16 +393,50 @@ def main():
         all_probs = np.vstack(all_probs_list)
 
         # =========================================================
-        # 4. 多分类诊断逻辑 (Soft Voting)
+        # 4. 多维度诊断逻辑 (Enhanced)
         # =========================================================
         
-        # 方法 A: Soft Voting (推荐)
-        # 计算该患者所有片段的平均概率分布
+        # --- A. Soft Voting (加权平均，推荐用于一般场景) ---
         mean_probs = np.mean(all_probs, axis=0) # Shape [Num_Classes]
+        soft_pred_class = np.argmax(mean_probs)
+        soft_conf = mean_probs[soft_pred_class]
+
+        # --- B. Hard Voting (带阈值过滤) ---
+        # 1. 获取每个切片的最大概率和预测类别
+        per_segment_max_probs = np.max(all_probs, axis=1)
+        per_segment_preds = np.argmax(all_probs, axis=1)
         
-        # 最终预测类别为平均概率最大的那个
-        final_pred_class = np.argmax(mean_probs)
-        confidence = mean_probs[final_pred_class]
+        # 2. 应用置信度阈值过滤
+        # 如果某切片的最大概率低于阈值，强制将其预测为 Class 0 (正常/背景)
+        # 这样做可以大幅减少模棱两可的切片导致的误报
+        valid_mask = per_segment_max_probs >= args.confidence_threshold
+        filtered_preds = np.where(valid_mask, per_segment_preds, 0)
+        
+        # 3. 统计投票结果
+        counts = np.bincount(filtered_preds, minlength=args.num_classes)
+        hard_pred_class = np.argmax(counts)
+        hard_conf = counts[hard_pred_class] / max(1, len(per_segment_preds))
+
+        # 统计被过滤的切片比例
+        filtered_count = np.sum(~valid_mask)
+        filtered_rate = filtered_count / max(1, len(per_segment_preds))
+
+        # --- C. Max Probability (捕捉最强烈的单一信号，用于阵发性检测) ---
+        max_probs = np.max(all_probs, axis=0)
+
+        # --- D. Strict Consensus (双重验证，最大程度减少误诊) ---
+        # 逻辑：只有当 Soft Voting 和 Hard Voting 一致时，才采纳预测结果。
+        # 否则，判定为 Class 0 (假设 0 为正常/基准类别)，或者视为"不确定"。
+        if soft_pred_class == hard_pred_class:
+            strict_pred_class = soft_pred_class
+            strict_status = "High_Conf"
+        else:
+            strict_pred_class = 0 # 出现分歧时，回退到 Class 0 (保守策略)
+            strict_status = "Ambiguous"
+
+        # 默认使用 Soft Voting 作为主要结果，但保存其他指标供分析
+        final_pred_class = soft_pred_class
+        confidence = soft_conf
         
         # 构建结果字典
         res_dict = {
@@ -401,17 +445,25 @@ def main():
             "Valid_Final": len(dataset),
             "Std_Threshold_High": round(stats["threshold_high"], 4),
             "Predicted_Class": final_pred_class,
-            "Confidence": round(confidence, 4)
+            "Confidence": round(confidence, 4),
+            "Hard_Pred": hard_pred_class,
+            "Hard_Conf": round(hard_conf, 4),
+            "Filtered_Rate": round(filtered_rate, 4),
+            "Confidence_Threshold": args.confidence_threshold,
+            "Strict_Pred": strict_pred_class,
+            "Strict_Status": strict_status
         }
         
-        # 记录每个类别的平均概率 (反映了该类别的风险程度)
+        # 记录每个类别的详细统计 (Mean, Max, Count)
         for c in range(args.num_classes):
-            res_dict[f"Prob_Class_{c}"] = round(mean_probs[c], 4)
+            res_dict[f"Prob_Mean_{c}"] = round(mean_probs[c], 4)
+            res_dict[f"Prob_Max_{c}"] = round(max_probs[c], 4)
+            res_dict[f"Count_Hard_{c}"] = counts[c]
             
         results_local.append(res_dict)
         if patient_pbar is not None:
             patient_pbar.update(1)
-            patient_pbar.set_postfix_str(f"segments={len(dataset)}")
+            patient_pbar.set_postfix_str(f"seg={len(dataset)}|soft={soft_pred_class}|hard={hard_pred_class}")
 
     if patient_pbar is not None:
         patient_pbar.close()
@@ -426,8 +478,10 @@ def main():
 
         df = pd.DataFrame(results)
 
-        cols = ["PatientID", "Predicted_Class", "Confidence"] + \
-               [f"Prob_Class_{c}" for c in range(args.num_classes)] + \
+        cols = ["PatientID", "Predicted_Class", "Confidence", "Strict_Pred", "Strict_Status", "Hard_Pred", "Hard_Conf", "Filtered_Rate", "Confidence_Threshold"] + \
+               [f"Prob_Mean_{c}" for c in range(args.num_classes)] + \
+               [f"Prob_Max_{c}" for c in range(args.num_classes)] + \
+               [f"Count_Hard_{c}" for c in range(args.num_classes)] + \
                ["Total_Raw", "Valid_Final", "Std_Threshold_High"]
 
         cols = [c for c in cols if c in df.columns]

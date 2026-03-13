@@ -12,7 +12,8 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report, precision_recall_curve, average_precision_score
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch.nn.functional as F
 import numpy as np
@@ -294,7 +295,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
 
     return total_loss / count
 
-def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True, search_threshold=True, fixed_threshold=0.5):
+def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True, search_threshold=True, fixed_threshold=0.5, save_dir=None, epoch=None):
     model.eval()
     total_loss = 0
     count = 0
@@ -388,6 +389,36 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         report_str = classification_report(all_labels_np, final_preds, digits=4)
         
         avg_loss = total_loss / count
+
+        # Plot Precision-Recall Curve if applicable
+        if num_classes == 2 and save_dir is not None:
+            try:
+                # Ensure using Agg backend to avoid GUI issues
+                current_backend = plt.get_backend()
+                if 'agg' not in current_backend.lower():
+                    plt.switch_backend('agg')
+
+                precisions, recalls, _ = precision_recall_curve(all_labels_np, all_probs_np[:, 1])
+                avg_precision = average_precision_score(all_labels_np, all_probs_np[:, 1])
+                
+                plt.figure(figsize=(8, 6))
+                plt.plot(recalls, precisions, label=f'AP={avg_precision:.4f}')
+                plt.xlabel('Recall')
+                plt.ylabel('Precision')
+                plt.title(f'Precision-Recall Curve (Epoch {epoch})')
+                plt.legend(loc='lower left')
+                plt.grid(True)
+                
+                filename = f"pr_curve_epoch_{epoch}.png" if epoch is not None else "pr_curve_test.png"
+                plot_path = os.path.join(save_dir, filename)
+                plt.savefig(plot_path)
+                plt.close()
+                if is_main_process():
+                    print(f"[Plot] Precision-Recall Curve saved to {plot_path}")
+            except Exception as e:
+                if is_main_process():
+                    print(f"[Warning] Failed to plot PR curve: {e}")
+
         return avg_loss, final_acc, precision, recall, final_f1, auroc, report_str, best_threshold
     else:
         return 0, 0, 0, 0, 0, 0, None, 0
@@ -657,7 +688,9 @@ def main():
             total_len=val_dataset_len, 
             use_amp=use_amp,
             search_threshold=(data_cfg['num_classes'] == 2),
-            fixed_threshold=best_threshold
+            fixed_threshold=best_threshold,
+            save_dir=train_cfg['save_dir'],
+            epoch=epoch+1
         )
 
         if is_main_process():
@@ -726,7 +759,9 @@ def main():
             total_len=test_dataset_len,
             use_amp=use_amp,
             search_threshold=False,
-            fixed_threshold=best_threshold
+            fixed_threshold=best_threshold,
+            save_dir=train_cfg['save_dir'],
+            epoch="test"
         )
 
     if is_main_process():

@@ -36,7 +36,7 @@ train:
   early_stop_patience: 0
 
   # ===== 输出目录 =====
-  save_dir: "./checkpoints_cls768"
+  save_dir: "./finetune"
 
 data:
   # ===== 数据路径 =====
