@@ -260,10 +260,22 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
 
         with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
             if is_arcface:
+                # ArcFace 需要硬标签 (Long Index)
+                # 如果是软标签 (B, C)，取 argmax
+                t_a = targets_a.argmax(dim=1) if targets_a.dim() > 1 else targets_a
+                t_b = targets_b.argmax(dim=1) if targets_b.dim() > 1 else targets_b
+                
                 # ArcFace needs labels to calculate margin
                 # Apply mixup logic manually: calc loss for target_a and target_b then mix
-                logits_a = model(inputs, label=targets_a)
-                logits_b = model(inputs, label=targets_b)
+                logits_a = model(inputs, label=t_a)
+                logits_b = model(inputs, label=t_b)
+                
+                # 计算 Loss
+                # 注意：如果 targets_a 本身是软标签，这里转为硬标签传给 ArcFace 计算 Logits 是必须的
+                # 但计算 Loss 时，我们依然可以用软标签 targets_a 吗？
+                # ArcFace 输出的是 Logits，CrossEntropyLoss 支持软标签。
+                # 所以：传给 Model 用硬标签，传给 Criterion 用原始标签 (软或硬)
+                
                 loss = lam * criterion(logits_a, targets_a) + (1 - lam) * criterion(logits_b, targets_b)
             else:
                 logits = model(inputs)
@@ -468,21 +480,19 @@ def main():
     train_ds = DownstreamClassificationDataset(
         data_cfg['data_root'], data_cfg['split_file'], mode='train', 
         signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
-        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg'),
         on_error=data_cfg.get('on_error', 'raise'),
-        max_error_logs=data_cfg.get('max_error_logs', 20)
+        max_error_logs=data_cfg.get('max_error_logs', 20),
+        refined_labels_path=data_cfg.get('refined_labels_path', None)
     )
     val_ds = DownstreamClassificationDataset(
         data_cfg['data_root'], data_cfg['split_file'], mode=val_mode, 
         signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
-        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg'),
         on_error=data_cfg.get('on_error', 'raise'),
         max_error_logs=data_cfg.get('max_error_logs', 20)
     )
     test_ds = DownstreamClassificationDataset(
         data_cfg['data_root'], data_cfg['split_file'], mode=test_mode, 
         signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
-        channel_policy=data_cfg.get('channel_policy', 'ecg_ppg'),
         on_error=data_cfg.get('on_error', 'raise'),
         max_error_logs=data_cfg.get('max_error_logs', 20)
     )

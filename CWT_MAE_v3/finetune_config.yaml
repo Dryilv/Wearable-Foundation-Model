@@ -6,7 +6,7 @@ train:
   test_mode: "test"
 
   # ===== 优化器与学习率 =====
-  base_lr: 1.0e-4
+  base_lr: 5.0e-5
   min_lr: 1.0e-6
   warmup_epochs: 5
   weight_decay: 0.05
@@ -21,9 +21,9 @@ train:
   focal_reduction: "mean"
 
   # ===== 训练稳定性与加速 =====
-  use_amp: true
+  use_amp: false
   mixup_alpha: 0.2
-  grad_clip_norm: 3.0
+  grad_clip_norm: 1.0
   find_unused_parameters: false
   allow_tf32: true
   cudnn_benchmark: true
@@ -52,7 +52,6 @@ data:
   pin_memory: true
 
   # ===== 通道与异常处理 =====
-  channel_policy: "ecg_ppg"
   on_error: "raise"
   max_error_logs: 20
 
@@ -84,6 +83,6 @@ model:
   num_reasoning_tokens: 16
 
   # ===== ArcFace 头 =====
-  use_arcface: false
-  arcface_s: 30.0
-  arcface_m: 0.5
+  use_arcface: true
+  arcface_s: 20.0
+  arcface_m: 0.2

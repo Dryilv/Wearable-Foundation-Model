@@ -57,16 +57,27 @@ class MultiChannelAugmentor:
 # 2. Dataset 定义
 # ===================================================================
 class DownstreamClassificationDataset(Dataset):
-    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2, channel_policy='default_5ch', on_error='raise', max_error_logs=20):
+    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2, on_error='raise', max_error_logs=20, refined_labels_path=None):
         self.data_root = data_root
         self.signal_len = signal_len
         self.mode = mode
         self.task_index = task_index
         self.num_classes = num_classes
-        self.channel_policy = channel_policy
         self.on_error = on_error
         self.max_error_logs = max_error_logs
         self.error_count = 0
+        
+        # 加载软标签 (如果提供)
+        self.refined_labels = None
+        if refined_labels_path and os.path.exists(refined_labels_path) and mode == 'train':
+            if is_main_process():
+                print(f"[{mode}] Loading refined soft labels from {refined_labels_path}")
+            with open(refined_labels_path, 'r') as f:
+                # JSON keys are strings, need to convert to int if using as list index
+                # But JSON usually loads keys as strings.
+                loaded_labels = json.load(f)
+                # Convert keys to int for easier access
+                self.refined_labels = {int(k): v for k, v in loaded_labels.items()}
 
         # 训练集开启增强
         self.augmentor = MultiChannelAugmentor(p=0.5) if mode == 'train' else None
@@ -141,67 +152,33 @@ class DownstreamClassificationDataset(Dataset):
             # 转为 Tensor: (M, L)
             signal_tensor = torch.from_numpy(processed_signal)
 
-            # --- 6. 通道乱序 (Channel Shuffling) ---
-            # 关键：微调时也保持 Bag-of-Signals 逻辑，增强对通道顺序的不敏感性
+            # --- 6. 通道自适应处理 (Modality-Agnostic) ---
+            # 移除所有人工指定的通道切片逻辑。
+            # 模型将接收所有可用通道，并被强制从信号波形本身学习特征，而不是依赖通道顺序。
             
-            # [新增] 构建 Modality IDs (支持多模式)
-            # 0: ECG, 1: ACC, 2: PPG
             M = signal_tensor.shape[0]
             
-            if self.channel_policy == 'ecg_only':
-                # 仅 ECG
-                if M == 5:
-                    signal_tensor = signal_tensor[0:1, :]
-                    modality_ids = torch.tensor([0], dtype=torch.long)
-                elif M == 1:
-                    # 假设本身就是单通道 ECG
-                    modality_ids = torch.tensor([0], dtype=torch.long)
-                else:
-                    # 未知情况，默认取第一个
-                    signal_tensor = signal_tensor[0:1, :]
-                    modality_ids = torch.tensor([0], dtype=torch.long)
-
-            elif self.channel_policy == 'ppg_only':
-                # 仅 PPG
-                if M == 5: 
-                    signal_tensor = signal_tensor[4:5, :]
-                    modality_ids = torch.tensor([2], dtype=torch.long)
-                elif M == 1:
-                    # 假设本身就是单通道 PPG
-                    modality_ids = torch.tensor([2], dtype=torch.long)
-                else:
-                    # 未知情况，默认取最后一个作为 PPG
-                    signal_tensor = signal_tensor[-1:, :]
-                    modality_ids = torch.tensor([2], dtype=torch.long)
-
-            elif self.channel_policy == 'ecg_ppg':
-                # ECG + PPG
-                if M == 5: 
-                    signal_tensor = signal_tensor[[0, 4], :]
-                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
-                elif M == 2:
-                    # 假设本身就是双通道
-                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
-                else:
-                    # 未知情况，默认取首尾
-                    signal_tensor = signal_tensor[[0, -1], :]
-                    modality_ids = torch.tensor([0, 2], dtype=torch.long)
+            # 由于我们不再告诉模型哪个通道是 ECG/PPG，我们统一赋予相同的 modality_id (例如 0)
+            # 或者赋予它们原始的相对索引，但在训练时打乱
+            modality_ids = torch.zeros(M, dtype=torch.long)
             
-            else:
-                # Fallback (虽然 argparse 限制了 choice，但为了健壮性)
-                modality_ids = torch.zeros(signal_tensor.shape[0], dtype=torch.long)
-            
-            # 更新 M (可能被切片修改)
-            M = signal_tensor.shape[0]
-            
+            # 在训练时，随机打乱通道顺序 (Channel Shuffling)
+            # 这强制模型必须独立分析每个通道的波形，而不是依赖 "通道0总是ECG" 这种捷径
             if self.mode == 'train':
                 if M > 1:
                     perm_indices = torch.randperm(M)
                     signal_tensor = signal_tensor[perm_indices]
-                    # 同步打乱 Modality IDs (如果通道数匹配)
-                    modality_ids = modality_ids[perm_indices]
-
-            return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
+                    # 如果 modality_ids 不是全0，这里也需要同步打乱
+                    # modality_ids = modality_ids[perm_indices]
+            
+            # --- 7. 返回标签 (硬标签 or 软标签) ---
+            if self.refined_labels is not None and idx in self.refined_labels:
+                # 返回软标签 (Float Tensor)
+                soft_label = torch.tensor(self.refined_labels[idx], dtype=torch.float32)
+                return signal_tensor, modality_ids, soft_label
+            else:
+                # 返回硬标签 (Long Tensor)
+                return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
 
         except Exception as e:
             self.error_count += 1
