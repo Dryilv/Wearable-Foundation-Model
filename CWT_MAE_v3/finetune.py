@@ -228,7 +228,7 @@ class FocalLoss(nn.Module):
             return loss
         return loss.mean()
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, mixup_alpha=0.2, grad_clip_norm=3.0):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, mixup_alpha=0.2, grad_clip_norm=3.0, scheduler=None):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
@@ -293,6 +293,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
+        
+        # Step-based scheduler
+        if scheduler is not None:
+            scheduler.step()
 
         if dist.is_initialized():
             reduced_loss = reduce_tensor(loss.detach())
@@ -303,7 +307,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
         count += 1
         
         if is_main_process():
-            iterator.set_postfix({'loss': total_loss / count})
+            current_lr = optimizer.param_groups[0]['lr']
+            iterator.set_postfix({
+                'loss': total_loss / count,
+                'lr': f"{current_lr:.2e}"
+            })
 
     return total_loss / count
 
@@ -618,23 +626,26 @@ def main():
         if is_main_process():
             print("Optimizer: AdamW with uniform learning rate")
     
-    # LR Scheduler (Warmup + Cosine)
-    if train_cfg['warmup_epochs'] > train_cfg['epochs']:
-        raise ValueError(f"warmup_epochs ({train_cfg['warmup_epochs']}) must be <= epochs ({train_cfg['epochs']})")
-    if train_cfg['warmup_epochs'] > 0:
-        scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=train_cfg['warmup_epochs'])
+    # LR Scheduler (Warmup + Cosine) - Step-based
+    # 计算总步数
+    steps_per_epoch = len(train_loader)
+    total_steps = train_cfg['epochs'] * steps_per_epoch
+    warmup_steps = int(train_cfg['warmup_epochs'] * steps_per_epoch)
+    
+    if warmup_steps > 0:
+        scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
         scheduler_cosine = CosineAnnealingLR(
             optimizer,
-            T_max=train_cfg['epochs'] - train_cfg['warmup_epochs'],
+            T_max=total_steps - warmup_steps,
             eta_min=train_cfg['min_lr']
         )
         scheduler = SequentialLR(
             optimizer,
             schedulers=[scheduler_warmup, scheduler_cosine],
-            milestones=[train_cfg['warmup_epochs']]
+            milestones=[warmup_steps]
         )
     else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=train_cfg['epochs'], eta_min=train_cfg['min_lr'])
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg['min_lr'])
     
     use_focal_loss = train_cfg.get('use_focal_loss', False)
     label_smoothing = train_cfg.get('label_smoothing', 0.1)
@@ -688,10 +699,11 @@ def main():
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
-            scaler=scaler, use_amp=use_amp, mixup_alpha=mixup_alpha, grad_clip_norm=grad_clip_norm
+            scaler=scaler, use_amp=use_amp, mixup_alpha=mixup_alpha, grad_clip_norm=grad_clip_norm,
+            scheduler=scheduler
         )
         
-        scheduler.step()
+        # scheduler.step() # Moved to per-step inside train_one_epoch
 
         val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th = validate(
             model, val_loader, criterion, device, data_cfg['num_classes'], 
