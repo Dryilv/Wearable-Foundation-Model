@@ -168,27 +168,6 @@ def variable_channel_collate_fn_cls(batch):
 # -------------------------------------------------------------------
 # 3. 训练与验证逻辑
 # -------------------------------------------------------------------
-def mixup_data(x, y, alpha=1.0, device='cuda'):
-    """
-    x: (B, M, L)
-    y: (B,)
-    """
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(device)
-    
-    # Mixup 直接在 (B, M, L) 上进行是可行的
-    # 注意：如果 M 不一致（通过 padding 补齐），mixup 会混合 真实信号 和 0
-    # 这在生理信号中是可以接受的，相当于降低了信噪比
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 def move_batch_to_device(batch, device):
     if len(batch) == 3:
@@ -238,7 +217,7 @@ class FocalLoss(nn.Module):
             return loss
         return loss.mean()
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, mixup_alpha=0.2, grad_clip_norm=3.0, scheduler=None):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, grad_clip_norm=3.0, scheduler=None):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
@@ -252,9 +231,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
     
     for batch in iterator:
         x, modality_ids, y = move_batch_to_device(batch, device)
-        
-        inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=mixup_alpha, device=device)
-        
+
         optimizer.zero_grad(set_to_none=True)
         
         real_model = unwrap_model(model)
@@ -262,14 +239,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
 
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             if is_arcface:
-                t_a = targets_a.argmax(dim=1) if targets_a.dim() > 1 else targets_a
-                t_b = targets_b.argmax(dim=1) if targets_b.dim() > 1 else targets_b
-                logits_a = model(inputs, label=t_a)
-                logits_b = model(inputs, label=t_b)
-                loss = lam * criterion(logits_a, targets_a) + (1 - lam) * criterion(logits_b, targets_b)
+                t = y.argmax(dim=1) if y.dim() > 1 else y
+                logits = model(x, label=t)
+                loss = criterion(logits, y)
             else:
-                logits = model(inputs)
-                loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
+                logits = model(x)
+                loss = criterion(logits, y)
         
         if use_amp and amp_dtype == torch.float16:
             if scaler is None:
@@ -754,10 +729,13 @@ def main():
     no_improve_epochs = 0
     total_epochs = train_cfg['epochs']
     use_amp = train_cfg.get('use_amp', True)
-    mixup_alpha = train_cfg.get('mixup_alpha', 0.2)
     grad_clip_norm = train_cfg.get('grad_clip_norm', 3.0)
     amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
     scaler = GradScaler(enabled=(use_amp and device.type == 'cuda' and amp_dtype == torch.float16))
+    if is_main_process():
+        amp_enabled = use_amp and device.type == 'cuda'
+        print(f"AMP Enabled: {amp_enabled} | AMP DType: {amp_dtype} | GradScaler: {scaler.is_enabled()}")
+        logger.info(f"amp_enabled={amp_enabled} amp_dtype={amp_dtype} grad_scaler={scaler.is_enabled()}")
     early_stop_patience = train_cfg.get('early_stop_patience', 0)
     resume_path = train_cfg.get('resume_path')
     if (not resume_path) and train_cfg.get('auto_resume', True):
@@ -779,7 +757,7 @@ def main():
 
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
-            scaler=scaler, use_amp=use_amp, mixup_alpha=mixup_alpha, grad_clip_norm=grad_clip_norm,
+            scaler=scaler, use_amp=use_amp, grad_clip_norm=grad_clip_norm,
             scheduler=scheduler
         )
         

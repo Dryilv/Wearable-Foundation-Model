@@ -25,27 +25,22 @@ class MultiChannelAugmentor:
         # signal shape: (M, L)
         M, L = signal.shape
         
-        # 1. 随机翻转 (针对每个通道独立判定)
-        if random.random() < self.p:
-            flip_mask = np.random.choice([-1.0, 1.0], size=(M, 1))
-            signal = signal * flip_mask
-
-        # 2. 随机缩放 (模拟信号强度波动)
+        # 1. 随机缩放 (模拟信号强度波动)
         if random.random() < self.p:
             scale = np.random.uniform(self.scale_range[0], self.scale_range[1], size=(M, 1))
             signal = signal * scale
 
-        # 3. 随机高斯噪声
+        # 2. 随机高斯噪声
         if random.random() < self.p:
             noise = np.random.normal(0, self.noise_std, size=(M, L))
             signal = signal + noise
 
-        # 4. 随机时间偏移 (Phase Shift) - 模拟采样起始点微差
+        # 3. 随机时间偏移 (Phase Shift) - 模拟采样起始点微差
         if random.random() < self.p:
             shift = np.random.randint(-20, 20)
             signal = np.roll(signal, shift, axis=1)
 
-        # 5. 随机通道丢弃 (模拟传感器接触不良)
+        # 4. 随机通道丢弃 (模拟传感器接触不良)
         # 只有当 M > 1 时才执行，避免数据全空
         if M > 1 and random.random() < 0.2:
             drop_idx = np.random.randint(0, M)
@@ -173,12 +168,16 @@ class DownstreamClassificationDataset(Dataset):
             
             # --- 7. 返回标签 (硬标签 or 软标签) ---
             if self.refined_labels is not None and idx in self.refined_labels:
-                # 返回软标签 (Float Tensor)
                 soft_label = torch.tensor(self.refined_labels[idx], dtype=torch.float32)
-                return signal_tensor, modality_ids, soft_label
+                if soft_label.numel() == self.num_classes and torch.isfinite(soft_label).all():
+                    soft_sum = soft_label.sum()
+                    if soft_sum > 0:
+                        soft_label = soft_label / soft_sum
+                    return signal_tensor, modality_ids, soft_label
             else:
                 # 返回硬标签 (Long Tensor)
                 return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
+            return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
 
         except Exception as e:
             self.error_count += 1
@@ -186,8 +185,8 @@ class DownstreamClassificationDataset(Dataset):
                 print(f"[{self.mode}] Error loading {filename}: {e}")
             if self.on_error == 'raise':
                 raise
-            modality_ids = torch.tensor([0, 1, 1, 1, 2], dtype=torch.long)
-            return torch.zeros(5, self.signal_len), modality_ids, torch.tensor(0, dtype=torch.long)
+            modality_ids = torch.zeros(1, dtype=torch.long)
+            return torch.zeros(1, self.signal_len), modality_ids, torch.tensor(0, dtype=torch.long)
 
     def _sync_crop_or_pad(self, signal):
         """
@@ -202,7 +201,7 @@ class DownstreamClassificationDataset(Dataset):
 
         if current_len > target_len:
             if self.mode == 'train':
-                start = np.random.randint(0, current_len - target_len)
+                start = np.random.randint(0, current_len - target_len + 1)
             else:
                 start = (current_len - target_len) // 2
             return signal[:, start : start + target_len]
