@@ -190,6 +190,16 @@ def mixup_data(x, y, alpha=1.0, device='cuda'):
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
+def move_batch_to_device(batch, device):
+    if len(batch) == 3:
+        x, modality_ids, y = batch
+    else:
+        x, y = batch
+        modality_ids = None
+    x = x.to(device, non_blocking=True)
+    y = y.to(device, non_blocking=True)
+    return x, modality_ids, y
+
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=None, reduction='mean', label_smoothing=0.0):
         super().__init__()
@@ -236,46 +246,26 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
     total_loss = 0
     count = 0
     
-    # 优先使用 bfloat16
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+    amp_enabled = use_amp and device.type == 'cuda'
     iterator = tqdm(loader, desc=f"Epoch {epoch + 1} Train") if is_main_process() else loader
     
     for batch in iterator:
-        if len(batch) == 3:
-            x, modality_ids, y = batch
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        else:
-            x, y = batch
-            modality_ids = None
-            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        x, modality_ids, y = move_batch_to_device(batch, device)
         
-        # Mixup
         inputs, targets_a, targets_b, lam = mixup_data(x, y, alpha=mixup_alpha, device=device)
         
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
-        # Check if ArcFace is enabled (DDP wrapper -> module)
         real_model = unwrap_model(model)
         is_arcface = hasattr(real_model, 'use_arcface') and real_model.use_arcface
 
-        with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             if is_arcface:
-                # ArcFace 需要硬标签 (Long Index)
-                # 如果是软标签 (B, C)，取 argmax
                 t_a = targets_a.argmax(dim=1) if targets_a.dim() > 1 else targets_a
                 t_b = targets_b.argmax(dim=1) if targets_b.dim() > 1 else targets_b
-                
-                # ArcFace needs labels to calculate margin
-                # Apply mixup logic manually: calc loss for target_a and target_b then mix
                 logits_a = model(inputs, label=t_a)
                 logits_b = model(inputs, label=t_b)
-                
-                # 计算 Loss
-                # 注意：如果 targets_a 本身是软标签，这里转为硬标签传给 ArcFace 计算 Logits 是必须的
-                # 但计算 Loss 时，我们依然可以用软标签 targets_a 吗？
-                # ArcFace 输出的是 Logits，CrossEntropyLoss 支持软标签。
-                # 所以：传给 Model 用硬标签，传给 Criterion 用原始标签 (软或硬)
-                
                 loss = lam * criterion(logits_a, targets_a) + (1 - lam) * criterion(logits_b, targets_b)
             else:
                 logits = model(inputs)
@@ -313,6 +303,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
                 'lr': f"{current_lr:.2e}"
             })
 
+    if count == 0:
+        return 0.0
     return total_loss / count
 
 def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True, search_threshold=True, fixed_threshold=0.5, save_dir=None, epoch=None):
@@ -323,21 +315,16 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
     local_labels = []
     local_probs = []
     
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+    amp_enabled = use_amp and device.type == 'cuda'
 
     iterator = tqdm(loader, desc="Validating") if is_main_process() else loader
 
     with torch.no_grad():
         for batch in iterator:
-            if len(batch) == 3:
-                x, modality_ids, y = batch
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            else:
-                x, y = batch
-                modality_ids = None
-                x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            x, modality_ids, y = move_batch_to_device(batch, device)
             
-            with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 logits = model(x)
                 loss = criterion(logits, y)
             
@@ -352,6 +339,11 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
             
             local_labels.append(y)
             local_probs.append(probs) 
+
+    if count == 0 or len(local_labels) == 0:
+        if is_main_process():
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "Empty validation loader.", fixed_threshold
+        return 0, 0, 0, 0, 0, 0, None, 0
 
     local_labels = torch.cat(local_labels)
     local_probs = torch.cat(local_probs)
@@ -460,17 +452,22 @@ def main():
     deterministic = train_cfg.get('deterministic', False)
     set_seed(seed, deterministic=deterministic)
 
-    local_rank, rank, world_size = setup_distributed()
-    device = torch.device(f"cuda:{local_rank}")
+    if torch.cuda.is_available():
+        local_rank, rank, world_size = setup_distributed()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        local_rank, rank, world_size = 0, 0, 1
+        device = torch.device("cpu")
     
     if is_main_process():
         os.makedirs(train_cfg['save_dir'], exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
     logger = setup_logger(train_cfg['save_dir'])
-    torch.backends.cuda.matmul.allow_tf32 = train_cfg.get('allow_tf32', True)
-    torch.backends.cudnn.allow_tf32 = train_cfg.get('allow_tf32', True)
-    if not deterministic:
-        torch.backends.cudnn.benchmark = train_cfg.get('cudnn_benchmark', True)
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = train_cfg.get('allow_tf32', True)
+        torch.backends.cudnn.allow_tf32 = train_cfg.get('allow_tf32', True)
+        if not deterministic:
+            torch.backends.cudnn.benchmark = train_cfg.get('cudnn_benchmark', True)
 
     with open(data_cfg['split_file'], 'r') as f:
         split_info = json.load(f)
@@ -759,8 +756,8 @@ def main():
     use_amp = train_cfg.get('use_amp', True)
     mixup_alpha = train_cfg.get('mixup_alpha', 0.2)
     grad_clip_norm = train_cfg.get('grad_clip_norm', 3.0)
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = GradScaler(enabled=(use_amp and device.type == 'cuda' and amp_dtype == torch.float16))
     early_stop_patience = train_cfg.get('early_stop_patience', 0)
     resume_path = train_cfg.get('resume_path')
     if (not resume_path) and train_cfg.get('auto_resume', True):
@@ -817,8 +814,9 @@ def main():
             best_metric = metric_to_track
             best_threshold = best_th
             best_epoch = epoch + 1
-            torch.save(unwrap_model(model).state_dict(), os.path.join(train_cfg['save_dir'], "best_model.pth"))
-            print(f">>> Best model saved! (Metric: {best_metric:.4f})")
+            if is_main_process():
+                torch.save(unwrap_model(model).state_dict(), os.path.join(train_cfg['save_dir'], "best_model.pth"))
+                print(f">>> Best model saved! (Metric: {best_metric:.4f})")
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
