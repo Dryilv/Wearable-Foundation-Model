@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -539,10 +539,93 @@ def main():
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
         val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
         test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False)
+        shuffle_train = False
     else:
+        # 单卡模式：使用 WeightedRandomSampler
         train_sampler = None
         val_sampler = None
         test_sampler = None
+        shuffle_train = True
+        
+        # 尝试提取标签以计算权重
+        try:
+            if is_main_process():
+                print("Single-GPU detected. Analyzing class distribution for WeightedRandomSampler...")
+            
+            # 1. 获取所有索引
+            if isinstance(train_ds, Subset):
+                indices = train_ds.indices
+                base_ds = train_ds.dataset
+            else:
+                indices = list(range(len(train_ds)))
+                base_ds = train_ds
+            
+            # 2. 快速读取标签 (使用简单的多线程)
+            # 定义一个读取函数
+            from concurrent.futures import ThreadPoolExecutor
+            import pickle
+            
+            def load_label(idx):
+                try:
+                    # 直接访问 base_ds 的逻辑，避免 dataset.__getitem__ 的额外开销 (如 CWT, Norm)
+                    filename = base_ds.file_list[idx]
+                    file_path = os.path.join(base_ds.data_root, filename)
+                    with open(file_path, 'rb') as f:
+                        content = pickle.load(f)
+                    
+                    label = 0
+                    if isinstance(content, dict) and 'label' in content:
+                        target_label = content['label']
+                        if isinstance(target_label, list):
+                            if base_ds.task_index < len(target_label):
+                                label_item = target_label[base_ds.task_index]
+                                label = int(label_item['class']) if isinstance(label_item, dict) else int(label_item)
+                        else:
+                            label = int(target_label)
+                    return label
+                except:
+                    return 0 # Default fallback
+
+            # 3. 并行加载
+            # 限制样本数以免卡太久，或者全量加载
+            if len(indices) < 100000: # 限制一下规模
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    labels = list(tqdm(executor.map(load_label, indices), total=len(indices), desc="Loading labels"))
+                
+                # 4. 计算权重
+                labels = np.array(labels)
+                class_counts = np.bincount(labels, minlength=data_cfg['num_classes'])
+                
+                # 避免除以零
+                class_counts = np.maximum(class_counts, 1)
+                class_weights = 1.0 / class_counts
+                
+                # 每个样本的权重
+                sample_weights = class_weights[labels]
+                
+                if is_main_process():
+                    print(f"Class counts: {class_counts}")
+                    print(f"Class weights: {class_weights}")
+                
+                # 5. 创建 Sampler
+                train_sampler = WeightedRandomSampler(
+                    weights=torch.from_numpy(sample_weights).double(),
+                    num_samples=len(sample_weights),
+                    replacement=True
+                )
+                shuffle_train = False # Sampler implies shuffle
+                if is_main_process():
+                    print("WeightedRandomSampler initialized successfully.")
+            else:
+                if is_main_process():
+                    print("Dataset too large for quick label scanning. Skipping WeightedRandomSampler.")
+                    
+        except Exception as e:
+            if is_main_process():
+                print(f"Failed to init WeightedRandomSampler: {e}")
+                print("Falling back to standard shuffling.")
+            train_sampler = None
+            shuffle_train = True
 
     # DataLoader: 必须使用 variable_channel_collate_fn_cls
     pin_memory = data_cfg.get('pin_memory', True)
@@ -550,7 +633,7 @@ def main():
         train_ds, 
         batch_size=train_cfg['batch_size'], 
         sampler=train_sampler, 
-        shuffle=train_sampler is None,
+        shuffle=shuffle_train,
         num_workers=data_cfg.get('num_workers', 4), 
         pin_memory=pin_memory,
         collate_fn=variable_channel_collate_fn_cls # 关键修改
