@@ -51,7 +51,7 @@ class LatentReasoningHead(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, x_encoder):
+    def forward(self, x_encoder, token_padding_mask=None):
         # x_encoder: (B, Total_Tokens, D)
         # Total_Tokens = M * N_patches (变长)
         
@@ -60,7 +60,7 @@ class LatentReasoningHead(nn.Module):
         
         # Cross Attention
         # 这里的 Key/Value 长度是 M*N，对于 MultiheadAttention 来说没问题
-        attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder)
+        attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder, key_padding_mask=token_padding_mask)
         queries = self.norm1(queries + attn_out)
         
         # Self Attention
@@ -269,7 +269,7 @@ class TF_MAE_Classifier(nn.Module):
         
         state_dict[key] = patch_tokens
 
-    def forward(self, x, label=None, return_features=False):
+    def forward(self, x, label=None, return_features=False, channel_mask=None):
         """
         x: (B, M, L) 多通道输入
         label: (B,) 标签，用于 ArcFace 训练
@@ -291,12 +291,20 @@ class TF_MAE_Classifier(nn.Module):
         # 4. 提取特征
         # patch_tokens: (B, M*N_patches, D)
         patch_tokens = latent # model.py has no CLS token 
+        token_padding_mask = None
+        if channel_mask is not None:
+            channel_mask = channel_mask.to(patch_tokens.device, dtype=torch.bool)
+            B, total_tokens, _ = patch_tokens.shape
+            M = x.shape[1]
+            if channel_mask.shape[0] == B and channel_mask.shape[1] == M and M > 0 and total_tokens % M == 0:
+                n_patches = total_tokens // M
+                token_padding_mask = (~channel_mask).unsqueeze(-1).expand(B, M, n_patches).reshape(B, total_tokens)
         
         # 5. Forward Head
         if isinstance(self.head, LatentReasoningHead):
             # CoT 模式: 输入所有 Patch Tokens (混合了所有通道的信息)
             # Cross-Attention 会自动处理 M*N 的长度
-            features = self.head(patch_tokens)
+            features = self.head(patch_tokens, token_padding_mask=token_padding_mask)
         else:
             # MLP 模式: Global Average Pooling
             global_feat = patch_tokens.mean(dim=1)

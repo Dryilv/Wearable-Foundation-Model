@@ -156,28 +156,36 @@ def variable_channel_collate_fn_cls(batch):
     # 2. 初始化全 0 张量 (B, Max_M, L)
     padded_signals = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
     padded_modality_ids = torch.zeros((batch_size, max_m), dtype=torch.long)
+    channel_mask = torch.zeros((batch_size, max_m), dtype=torch.bool)
     
     # 3. 填充数据
     for i, s in enumerate(signals):
         m = s.shape[0]
         padded_signals[i, :m, :] = s
         padded_modality_ids[i, :m] = modality_ids[i]
+        channel_mask[i, :m] = True
         
-    return padded_signals, padded_modality_ids, torch.stack(labels)
+    return padded_signals, padded_modality_ids, torch.stack(labels), channel_mask
 
 # -------------------------------------------------------------------
 # 3. 训练与验证逻辑
 # -------------------------------------------------------------------
 
 def move_batch_to_device(batch, device):
-    if len(batch) == 3:
+    if len(batch) == 4:
+        x, modality_ids, y, channel_mask = batch
+    elif len(batch) == 3:
         x, modality_ids, y = batch
+        channel_mask = None
     else:
         x, y = batch
         modality_ids = None
+        channel_mask = None
     x = x.to(device, non_blocking=True)
     y = y.to(device, non_blocking=True)
-    return x, modality_ids, y
+    if channel_mask is not None:
+        channel_mask = channel_mask.to(device, non_blocking=True)
+    return x, modality_ids, y, channel_mask
 
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=None, reduction='mean', label_smoothing=0.0):
@@ -230,7 +238,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
     iterator = tqdm(loader, desc=f"Epoch {epoch + 1} Train") if is_main_process() else loader
     
     for batch in iterator:
-        x, modality_ids, y = move_batch_to_device(batch, device)
+        x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
         
@@ -240,10 +248,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             if is_arcface:
                 t = y.argmax(dim=1) if y.dim() > 1 else y
-                logits = model(x, label=t)
+                logits = model(x, label=t, channel_mask=channel_mask)
                 loss = criterion(logits, y)
             else:
-                logits = model(x)
+                logits = model(x, channel_mask=channel_mask)
                 loss = criterion(logits, y)
         
         if use_amp and amp_dtype == torch.float16:
@@ -297,10 +305,10 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
 
     with torch.no_grad():
         for batch in iterator:
-            x, modality_ids, y = move_batch_to_device(batch, device)
+            x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
             
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                logits = model(x)
+                logits = model(x, channel_mask=channel_mask)
                 loss = criterion(logits, y)
             
             if dist.is_initialized():
