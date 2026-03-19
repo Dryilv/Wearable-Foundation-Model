@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report, precision_recall_curve, average_precision_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report, precision_recall_curve, average_precision_score, fbeta_score
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch.nn.functional as F
@@ -356,14 +356,15 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
             y_scores = all_probs_np[:, 1]
             if search_threshold:
                 thresholds = np.arange(0.01, 1.00, 0.01)
-                best_f1_search = -1.0
+                best_score_search = -1.0
                 for th in thresholds:
                     preds_th = (y_scores >= th).astype(int)
-                    f1_th = f1_score(all_labels_np, preds_th, average='macro')
-                    if f1_th > best_f1_search:
-                        best_f1_search = f1_th
+                    # 使用 F0.5 分数进行阈值搜索，以满足高精度需求 (Precision权重高于Recall)
+                    score_th = fbeta_score(all_labels_np, preds_th, beta=0.5, average='macro')
+                    if score_th > best_score_search:
+                        best_score_search = score_th
                         best_threshold = th
-                print(f"\n[Threshold Search] Best Threshold: {best_threshold:.2f} | Best Macro F1: {best_f1_search:.4f}")
+                print(f"\n[Threshold Search] Best Threshold: {best_threshold:.2f} | Best Macro F0.5 (High Precision): {best_score_search:.4f}")
             final_preds = (y_scores >= best_threshold).astype(int)
         else:
             final_preds = np.argmax(all_probs_np, axis=1)
@@ -794,7 +795,8 @@ def main():
             print(val_report)
             print("-" * 60)
 
-        metric_to_track = val_f1 if data_cfg['num_classes'] == 2 else (val_f1 if data_cfg['num_classes'] > 2 else val_auc)
+        # 使用 AUC 作为最佳权重的保留标准
+        metric_to_track = val_auc
         
         if metric_to_track > best_metric:
             best_metric = metric_to_track
