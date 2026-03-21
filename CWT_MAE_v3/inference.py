@@ -113,11 +113,15 @@ def build_balanced_shards(patient_folders, world_size):
     return shards, loads
 
 # ==========================================
-# 2. 自适应推理数据集 (保持不变)
+# 2. 自适应推理数据集 (Lazy Loading 优化版)
 # ==========================================
 class AdaptivePatientDataset(Dataset):
     def __init__(self, file_paths, signal_len=3000, stride=1500, iqr_scale=1.5):
-        self.windows = []
+        self.signal_len = signal_len
+        self.stride = stride
+        self.iqr_scale = iqr_scale
+        self.windows_meta = [] # 存储元数据：(file_path, start_idx, std_val)
+        
         self.sqa_stats = {
             "total_raw": 0, 
             "valid_final": 0, 
@@ -127,39 +131,29 @@ class AdaptivePatientDataset(Dataset):
             "dropped_high": 0
         }
         
-        raw_segments = []
         std_values = []
         
+        # 第一阶段：轻量级扫描，仅记录有效切片的位置和标准差
         for fp in file_paths:
             try:
                 with open(fp, 'rb') as f:
                     content = pickle.load(f)
-                    # 兼容不同结构的 content
                     if isinstance(content, dict) and 'data' in content:
                         raw_data = content['data']
                     else:
-                        raw_data = content # 假设直接是数据
+                        raw_data = content
                         
                     if isinstance(raw_data, list):
                         raw_data = np.array(raw_data)
 
                     if raw_data.ndim == 1:
-                        raw_data = raw_data[np.newaxis, :] # (1, L)
+                        raw_data = raw_data[np.newaxis, :]
                     
-                    raw_data = raw_data.astype(np.float32) # (M, L_raw)
-                    
-                    # --- 重要修复：添加归一化逻辑，与训练保持完全一致 ---
-                    # 注意：在切分之前或之后归一化都可以，为了与训练完全一致，最好在切分后归一化
-                    # 但为了防止极端值，先做一次全局的类型转换和清理
+                    raw_data = raw_data.astype(np.float32)
                     raw_data = np.nan_to_num(raw_data, nan=0.0, posinf=0.0, neginf=0.0)
                 
-                # --- 通道自适应逻辑 ---
-                # 不再切片，保留所有通道
-                
-                # --- 修复切片和长度校验逻辑 ---
                 M, n_samples = raw_data.shape
                 
-                # 如果信号长度不足，使用边缘填充
                 if n_samples < signal_len:
                     pad_len = signal_len - n_samples
                     raw_data = np.pad(raw_data, ((0, 0), (0, pad_len)), mode='edge')
@@ -169,72 +163,91 @@ class AdaptivePatientDataset(Dataset):
                     segment = raw_data[:, start : start + signal_len] # (M, L)
                     
                     if check_basic_validity(segment):
-                        # 对每个通道计算 std，这里简单取平均或最大作为过滤依据
                         std_val = np.mean(np.std(segment, axis=1))
-                        
-                        raw_segments.append(segment)
+                        self.windows_meta.append({
+                            'file_path': fp,
+                            'start': start,
+                            'std': std_val
+                        })
                         std_values.append(std_val)
                         self.sqa_stats["total_raw"] += 1
                         
             except Exception as e:
-                print(f"Error reading {fp}: {e}")
+                print(f"Error scanning {fp}: {e}")
 
         if not std_values:
             return
 
         std_array = np.array(std_values)
         
-        # --- 修复归一化阈值计算逻辑 ---
-        # 原逻辑可能导致阈值过窄，导致大量正常片段被丢弃，甚至全部丢弃
-        # 改为使用更宽松的阈值，或者仅在需要时进行过滤
-        q1 = np.percentile(std_array, 5)   # 放宽下界
-        q3 = np.percentile(std_array, 95)  # 放宽上界
+        q1 = np.percentile(std_array, 5)
+        q3 = np.percentile(std_array, 95)
         iqr = q3 - q1
         
-        lower_bound = max(0.0001, q1 - iqr_scale * iqr) # 放宽最小下限
-        upper_bound = q3 + iqr_scale * iqr
+        self.lower_bound = max(0.0001, q1 - iqr_scale * iqr)
+        self.upper_bound = q3 + iqr_scale * iqr
         
-        self.sqa_stats["threshold_low"] = lower_bound
-        self.sqa_stats["threshold_high"] = upper_bound
+        self.sqa_stats["threshold_low"] = self.lower_bound
+        self.sqa_stats["threshold_high"] = self.upper_bound
         
-        for segment, std_val in zip(raw_segments, std_values):
-            # 仅做极端异常过滤，避免过度过滤
-            if std_val < lower_bound or std_val > upper_bound:
-                if std_val < lower_bound:
+        # 过滤元数据
+        valid_meta = []
+        for meta in self.windows_meta:
+            std_val = meta['std']
+            if std_val < self.lower_bound or std_val > self.upper_bound:
+                if std_val < self.lower_bound:
                     self.sqa_stats["dropped_low"] += 1
                 else:
                     self.sqa_stats["dropped_high"] += 1
-                # 如果这个片段被过滤了，不要跳过，而是直接用下一个逻辑或者保留，因为你提到所有人都被预测成了病人
-                # 这可能是因为正常片段全被过滤了，只剩下了波形剧烈的（类似病理波形的）片段
-                # 我们这里先改为**不丢弃**，只记录，让模型自己去判断
-                # continue 
-            
-            # Robust Normalization per channel
-            # segment: (M, L)
-            median = np.median(segment, axis=1, keepdims=True)
-            q25 = np.percentile(segment, 25, axis=1, keepdims=True)
-            q75 = np.percentile(segment, 75, axis=1, keepdims=True)
-            iqr_val = q75 - q25
-            iqr_val = np.where(iqr_val < 1e-6, 1.0, iqr_val)
-            
-            segment_norm = (segment - median) / iqr_val
-            segment_norm = np.clip(segment_norm, -20.0, 20.0)
-            
-            # --- 关键修复：确保返回的维度包含 modality_ids 和 channel_mask ---
-            # 训练时 Dataset 返回 (signal_tensor, modality_ids, label)
-            # 推理时也需要返回类似的结构，以便 DataLoader 和 collate_fn 处理
-            self.windows.append(segment_norm)
+                # 根据之前的逻辑，这里不丢弃，保留让模型判断，或者你可以选择 continue
+                # valid_meta.append(meta) 
+            # 即使超界我们也保留它，记录在 valid_meta 中
+            valid_meta.append(meta)
             self.sqa_stats["valid_final"] += 1
+            
+        self.windows_meta = valid_meta
 
     def __len__(self):
-        return len(self.windows)
+        return len(self.windows_meta)
 
     def __getitem__(self, idx):
-        sig = self.windows[idx]
-        sig_tensor = torch.from_numpy(sig) # (M, L)
-        M = sig_tensor.shape[0]
+        meta = self.windows_meta[idx]
+        
+        # 实时读取和切片
+        with open(meta['file_path'], 'rb') as f:
+            content = pickle.load(f)
+            if isinstance(content, dict) and 'data' in content:
+                raw_data = content['data']
+            else:
+                raw_data = content
+                
+            if isinstance(raw_data, list):
+                raw_data = np.array(raw_data)
+
+            if raw_data.ndim == 1:
+                raw_data = raw_data[np.newaxis, :]
+            
+            raw_data = raw_data.astype(np.float32)
+            raw_data = np.nan_to_num(raw_data, nan=0.0, posinf=0.0, neginf=0.0)
+            
+        M, n_samples = raw_data.shape
+        if n_samples < self.signal_len:
+            pad_len = self.signal_len - n_samples
+            raw_data = np.pad(raw_data, ((0, 0), (0, pad_len)), mode='edge')
+            
+        start = meta['start']
+        segment = raw_data[:, start : start + self.signal_len]
+        
+        # 实时归一化 (使用与 dataset.py 一致的 Z-Score，抛弃 IQR)
+        std_vals = np.std(segment, axis=1, keepdims=True)
+        mean_vals = np.mean(segment, axis=1, keepdims=True)
+        
+        segment_norm = (segment - mean_vals) / (std_vals + 1e-5)
+        segment_norm = np.clip(segment_norm, -10.0, 10.0)
+
+        sig_tensor = torch.from_numpy(segment_norm) # (M, L)
         modality_ids = torch.zeros(M, dtype=torch.long)
-        # 返回与训练时相似的元组，只是把 label 换成一个 dummy label
+        
         return sig_tensor, modality_ids, torch.tensor(-1, dtype=torch.long)
 
 # ==========================================
@@ -262,6 +275,11 @@ def main():
     parser.add_argument('--confidence_threshold', type=float, default=0.75, help="单片段置信度阈值，低于此值归为 Class 0")
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--prefetch_factor', type=int, default=2)
+    
+    # 高级聚合与抗噪参数
+    parser.add_argument('--top_p_ratio', type=float, default=0.15, help="Top-P% 均值聚合比例")
+    parser.add_argument('--fallback_top_k', type=int, default=5, help="自适应阈值降级时保留的 Top-K 片段数")
+    parser.add_argument('--trim_ratio', type=float, default=0.05, help="截尾均值剔除极值的比例 (单侧)")
     
     # 自适应过滤参数
     parser.add_argument('--iqr_scale', type=float, default=1.5)
@@ -407,14 +425,14 @@ def main():
         all_probs = np.vstack(all_probs_list)
 
         # =========================================================
-        # 4. 多维度诊断逻辑 (Enhanced)
+        # 4. 多维度诊断逻辑 (Advanced Enhanced)
         # =========================================================
         
         # 1. 获取每个切片的最大概率和预测类别
         per_segment_max_probs = np.max(all_probs, axis=1)
         per_segment_preds = np.argmax(all_probs, axis=1)
         
-        # 2. 应用置信度阈值过滤：剔除所有置信度低的片段，不让它们参与任何统计
+        # 2. 应用置信度阈值过滤
         valid_mask = per_segment_max_probs >= args.confidence_threshold
         
         # 统计被过滤的切片比例
@@ -422,12 +440,23 @@ def main():
         total_segments = len(per_segment_preds)
         filtered_rate = filtered_count / max(1, total_segments)
         
-        # 提取高置信度的有效片段
+        # --- 3. 动态/自适应置信度阈值降级 (Adaptive Thresholding) ---
+        fallback_used = False
+        if np.sum(valid_mask) == 0 and total_segments > 0:
+            fallback_used = True
+            # 取全局置信度最高的 Top-K
+            k = min(args.fallback_top_k, total_segments)
+            top_k_indices = np.argsort(per_segment_max_probs)[-k:]
+            valid_mask = np.zeros(total_segments, dtype=bool)
+            valid_mask[top_k_indices] = True
+            
+        # 提取有效片段
         valid_probs = all_probs[valid_mask]
         valid_preds = per_segment_preds[valid_mask]
+        valid_confidences = per_segment_max_probs[valid_mask]
         
         if len(valid_probs) == 0:
-            # 极端情况：所有片段的置信度都低于阈值
+            # 极端情况：没有任何数据 (可能本身 total_segments=0)
             soft_pred_class = -1
             soft_conf = 0.0
             hard_pred_class = -1
@@ -436,28 +465,105 @@ def main():
             max_probs = np.zeros(args.num_classes)
             counts = np.zeros(args.num_classes, dtype=int)
             strict_pred_class = -1
-            strict_status = "All_Low_Conf"
+            strict_status = "No_Data"
         else:
-            # --- A. Soft Voting (仅在有效片段上加权平均) ---
-            mean_probs = np.mean(valid_probs, axis=0) # Shape [Num_Classes]
+            num_valid = len(valid_probs)
+            
+            # --- 4. 引入截尾均值 (Trimmed Mean) 抵抗极端假阳性 ---
+            # 如果有效片段数量足够多 (例如 >10)，则在每个类别的维度上剔除极值
+            trim_probs = valid_probs.copy()
+            if num_valid > 10 and args.trim_ratio > 0:
+                trim_count = int(num_valid * args.trim_ratio)
+                if trim_count > 0:
+                    for c in range(args.num_classes):
+                        c_probs = trim_probs[:, c]
+                        sorted_indices = np.argsort(c_probs)
+                        # 将极高和极低值替换为有效边界内的中值，或者直接把它们的权重设为0
+                        # 简单起见，我们直接计算均值时排除它们
+                        pass # 这里我们留到聚合时处理，为了和 Top-P 不冲突，或者直接修改 trim_probs
+            
+            # 改进的截尾机制：不直接修改 trim_probs，而是在计算 mean 时进行过滤
+            
+            mean_probs = np.zeros(args.num_classes)
+            for c in range(args.num_classes):
+                c_probs = valid_probs[:, c]
+                c_confs = valid_confidences
+                
+                # --- 4. 引入截尾均值 (Trimmed Mean) 抵抗极端假阳性 ---
+                # 先进行截尾过滤
+                if num_valid > 10 and args.trim_ratio > 0:
+                    trim_count = int(num_valid * args.trim_ratio)
+                    if trim_count > 0:
+                        # 找到排名的索引
+                        sorted_indices = np.argsort(c_probs)
+                        # 剔除最低和最高 trim_count 个样本
+                        valid_indices_after_trim = sorted_indices[trim_count:-trim_count]
+                        c_probs = c_probs[valid_indices_after_trim]
+                        c_confs = c_confs[valid_indices_after_trim]
+                
+                # 更新当前有效数量
+                current_valid_count = len(c_probs)
+                
+                # --- 1. Top-P% 均值聚合 (Top-P Mean Pooling) ---
+                # 对于每个类别，只取该类别概率排名前 P% 的片段
+                p_count = max(1, int(current_valid_count * args.top_p_ratio))
+                top_p_indices = np.argsort(c_probs)[-p_count:]
+                selected_probs = c_probs[top_p_indices]
+                
+                if fallback_used:
+                     # 如果 fallback，则 confs 的顺序可能与 probs 不完全一致，但由于 fallback 通常片段很少，这里安全起见直接使用 c_confs
+                     selected_confs = c_confs[top_p_indices]
+                else:
+                     selected_confs = c_confs[top_p_indices]
+                    
+                # --- 2. 置信度加权软投票 (Confidence-Weighted Soft Voting) ---
+                # 使用每个片段的最大概率值（置信度）作为权重
+                weights = selected_confs
+                # 避免全 0 权重
+                if np.sum(weights) < 1e-6:
+                    weights = np.ones_like(weights)
+                weights = weights / np.sum(weights)
+                
+                # 计算加权 Top-P 均值
+                mean_probs[c] = np.sum(selected_probs * weights)
+
+            # 重新归一化 (因为 Top-P 导致和不为 1)
+            if np.sum(mean_probs) > 0:
+                mean_probs = mean_probs / np.sum(mean_probs)
+                
             soft_pred_class = np.argmax(mean_probs)
             soft_conf = mean_probs[soft_pred_class]
 
             # --- B. Hard Voting (仅在有效片段上投票) ---
             counts = np.bincount(valid_preds, minlength=args.num_classes)
             hard_pred_class = np.argmax(counts)
-            hard_conf = counts[hard_pred_class] / len(valid_preds)
+            hard_conf = counts[hard_pred_class] / num_valid
 
             # --- C. Max Probability (仅在有效片段上提取) ---
-            max_probs = np.max(valid_probs, axis=0)
+            # 为了抵抗极值，我们可以取 95 分位数而不是严格的 max
+            if num_valid > 10 and args.trim_ratio > 0:
+                max_probs = np.percentile(valid_probs, 100 - (args.trim_ratio * 100), axis=0)
+            else:
+                max_probs = np.max(valid_probs, axis=0)
 
-            # --- D. Strict Consensus ---
+            # --- 5. 针对多分类的“保守降级”逻辑优化 ---
             if soft_pred_class == hard_pred_class:
                 strict_pred_class = soft_pred_class
-                strict_status = "High_Conf"
+                strict_status = "Fallback_Low_Conf" if fallback_used else "High_Conf"
             else:
-                strict_pred_class = 0 # 出现分歧时，回退到 Class 0
-                strict_status = "Ambiguous"
+                # 发生分歧
+                if soft_pred_class > 0 and hard_pred_class > 0:
+                    # 都认为是疾病，只是具体类别有分歧
+                    # 取两者中概率更高的类别
+                    if mean_probs[soft_pred_class] > (counts[hard_pred_class] / num_valid):
+                        strict_pred_class = soft_pred_class
+                    else:
+                        strict_pred_class = hard_pred_class
+                    strict_status = "Disease_Ambiguous"
+                else:
+                    # 分歧发生在 0 (正常) 和 >0 (疾病) 之间
+                    strict_pred_class = 0 # 保守回退到 0
+                    strict_status = "Normal_Ambiguous"
 
         # 默认使用 Soft Voting 作为主要结果
         final_pred_class = soft_pred_class

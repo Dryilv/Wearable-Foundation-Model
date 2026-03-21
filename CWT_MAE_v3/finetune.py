@@ -517,11 +517,66 @@ def main():
         test_ds = Subset(test_ds, clean_test_indices)
         test_dataset_len = len(test_ds)
 
+    # 单卡模式下使用 WeightedRandomSampler
+    # --- 重要修复：如果在 DDP 模式下，也需要解决类别不平衡问题 ---
+    # 但 DDP 下使用 WeightedRandomSampler 比较复杂，所以最稳妥的办法是：
+    # 确保 FocalLoss 的 gamma 设置得足够大，或者传入 alpha 权重
+    
     if dist.is_initialized():
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
         val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
         test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False)
         shuffle_train = False
+        
+        # 即使在 DDP 模式下，我们也应该计算一下类别权重，传给 FocalLoss
+        try:
+            if is_main_process():
+                print("Calculating class weights for FocalLoss alpha in DDP mode...")
+                
+                if isinstance(train_ds, Subset):
+                    indices = train_ds.indices
+                    base_ds = train_ds.dataset
+                else:
+                    indices = list(range(len(train_ds)))
+                    base_ds = train_ds
+                
+                from concurrent.futures import ThreadPoolExecutor
+                import pickle
+                def load_label(idx):
+                    try:
+                        filename = base_ds.file_list[idx]
+                        file_path = os.path.join(base_ds.data_root, filename)
+                        with open(file_path, 'rb') as f:
+                            content = pickle.load(f)
+                        label = 0
+                        if isinstance(content, dict) and 'label' in content:
+                            target_label = content['label']
+                            if isinstance(target_label, list):
+                                if base_ds.task_index < len(target_label):
+                                    label_item = target_label[base_ds.task_index]
+                                    label = int(label_item['class']) if isinstance(label_item, dict) else int(label_item)
+                            else:
+                                label = int(target_label)
+                        return label
+                    except:
+                        return 0
+                
+                if len(indices) < 100000:
+                    with ThreadPoolExecutor(max_workers=16) as executor:
+                        labels = list(tqdm(executor.map(load_label, indices), total=len(indices), desc="Loading labels for Alpha"))
+                    labels = np.array(labels)
+                    class_counts = np.bincount(labels, minlength=data_cfg['num_classes'])
+                    class_counts = np.maximum(class_counts, 1)
+                    # 频率的倒数作为权重，然后归一化使得均值为 1
+                    weights = 1.0 / class_counts
+                    weights = weights / np.sum(weights) * len(class_counts)
+                    print(f"Calculated FocalLoss Alpha: {weights}")
+                    
+                    # 将权重写入配置中，后续 FocalLoss 初始化会用到
+                    train_cfg['focal_alpha'] = weights.tolist()
+        except Exception as e:
+            if is_main_process():
+                print(f"Failed to calculate DDP alpha: {e}")
     else:
         # 单卡模式：使用 WeightedRandomSampler
         train_sampler = None

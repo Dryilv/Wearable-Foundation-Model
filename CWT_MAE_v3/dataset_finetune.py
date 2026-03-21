@@ -201,8 +201,27 @@ class DownstreamClassificationDataset(Dataset):
 
         if current_len > target_len:
             if self.mode == 'train':
+                # 随机裁剪
                 start = np.random.randint(0, current_len - target_len + 1)
+                
+                # 增强策略：对于训练集，有一定概率使用能量最大的片段
+                # 这有助于在长程信号中捕捉到那些真正有意义的病理波动，而不是裁剪到平庸的直线
+                if random.random() < 0.3: # 30% 概率寻找高能量区域
+                    # 快速滑动窗口寻找能量最高（方差最大）的区域
+                    num_windows = min(10, (current_len - target_len) // (target_len // 2) + 1)
+                    if num_windows > 1:
+                        best_start = start
+                        max_var = -1
+                        for i in range(num_windows):
+                            s = np.random.randint(0, current_len - target_len + 1)
+                            window = signal[:, s : s + target_len]
+                            var = np.mean(np.var(window, axis=1))
+                            if var > max_var:
+                                max_var = var
+                                best_start = s
+                        start = best_start
             else:
+                # 验证/测试：中心裁剪
                 start = (current_len - target_len) // 2
             return signal[:, start : start + target_len]
         else:
@@ -212,19 +231,15 @@ class DownstreamClassificationDataset(Dataset):
 
     def _robust_norm(self, signal):
         """
-        对每个通道独立进行 Robust Normalization (Median & IQR)
+        与 dataset.py (预训练) 保持完全一致的归一化方式：Z-Score
+        消除预训练与微调之间的 Distribution Gap
         """
-        # axis=1 表示沿时间轴
-        median = np.median(signal, axis=1, keepdims=True)
-        q25 = np.percentile(signal, 25, axis=1, keepdims=True)
-        q75 = np.percentile(signal, 75, axis=1, keepdims=True)
-        iqr = q75 - q25
+        # 计算全局或逐通道的 mean 和 std，与 dataset.py 保持一致
+        # 在 dataset.py 中，是逐通道 Z-score，然后裁剪到 [-10, 10]
+        std_vals = np.std(signal, axis=1, keepdims=True)
+        mean_vals = np.mean(signal, axis=1, keepdims=True)
         
-        # 避免除以零，对于全 0 通道赋予默认尺度
-        iqr = np.where(iqr < 1e-6, 1.0, iqr)
+        normalized = (signal - mean_vals) / (std_vals + 1e-5)
+        normalized = np.clip(normalized, -10.0, 10.0)
         
-        normalized = (signal - median) / iqr
-        
-        # 数值截断，防止离群值
-        normalized = np.clip(normalized, -20.0, 20.0)
         return normalized
