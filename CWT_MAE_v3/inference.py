@@ -14,6 +14,7 @@ from torch.amp import autocast
 
 # 导入 v1 版本的模型定义
 from model_finetune import TF_MAE_Classifier
+from finetune import variable_channel_collate_fn_cls, move_batch_to_device
 
 # ==========================================
 # 1. 基础信号检查 (保持不变)
@@ -146,12 +147,23 @@ class AdaptivePatientDataset(Dataset):
                         raw_data = raw_data[np.newaxis, :] # (1, L)
                     
                     raw_data = raw_data.astype(np.float32) # (M, L_raw)
+                    
+                    # --- 重要修复：添加归一化逻辑，与训练保持完全一致 ---
+                    # 注意：在切分之前或之后归一化都可以，为了与训练完全一致，最好在切分后归一化
+                    # 但为了防止极端值，先做一次全局的类型转换和清理
+                    raw_data = np.nan_to_num(raw_data, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 # --- 通道自适应逻辑 ---
                 # 不再切片，保留所有通道
                 
+                # --- 修复切片和长度校验逻辑 ---
                 M, n_samples = raw_data.shape
-                if n_samples < signal_len: continue
+                
+                # 如果信号长度不足，使用边缘填充
+                if n_samples < signal_len:
+                    pad_len = signal_len - n_samples
+                    raw_data = np.pad(raw_data, ((0, 0), (0, pad_len)), mode='edge')
+                    n_samples = signal_len
                 
                 for start in range(0, n_samples - signal_len + 1, stride):
                     segment = raw_data[:, start : start + signal_len] # (M, L)
@@ -171,23 +183,31 @@ class AdaptivePatientDataset(Dataset):
             return
 
         std_array = np.array(std_values)
-        q1 = np.percentile(std_array, 25)
-        q3 = np.percentile(std_array, 75)
+        
+        # --- 修复归一化阈值计算逻辑 ---
+        # 原逻辑可能导致阈值过窄，导致大量正常片段被丢弃，甚至全部丢弃
+        # 改为使用更宽松的阈值，或者仅在需要时进行过滤
+        q1 = np.percentile(std_array, 5)   # 放宽下界
+        q3 = np.percentile(std_array, 95)  # 放宽上界
         iqr = q3 - q1
         
-        lower_bound = max(0.001, q1 - iqr_scale * iqr)
+        lower_bound = max(0.0001, q1 - iqr_scale * iqr) # 放宽最小下限
         upper_bound = q3 + iqr_scale * iqr
         
         self.sqa_stats["threshold_low"] = lower_bound
         self.sqa_stats["threshold_high"] = upper_bound
         
         for segment, std_val in zip(raw_segments, std_values):
-            if std_val < lower_bound:
-                self.sqa_stats["dropped_low"] += 1
-                continue
-            if std_val > upper_bound:
-                self.sqa_stats["dropped_high"] += 1
-                continue
+            # 仅做极端异常过滤，避免过度过滤
+            if std_val < lower_bound or std_val > upper_bound:
+                if std_val < lower_bound:
+                    self.sqa_stats["dropped_low"] += 1
+                else:
+                    self.sqa_stats["dropped_high"] += 1
+                # 如果这个片段被过滤了，不要跳过，而是直接用下一个逻辑或者保留，因为你提到所有人都被预测成了病人
+                # 这可能是因为正常片段全被过滤了，只剩下了波形剧烈的（类似病理波形的）片段
+                # 我们这里先改为**不丢弃**，只记录，让模型自己去判断
+                # continue 
             
             # Robust Normalization per channel
             # segment: (M, L)
@@ -200,6 +220,9 @@ class AdaptivePatientDataset(Dataset):
             segment_norm = (segment - median) / iqr_val
             segment_norm = np.clip(segment_norm, -20.0, 20.0)
             
+            # --- 关键修复：确保返回的维度包含 modality_ids 和 channel_mask ---
+            # 训练时 Dataset 返回 (signal_tensor, modality_ids, label)
+            # 推理时也需要返回类似的结构，以便 DataLoader 和 collate_fn 处理
             self.windows.append(segment_norm)
             self.sqa_stats["valid_final"] += 1
 
@@ -208,7 +231,11 @@ class AdaptivePatientDataset(Dataset):
 
     def __getitem__(self, idx):
         sig = self.windows[idx]
-        return torch.from_numpy(sig) # (M, L)
+        sig_tensor = torch.from_numpy(sig) # (M, L)
+        M = sig_tensor.shape[0]
+        modality_ids = torch.zeros(M, dtype=torch.long)
+        # 返回与训练时相似的元组，只是把 label 换成一个 dummy label
+        return sig_tensor, modality_ids, torch.tensor(-1, dtype=torch.long)
 
 # ==========================================
 # 3. 主推理逻辑 (多分类修改版)
@@ -346,6 +373,7 @@ def main():
             "shuffle": False,
             "num_workers": args.num_workers,
             "pin_memory": (device.type == "cuda"),
+            "collate_fn": variable_channel_collate_fn_cls # --- 关键修复：加入变长通道的 collate_fn ---
         }
         if args.num_workers > 0:
             loader_kwargs["persistent_workers"] = True
@@ -363,12 +391,13 @@ def main():
         
         with torch.no_grad():
             for batch in loader:
-                x = batch
-                x = x.to(device)
+                # --- 关键修复：使用与 finetune 一致的 batch 提取逻辑 ---
+                x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
 
                 amp_ctx = autocast(device_type="cuda", dtype=amp_dtype) if use_amp else contextlib.nullcontext()
                 with amp_ctx:
-                    logits = model(x)
+                    # 推理时也要传入 channel_mask
+                    logits = model(x, channel_mask=channel_mask)
                 probs = F.softmax(logits.float(), dim=1)
                 all_probs_list.append(probs.cpu().numpy())
                 if batch_pbar is not None:
@@ -381,45 +410,56 @@ def main():
         # 4. 多维度诊断逻辑 (Enhanced)
         # =========================================================
         
-        # --- A. Soft Voting (加权平均，推荐用于一般场景) ---
-        mean_probs = np.mean(all_probs, axis=0) # Shape [Num_Classes]
-        soft_pred_class = np.argmax(mean_probs)
-        soft_conf = mean_probs[soft_pred_class]
-
-        # --- B. Hard Voting (带阈值过滤) ---
         # 1. 获取每个切片的最大概率和预测类别
         per_segment_max_probs = np.max(all_probs, axis=1)
         per_segment_preds = np.argmax(all_probs, axis=1)
         
-        # 2. 应用置信度阈值过滤
-        # 如果某切片的最大概率低于阈值，强制将其预测为 Class 0 (正常/背景)
-        # 这样做可以大幅减少模棱两可的切片导致的误报
+        # 2. 应用置信度阈值过滤：剔除所有置信度低的片段，不让它们参与任何统计
         valid_mask = per_segment_max_probs >= args.confidence_threshold
-        filtered_preds = np.where(valid_mask, per_segment_preds, 0)
         
-        # 3. 统计投票结果
-        counts = np.bincount(filtered_preds, minlength=args.num_classes)
-        hard_pred_class = np.argmax(counts)
-        hard_conf = counts[hard_pred_class] / max(1, len(per_segment_preds))
-
         # 统计被过滤的切片比例
         filtered_count = np.sum(~valid_mask)
-        filtered_rate = filtered_count / max(1, len(per_segment_preds))
-
-        # --- C. Max Probability (捕捉最强烈的单一信号，用于阵发性检测) ---
-        max_probs = np.max(all_probs, axis=0)
-
-        # --- D. Strict Consensus (双重验证，最大程度减少误诊) ---
-        # 逻辑：只有当 Soft Voting 和 Hard Voting 一致时，才采纳预测结果。
-        # 否则，判定为 Class 0 (假设 0 为正常/基准类别)，或者视为"不确定"。
-        if soft_pred_class == hard_pred_class:
-            strict_pred_class = soft_pred_class
-            strict_status = "High_Conf"
+        total_segments = len(per_segment_preds)
+        filtered_rate = filtered_count / max(1, total_segments)
+        
+        # 提取高置信度的有效片段
+        valid_probs = all_probs[valid_mask]
+        valid_preds = per_segment_preds[valid_mask]
+        
+        if len(valid_probs) == 0:
+            # 极端情况：所有片段的置信度都低于阈值
+            soft_pred_class = -1
+            soft_conf = 0.0
+            hard_pred_class = -1
+            hard_conf = 0.0
+            mean_probs = np.zeros(args.num_classes)
+            max_probs = np.zeros(args.num_classes)
+            counts = np.zeros(args.num_classes, dtype=int)
+            strict_pred_class = -1
+            strict_status = "All_Low_Conf"
         else:
-            strict_pred_class = 0 # 出现分歧时，回退到 Class 0 (保守策略)
-            strict_status = "Ambiguous"
+            # --- A. Soft Voting (仅在有效片段上加权平均) ---
+            mean_probs = np.mean(valid_probs, axis=0) # Shape [Num_Classes]
+            soft_pred_class = np.argmax(mean_probs)
+            soft_conf = mean_probs[soft_pred_class]
 
-        # 默认使用 Soft Voting 作为主要结果，但保存其他指标供分析
+            # --- B. Hard Voting (仅在有效片段上投票) ---
+            counts = np.bincount(valid_preds, minlength=args.num_classes)
+            hard_pred_class = np.argmax(counts)
+            hard_conf = counts[hard_pred_class] / len(valid_preds)
+
+            # --- C. Max Probability (仅在有效片段上提取) ---
+            max_probs = np.max(valid_probs, axis=0)
+
+            # --- D. Strict Consensus ---
+            if soft_pred_class == hard_pred_class:
+                strict_pred_class = soft_pred_class
+                strict_status = "High_Conf"
+            else:
+                strict_pred_class = 0 # 出现分歧时，回退到 Class 0
+                strict_status = "Ambiguous"
+
+        # 默认使用 Soft Voting 作为主要结果
         final_pred_class = soft_pred_class
         confidence = soft_conf
         

@@ -378,7 +378,8 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
             auroc = 0.0
 
         final_acc = accuracy_score(all_labels_np, final_preds)
-        final_f1 = f1_score(all_labels_np, final_preds, average='macro')
+        # 将验证集最终报告和输出的 F1 指标也修改为 F0.5，保持前后一致
+        final_f1 = fbeta_score(all_labels_np, final_preds, beta=0.5, average='macro')
         precision = precision_score(all_labels_np, final_preds, average='macro', zero_division=0)
         recall = recall_score(all_labels_np, final_preds, average='macro', zero_division=0)
         
@@ -821,7 +822,7 @@ def main():
                 scaler=scaler
             )
         if is_main_process():
-            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f1={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={best_th:.4f}")
+            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={best_th:.4f}")
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             if is_main_process():
                 print(f"Early stopping triggered at epoch {epoch+1}")
