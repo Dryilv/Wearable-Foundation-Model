@@ -29,98 +29,88 @@ def check_basic_validity(signal):
     return True
 
 # ==========================================
-# 2. 推理域自适应数据集
+# 2. 推理域自适应数据集 (Lazy Loading 懒加载优化版)
 # ==========================================
 class InferenceAdaptationDataset(Dataset):
     def __init__(self, data_root, signal_len=1000, stride=1000, iqr_scale=1.5):
-        self.windows = []
+        self.signal_len = signal_len
+        self.iqr_scale = iqr_scale
         
-        # 递归查找所有 .pkl 文件
-        pkl_files = glob.glob(os.path.join(data_root, "**", "*.pkl"), recursive=True)
+        # 仅在初始化时扫描文件路径，不读取文件内容
+        self.pkl_files = glob.glob(os.path.join(data_root, "**", "*.pkl"), recursive=True)
         if is_main_process():
-            print(f"Found {len(pkl_files)} pkl files for adaptation in {data_root}.")
+            print(f"Found {len(self.pkl_files)} pkl files for adaptation in {data_root}.")
+            print("Using lazy loading to prevent OOM and initialization hang.")
+            
+        # 设定虚拟长度：如果文件数量太少（比如长录音），保证一个 epoch 有足够采样次数
+        self.virtual_size = max(len(self.pkl_files), 1000)
+
+    def __len__(self):
+        return self.virtual_size
+
+    def __getitem__(self, idx):
+        # 映射回实际文件索引
+        idx = idx % len(self.pkl_files)
         
-        raw_segments = []
-        std_values = []
-        
-        # 使用 tqdm 显示扫描进度
-        iterator = tqdm(pkl_files, desc="Scanning files", disable=not is_main_process())
-        for fp in iterator:
+        # 重试机制：如果抽到的片段无效或文件损坏，尝试其他随机文件
+        for _ in range(5):
             try:
+                fp = self.pkl_files[idx]
                 with open(fp, 'rb') as f:
                     content = pickle.load(f)
-                    if isinstance(content, dict) and 'data' in content:
-                        raw_data = content['data']
-                    else:
-                        raw_data = content
-                        
-                    if isinstance(raw_data, list):
-                        raw_data = np.array(raw_data)
-
-                    if raw_data.ndim == 1:
-                        raw_data = raw_data[np.newaxis, :]
                     
-                    raw_data = raw_data.astype(np.float32)
-                    raw_data = np.nan_to_num(raw_data, nan=0.0, posinf=0.0, neginf=0.0)
+                if isinstance(content, dict) and 'data' in content:
+                    raw_data = content['data']
+                else:
+                    raw_data = content
+                    
+                if isinstance(raw_data, list):
+                    raw_data = np.array(raw_data)
+
+                if raw_data.ndim == 1:
+                    raw_data = raw_data[np.newaxis, :]
+                
+                raw_data = raw_data.astype(np.float32)
+                raw_data = np.nan_to_num(raw_data, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 M, n_samples = raw_data.shape
                 
-                if n_samples < signal_len:
-                    pad_len = signal_len - n_samples
+                # 长度不足则边缘填充
+                if n_samples < self.signal_len:
+                    pad_len = self.signal_len - n_samples
                     raw_data = np.pad(raw_data, ((0, 0), (0, pad_len)), mode='edge')
-                    n_samples = signal_len
+                    n_samples = self.signal_len
                 
-                for start in range(0, n_samples - signal_len + 1, stride):
-                    segment = raw_data[:, start : start + signal_len]
+                # 随机裁剪 (模拟 TENT 的随机采样)
+                start = np.random.randint(0, n_samples - self.signal_len + 1)
+                segment = raw_data[:, start : start + self.signal_len]
+                
+                if not check_basic_validity(segment):
+                    idx = np.random.randint(0, len(self.pkl_files))
+                    continue
                     
-                    if check_basic_validity(segment):
-                        std_val = np.mean(np.std(segment, axis=1))
-                        raw_segments.append(segment)
-                        std_values.append(std_val)
-                        
+                # 鲁棒归一化逻辑 (与 inference 保持一致)
+                median = np.median(segment, axis=1, keepdims=True)
+                q25 = np.percentile(segment, 25, axis=1, keepdims=True)
+                q75 = np.percentile(segment, 75, axis=1, keepdims=True)
+                iqr_val = q75 - q25
+                iqr_val = np.where(iqr_val < 1e-6, 1.0, iqr_val)
+                
+                segment_norm = (segment - median) / iqr_val
+                segment_norm = np.clip(segment_norm, -20.0, 20.0)
+                
+                sig_tensor = torch.from_numpy(segment_norm) # (M, L)
+                modality_ids = torch.zeros(M, dtype=torch.long)
+                
+                # 返回符合 variable_channel_collate_fn_cls 要求的格式
+                return sig_tensor, modality_ids, torch.tensor(-1, dtype=torch.long)
+                
             except Exception as e:
-                pass
-
-        if not std_values:
-            if is_main_process():
-                print("Warning: No valid segments found.")
-            return
-
-        std_array = np.array(std_values)
+                idx = np.random.randint(0, len(self.pkl_files))
         
-        q1 = np.percentile(std_array, 5)
-        q3 = np.percentile(std_array, 95)
-        iqr = q3 - q1
-        
-        lower_bound = max(0.0001, q1 - iqr_scale * iqr)
-        upper_bound = q3 + iqr_scale * iqr
-        
-        for segment, std_val in zip(raw_segments, std_values):
-            # 采用和 inference.py 中一致的鲁棒归一化逻辑
-            median = np.median(segment, axis=1, keepdims=True)
-            q25 = np.percentile(segment, 25, axis=1, keepdims=True)
-            q75 = np.percentile(segment, 75, axis=1, keepdims=True)
-            iqr_val = q75 - q25
-            iqr_val = np.where(iqr_val < 1e-6, 1.0, iqr_val)
-            
-            segment_norm = (segment - median) / iqr_val
-            segment_norm = np.clip(segment_norm, -20.0, 20.0)
-            
-            self.windows.append(segment_norm)
-            
-        if is_main_process():
-            print(f"Extracted {len(self.windows)} valid segments for adaptation.")
-
-    def __len__(self):
-        return len(self.windows)
-
-    def __getitem__(self, idx):
-        sig = self.windows[idx]
-        sig_tensor = torch.from_numpy(sig) # (M, L)
-        M = sig_tensor.shape[0]
-        modality_ids = torch.zeros(M, dtype=torch.long)
-        # 返回 dummy label -1
-        return sig_tensor, modality_ids, torch.tensor(-1, dtype=torch.long)
+        # 兜底返回全零
+        fallback = torch.zeros((1, self.signal_len), dtype=torch.float32)
+        return fallback, torch.zeros(1, dtype=torch.long), torch.tensor(-1, dtype=torch.long)
 
 # ==========================================
 # 3. 核心：TENT 自适应配置与熵损失
