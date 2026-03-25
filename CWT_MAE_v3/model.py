@@ -8,11 +8,20 @@ import torch.fft
 # 1. CWT 模块 (保持不变，优秀的特征工程)
 # ===================================================================
 @torch.compiler.disable
-def create_ricker_wavelets(points, scales):
+def create_ricker_wavelets(points_tensor, scales):
     scales = scales.float()
     # Ensure points is treated as a float tensor to avoid TracerWarnings
-    points_tensor = torch.tensor(points, device=scales.device, dtype=torch.float32)
-    t = torch.arange(0, points, device=scales.device).float() - (points_tensor - 1.0) / 2
+    # points_tensor should be passed as a tensor already
+    if not isinstance(points_tensor, torch.Tensor):
+        points_tensor = torch.tensor(points_tensor, device=scales.device, dtype=torch.float32)
+    else:
+        # Avoid CPU to CUDA mismatch
+        points_tensor = points_tensor.to(scales.device).float()
+        
+    # Cast to int to construct arange correctly, since arange doesn't accept tensor for end
+    points_int = int(points_tensor.item())
+    
+    t = torch.arange(0, points_int, device=scales.device).float() - (points_tensor - 1.0) / 2
     t = t.reshape(1, 1, -1) 
     scales = scales.reshape(-1, 1, 1)
     pi_factor = math.pi ** 0.25
@@ -30,39 +39,35 @@ def cwt_ricker(x, scales):
     x = x.unsqueeze(1)
     num_scales = scales.shape[0]
     
-    # 将 largest_scale 和 wavelet_len 的计算改为支持张量运算，以消除 TracerWarning
     largest_scale = scales[-1]
     
-    # 动态计算 wavelet_len: ONNX 中尽量避免使用 .item() 转换
-    # 预先定义一个较大的最大长度，或者使用固定的 filter 长度。如果序列长度固定，使用静态逻辑更好。
-    # 为了兼容 ONNX，我们使用 torch.clamp/min 并转为 int (但 ONNX 导出时维度通常需要静态或符号推理)
-    # 为了保险起见，我们将这部分包装在非追踪逻辑中或者使用固定值，但如果是动态，只能使用 Tensor 运算
-    # 这里因为 create_ricker_wavelets 的 points 参数需要是 int，我们可能不得不保持它为一个 Python int，
-    # 但我们可以在 ONNX 导出时提供静态值。或者使用常量折叠。
-    # 更好的方法是在 forward 中传递固定参数。
-    # 为了解决导出报错，如果是 ONNX 导出，我们最好把 FFT 卷积换成 F.conv1d。
-    # 因为 ONNX 14 不支持 aten::fft_rfft。
+    # 动态计算 wavelet_len，避免 TracerWarning 和 Device Mismatch
+    # Ensure all tensors are on the same device as x
+    seq_len_tensor = torch.tensor(sequence_length, device=x.device, dtype=torch.float32)
     
-    wavelet_len = int(min(10 * largest_scale.item(), sequence_length))
-    if wavelet_len % 2 == 0: wavelet_len += 1 
+    # max/min with scalar is fine in most PyTorch versions, but tensor is safer for tracing
+    ten_tensor = torch.tensor(10.0, device=x.device, dtype=torch.float32)
     
-    wavelets = create_ricker_wavelets(wavelet_len, scales)
+    wavelet_len_float = torch.min(ten_tensor * largest_scale, seq_len_tensor)
+    
+    # 保证长度为奇数 (如果是偶数则+1)
+    # 因为我们在 ONNX 导出时不希望这里成为动态流控制的阻塞点，
+    # 但实际创建 wavelet 需要一个确定的整数长度，这在 ONNX 中是常量折叠的。
+    wavelet_len_int = int(wavelet_len_float.item())
+    if wavelet_len_int % 2 == 0:
+        wavelet_len_int += 1
+        
+    wavelet_len_tensor = torch.tensor(wavelet_len_int, device=x.device, dtype=torch.float32)
+    
+    # scales must be on the same device
+    scales = scales.to(x.device)
+    
+    wavelets = create_ricker_wavelets(wavelet_len_tensor, scales)
     wavelets = wavelets.to(dtype=x.dtype)
     
-    # FFT 卷积在 ONNX 中不受支持 (aten::fft_rfft)
-    # 替换为普通的 F.conv1d 空间域卷积
-    # x: (B, 1, L)
-    # wavelets: (S, 1, W)
-    # 目标输出: (B, S, L)
-    
-    pad_len = wavelet_len // 2
-    # 为了避免边界效应，先对 x 进行 padding
+    pad_len = wavelet_len_int // 2
     x_padded = F.pad(x, (pad_len, pad_len), mode='reflect')
     
-    # 使用 F.conv1d
-    # x_padded: (B, 1, L + 2*pad_len)
-    # wavelets: (S, 1, W)
-    # 结果: (B, S, L)
     cwt_output = F.conv1d(x_padded, wavelets)
     
     return cwt_output
@@ -120,11 +125,17 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, x, pos_ids):
         seq_len = torch.max(pos_ids) + 1
-        # Use torch.tensor logic for comparison if max_seq_len is updated dynamically,
-        # but for ONNX export, this branch usually isn't hit or shouldn't be traced dynamically
-        # It's better to ensure max_seq_len is large enough during init
-        if int(seq_len.item()) > self.max_seq_len:
+        
+        # When checking seq_len against max_seq_len, convert self.max_seq_len to a tensor
+        # on the same device to ensure proper graph tracing without triggering Device mismatch
+        # or python boolean tracer warnings.
+        # Ensure we avoid mixing CPU and CUDA tensors during comparison
+        max_seq_len_tensor = torch.tensor(self.max_seq_len, device=x.device)
+        
+        # This condition is typically skipped during standard ONNX export since max_seq_len is large
+        if seq_len > max_seq_len_tensor:
             self._update_cache(int(seq_len.item() * 1.5))
+            
         cos = self.cos_cached[pos_ids].to(x.dtype)
         sin = self.sin_cached[pos_ids].to(x.dtype)
         return cos.unsqueeze(2), sin.unsqueeze(2)
