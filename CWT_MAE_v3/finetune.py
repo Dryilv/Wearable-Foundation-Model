@@ -861,6 +861,34 @@ def main():
             if is_main_process():
                 torch.save(unwrap_model(model).state_dict(), os.path.join(train_cfg['save_dir'], "best_model.pth"))
                 print(f">>> Best model saved! (Metric: {best_metric:.4f})")
+                
+                # 同步生成 ONNX 模型用于 CPU 推理
+                try:
+                    onnx_path = os.path.join(train_cfg['save_dir'], "best_model_cpu.onnx")
+                    real_model = unwrap_model(model)
+                    real_model.eval()
+                    # 构建虚拟输入 (B=1, M=1, L=signal_len)
+                    dummy_x = torch.randn(1, 1, data_cfg['signal_len'], device=device)
+                    # 导出 ONNX (设置动态轴以便支持不同 batch_size 和通道数)
+                    torch.onnx.export(
+                        real_model,
+                        (dummy_x,),
+                        onnx_path,
+                        export_params=True,
+                        opset_version=14,
+                        do_constant_folding=True,
+                        input_names=['input'],
+                        output_names=['output'],
+                        dynamic_axes={
+                            'input': {0: 'batch_size', 1: 'channels'},
+                            'output': {0: 'batch_size'}
+                        }
+                    )
+                    print(f">>> ONNX model exported to {onnx_path}")
+                    real_model.train() # 恢复训练状态
+                except Exception as e:
+                    print(f"[Warning] Failed to export ONNX model: {e}")
+
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
