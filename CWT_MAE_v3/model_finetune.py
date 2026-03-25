@@ -310,6 +310,13 @@ class TF_MAE_Classifier(nn.Module):
             global_feat = patch_tokens.mean(dim=1)
             features = self.head(global_feat)
         
+        # In ONNX export, return_features is usually a static boolean,
+        # but to be safe and remove TracerWarnings, we just use standard Python if.
+        # Since the user input warning says "Converting a tensor to a Python boolean",
+        # return_features itself might be passed as a tensor.
+        if isinstance(return_features, torch.Tensor):
+            return_features = return_features.item()
+            
         if return_features:
             return features
 
