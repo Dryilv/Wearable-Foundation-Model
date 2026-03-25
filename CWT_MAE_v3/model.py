@@ -234,15 +234,20 @@ class TrueFactorizedBlock(nn.Module):
         x_time = x_time + self.time_attn(self.norm_time(x_time), cos_t, sin_t)
         
         # --- 2. Cross-Channel Attention ---
-        # Unified logic without 'if M > 1' conditional that causes TracerWarning
-        # When M == 1, cross-channel attention will just process the single channel.
-        x_c = x_time.reshape(B, M, N, D)
-        x_smooth = x_c.reshape(B * M, N, D).transpose(1, 2) 
-        x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).contiguous().reshape(B, M, N, D)
-        x_channel = x_smooth.transpose(1, 2).contiguous().reshape(B * N, M, D)
-        attn_out = self.channel_attn(self.norm_channel(x_channel))
-        x_c = x_c + attn_out.reshape(B, N, M, D).transpose(1, 2)
-        x = x_c.reshape(B, MN, D)
+        # When M == 1, self.channel_attn should just be an identity operation
+        # since there's no cross-channel information to attend to.
+        # It's safer to bypass attention when M=1 to avoid CUDA errors with SDPA 
+        # when dealing with N=1 or single tokens in certain configurations.
+        if M > 1:
+            x_c = x_time.reshape(B, M, N, D)
+            x_smooth = x_c.reshape(B * M, N, D).transpose(1, 2) 
+            x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).contiguous().reshape(B, M, N, D)
+            x_channel = x_smooth.transpose(1, 2).contiguous().reshape(B * N, M, D)
+            attn_out = self.channel_attn(self.norm_channel(x_channel))
+            x_c = x_c + attn_out.reshape(B, N, M, D).transpose(1, 2)
+            x = x_c.reshape(B, MN, D)
+        else:
+            x = x_time.reshape(B, MN, D)
             
         # --- 3. MLP ---
         x = x + self.mlp(self.norm_mlp(x))
