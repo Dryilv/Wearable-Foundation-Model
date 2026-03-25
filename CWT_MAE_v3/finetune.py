@@ -203,21 +203,48 @@ class FocalLoss(nn.Module):
             self.alpha_scalar = float(alpha)
 
     def forward(self, logits, targets):
-        ce_loss = F.cross_entropy(
-            logits,
-            targets,
-            reduction='none',
-            label_smoothing=self.label_smoothing
-        )
-        pt = torch.exp(-ce_loss)
-        focal_weight = (1.0 - pt) ** self.gamma
-        loss = focal_weight * ce_loss
+        # targets can be either hard labels (long) or soft labels (float)
+        if targets.dtype == torch.long:
+            # For hard labels, get standard cross entropy
+            ce_loss = F.cross_entropy(
+                logits,
+                targets,
+                reduction='none',
+                label_smoothing=self.label_smoothing
+            )
+            # Calculate probabilities of the target class
+            pt = torch.exp(-ce_loss)
+            focal_weight = (1.0 - pt) ** self.gamma
+            loss = focal_weight * ce_loss
 
-        if self.alpha_tensor is not None:
-            alpha_t = self.alpha_tensor[targets]
-            loss = alpha_t * loss
-        elif self.alpha_scalar is not None:
-            loss = self.alpha_scalar * loss
+            if self.alpha_tensor is not None:
+                alpha_t = self.alpha_tensor[targets]
+                loss = alpha_t * loss
+            elif self.alpha_scalar is not None:
+                loss = self.alpha_scalar * loss
+
+        else:
+            # For soft labels, use KL divergence or compute manually
+            log_probs = F.log_softmax(logits, dim=-1)
+            # Manually apply label smoothing if needed for soft labels
+            if self.label_smoothing > 0:
+                num_classes = logits.size(-1)
+                targets = targets * (1.0 - self.label_smoothing) + self.label_smoothing / num_classes
+                
+            ce_loss = -(targets * log_probs).sum(dim=-1)
+            probs = torch.exp(log_probs)
+            # pt is the probability of the true distribution
+            pt = (targets * probs).sum(dim=-1)
+            
+            focal_weight = (1.0 - pt) ** self.gamma
+            loss = focal_weight * ce_loss
+            
+            if self.alpha_tensor is not None:
+                # Approximate alpha for soft labels by taking expected alpha
+                alpha_t = (targets * self.alpha_tensor).sum(dim=-1)
+                loss = alpha_t * loss
+            elif self.alpha_scalar is not None:
+                loss = self.alpha_scalar * loss
 
         if self.reduction == 'sum':
             return loss.sum()
@@ -557,6 +584,7 @@ def main():
                                     label = int(label_item['class']) if isinstance(label_item, dict) else int(label_item)
                             else:
                                 label = int(target_label)
+                        label = max(0, min(label, data_cfg['num_classes'] - 1))
                         return label
                     except:
                         return 0
@@ -619,6 +647,7 @@ def main():
                                 label = int(label_item['class']) if isinstance(label_item, dict) else int(label_item)
                         else:
                             label = int(target_label)
+                    label = max(0, min(label, data_cfg['num_classes'] - 1))
                     return label
                 except:
                     return 0 # Default fallback
