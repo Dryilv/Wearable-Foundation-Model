@@ -285,6 +285,15 @@ class TF_MAE_Classifier(nn.Module):
         # 3. Forward Encoder
         # 新版 forward_encoder 需要传入原始信号 x 用于 1D 特征融合
         # x 的形状是 (B, M*N_patches + 1, D)
+        
+        # When exporting to ONNX, we must ensure the device of the dummy inputs 
+        # is absolutely aligned with the model parameters
+        if torch.onnx.is_in_onnx_export():
+            if x.device != next(self.encoder_model.parameters()).device:
+                x = x.to(next(self.encoder_model.parameters()).device)
+            if imgs.device != x.device:
+                imgs = imgs.to(x.device)
+
         self.encoder_model.mask_ratio = 0.0
         latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs)
         
@@ -294,11 +303,11 @@ class TF_MAE_Classifier(nn.Module):
         token_padding_mask = None
         if channel_mask is not None:
             channel_mask = channel_mask.to(patch_tokens.device, dtype=torch.bool)
-            B, total_tokens, _ = patch_tokens.shape
-            M = x.shape[1]
-            if channel_mask.shape[0] == B and channel_mask.shape[1] == M and M > 0 and total_tokens % M == 0:
-                n_patches = total_tokens // M
-                token_padding_mask = (~channel_mask).unsqueeze(-1).expand(B, M, n_patches).reshape(B, total_tokens)
+            B_mask, total_tokens, _ = patch_tokens.shape
+            M_mask = x.shape[1]
+            if channel_mask.shape[0] == B_mask and channel_mask.shape[1] == M_mask and M_mask > 0 and total_tokens % M_mask == 0:
+                n_patches = total_tokens // M_mask
+                token_padding_mask = (~channel_mask).unsqueeze(-1).expand(B_mask, M_mask, n_patches).reshape(B_mask, total_tokens)
         
         # 5. Forward Head
         if isinstance(self.head, LatentReasoningHead):

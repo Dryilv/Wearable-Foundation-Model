@@ -124,28 +124,46 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(torch.float32), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(torch.float32), persistent=False)
+        
+        # When creating persistent buffers, ensure they align with the current device.
+        cos_tensor = emb.cos().to(torch.float32)
+        sin_tensor = emb.sin().to(torch.float32)
+        
+        self.register_buffer("cos_cached", cos_tensor, persistent=False)
+        self.register_buffer("sin_cached", sin_tensor, persistent=False)
 
     def forward(self, x, pos_ids):
+        # 确保 pos_ids 和缓存张量在同一个设备上
+        # 因为 pos_ids 可能是由于其他计算动态生成在某些设备上，或者导出的 dummy_x 在 CUDA 而 pos_ids 默认在 CPU
+        # 这会导致 `cos_cached[pos_ids]` 时发生 index_select 跨设备错误
+        
+        # In ONNX export, doing conditional device checks can sometimes insert branching logic 
+        # that confuses the tracer. We simply cast pos_ids unconditionally.
+        
+        # We also need to make sure self.cos_cached is on the same device as x
+        # In some cases, buffers created during init remain on CPU if not explicitly moved
+        if self.cos_cached.device != x.device:
+            self.cos_cached = self.cos_cached.to(x.device)
+            self.sin_cached = self.sin_cached.to(x.device)
+            
+        pos_ids = pos_ids.to(x.device)
+
         if torch.onnx.is_in_onnx_export():
-            # 在 ONNX 导出时，忽略 seq_len 的动态比较，直接使用索引
-            # 注意: 如果 pos_ids 包含了对缓存越界的索引，在实际推理框架中可能会越界。
-            # 但只要 max_seq_len (如 6000) 大于序列长度，就没问题。
             cos = self.cos_cached[pos_ids].to(x.dtype)
             sin = self.sin_cached[pos_ids].to(x.dtype)
             return cos.unsqueeze(2), sin.unsqueeze(2)
             
         seq_len = torch.max(pos_ids) + 1
         
-        # 训练和常规推理时的逻辑
-        # 我们使用纯 Python 类型提取，因为这不属于计算图的一部分
-        # 但在某些 PyTorch 版本中，即使是 if 分支内部，只要有 .item() 也会被探测到
-        # 因此我们在 Python 层面获取 seq_len 的最大值
         seq_len_val = seq_len.item()
         
         if seq_len_val > self.max_seq_len:
             self._update_cache(int(seq_len_val * 1.5))
+            # 更新缓存后，重新分配设备
+            if self.cos_cached.device != x.device:
+                self.cos_cached = self.cos_cached.to(x.device)
+                self.sin_cached = self.sin_cached.to(x.device)
+            pos_ids = pos_ids.to(x.device)
             
         cos = self.cos_cached[pos_ids].to(x.dtype)
         sin = self.sin_cached[pos_ids].to(x.dtype)
@@ -212,7 +230,13 @@ class RoPEAttention(nn.Module):
              q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
         
         q, k, v = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous()
-        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        
+        # In ONNX export, F.scaled_dot_product_attention is fully supported in opset >= 14,
+        # but the dropout argument needs to be strictly a float, and sometimes training flag checking causes issues.
+        # Ensure dropout is a static float.
+        dropout_val = float(self.attn_drop.p) if self.training else 0.0
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_val)
+        
         x = x.transpose(1, 2).contiguous().reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -463,13 +487,25 @@ class CWT_MAE_RoPE(nn.Module):
         x_cwt_2d = x_cwt.reshape(B * M, H_grid, W_grid, D)
         x_raw_2d = x_raw_embed.unsqueeze(1) # (B*M, 1, W_grid, D)
         
+        # 确保 scale 参数的设备匹配
+        if self.raw_signal_scale.device != x_raw_2d.device:
+            raw_scale = self.raw_signal_scale.to(x_raw_2d.device)
+        else:
+            raw_scale = self.raw_signal_scale
+            
         # 广播相加：1D 特征复制到所有频率带
-        x_fused = x_cwt_2d + x_raw_2d * self.raw_signal_scale
+        x_fused = x_cwt_2d + x_raw_2d * raw_scale
         x = x_fused.reshape(B, M, -1, D) 
         N_patches = x.shape[2]
 
         # 4. 位置编码
-        x = x + self.pos_embed.unsqueeze(1)
+        # In ONNX export, we need to make sure pos_embed matches x's device
+        # in case pos_embed was somehow created on a different device
+        if self.pos_embed.device != x.device:
+            x = x + self.pos_embed.unsqueeze(1).to(x.device)
+        else:
+            x = x + self.pos_embed.unsqueeze(1)
+            
         x = x.reshape(B, M * N_patches, -1)
 
         # 5. Masking
@@ -489,6 +525,11 @@ class CWT_MAE_RoPE(nn.Module):
             pos_ids_flat = (ids_keep % W_grid).reshape(B * M_enc, -1) 
         else:
             pos_ids_flat = (ids_keep % W_grid) 
+            
+        # Ensure pos_ids_flat is explicitly on the correct device before passing to RoPE
+        # This is a key fix for wrapper_CUDA__index_select cross-device issues
+        if pos_ids_flat.device != x_masked.device:
+            pos_ids_flat = pos_ids_flat.to(x_masked.device)
             
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids_flat)
         
@@ -511,12 +552,21 @@ class CWT_MAE_RoPE(nn.Module):
         x = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D_dec))
 
         x_patches = x.reshape(B, M, N_patches, D_dec)
-        x_patches = x_patches + self.decoder_pos_embed.unsqueeze(1)
+        if self.decoder_pos_embed.device != x_patches.device:
+            x_patches = x_patches + self.decoder_pos_embed.unsqueeze(1).to(x_patches.device)
+        else:
+            x_patches = x_patches + self.decoder_pos_embed.unsqueeze(1)
         x = x_patches.reshape(B, Total_Tokens, D_dec)
 
         H_grid, W_grid = self.grid_size
         patch_pos = (torch.arange(N_patches, device=x.device) % W_grid).unsqueeze(0).expand(B, -1)
         patch_pos_expanded = patch_pos.repeat(1, M)
+
+        # Before passing to rope, ensure pos_ids are explicitly aligned to the device of the rope cache if known
+        # But x.device is the safest default
+        if patch_pos_expanded.device != x.device:
+            patch_pos_expanded = patch_pos_expanded.to(x.device)
+
         rope_cos, rope_sin = self.rope_decoder(x, patch_pos_expanded)
         
         for blk in self.decoder_blocks:
