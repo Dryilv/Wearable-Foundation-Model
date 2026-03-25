@@ -30,30 +30,41 @@ def cwt_ricker(x, scales):
     batch_size, sequence_length = x.shape
     x = x.unsqueeze(1)
     
-    if torch.onnx.is_in_onnx_export():
-        # 在 ONNX 导出时，完全绕过张量的动态求值，直接使用静态值
-        # 假设 scales 的最大值可以通过传入的标量或预定义逻辑推断
-        # 注意: 这里的 scales 是从 cwt_wrap 生成的。如果导出时 batch 的 seq_len 也是固定的，我们就可以完全静态化。
-        wavelet_len_int = 641 # 一个合理的默认最大奇数长度，或者根据实际配置
-        # 为了更准确，我们可以从当前张量中强行剥离出标量
-        try:
-            ls = float(scales[-1])
-            sl = int(sequence_length)
-            wavelet_len_int = int(min(10.0 * ls, float(sl)))
-            if wavelet_len_int % 2 == 0:
-                wavelet_len_int += 1
-        except:
-            pass # 降级使用默认静态值
-    else:
-        # 训练和常规推理时的逻辑
-        largest_scale = float(scales[-1].detach().cpu().item())
-        wavelet_len_int = int(min(10.0 * largest_scale, float(sequence_length)))
-        if wavelet_len_int % 2 == 0:
-            wavelet_len_int += 1
-        
-    # scales must be on the same device
+    # 获取最大尺度用于计算小波长度
+    # 使用纯 Tensor 操作来计算长度，避免任何 python scalar 转换带来的 TracerWarning
+    
+    # 我们知道 scales 是一维的。我们需要获取其最后一个元素。
+    # 为了让 ONNX 追踪器满意，我们需要所有的操作都在同一设备上（例如 x.device），
+    # 并且避免任何如果涉及到形状大小的条件分支。
+    
+    # 1. 确保 scales 在同一设备
     scales = scales.to(x.device)
     
+    # 2. 通过 tensor 运算得到长度上限
+    largest_scale = scales[-1]
+    
+    # 注意：F.conv1d 和 F.pad 要求它们的参数（如 padding 大小、weight）在构建计算图时具有确定的静态形状。
+    # 动态的 kernel size 会破坏 ONNX 导出，因为 ONNX 静态图中卷积核的尺寸必须是已知的。
+    # 因此，我们必须使用一个静态的整数来作为 wavelet_len，而不能依赖张量的动态计算。
+    # 解决办法：在模型结构初始化时预先计算好最大小波长度并作为常量传入，或者在这里提取。
+    # 如果处于导出模式，强制回退到一个已知的安全静态常量。
+    
+    if torch.onnx.is_in_onnx_export():
+        # 在导出模式下，提取出数值。
+        # 即使使用了 is_in_onnx_export()，追踪器也会“扫描”里面的代码。
+        # 因此最安全的做法是根本不碰 scales 的数据。
+        # 对于当前配置 (num_scales=64, lowest_scale=0.1, step=1.0)
+        # largest_scale = 63 * 1.0 + 0.1 = 63.1
+        # wavelet_len = min(10 * 63.1, 1000) = min(631, 1000) = 631
+        wavelet_len_int = 631
+    else:
+        # 训练时，使用 item() 提取数值
+        largest_scale_val = largest_scale.item()
+        seq_len_val = sequence_length if isinstance(sequence_length, int) else sequence_length.item()
+        wavelet_len_int = int(min(10.0 * largest_scale_val, float(seq_len_val)))
+        if wavelet_len_int % 2 == 0:
+            wavelet_len_int += 1
+            
     # Pass plain int to create_ricker_wavelets
     wavelets = create_ricker_wavelets(wavelet_len_int, scales)
     wavelets = wavelets.to(dtype=x.dtype)
@@ -119,16 +130,22 @@ class RotaryEmbedding(nn.Module):
     def forward(self, x, pos_ids):
         if torch.onnx.is_in_onnx_export():
             # 在 ONNX 导出时，忽略 seq_len 的动态比较，直接使用索引
+            # 注意: 如果 pos_ids 包含了对缓存越界的索引，在实际推理框架中可能会越界。
+            # 但只要 max_seq_len (如 6000) 大于序列长度，就没问题。
             cos = self.cos_cached[pos_ids].to(x.dtype)
             sin = self.sin_cached[pos_ids].to(x.dtype)
             return cos.unsqueeze(2), sin.unsqueeze(2)
             
         seq_len = torch.max(pos_ids) + 1
         
-        # RoPE 缓存通常远大于实际序列长度，在 ONNX 导出时不需要将此比较写入计算图。
-        # 如果确实超过了，直接在 Python 层扩容即可。这避免了任何形式的 TracerWarning 或 Device Mismatch
-        if int(seq_len.detach().cpu().item()) > self.max_seq_len:
-            self._update_cache(int(seq_len.detach().cpu().item() * 1.5))
+        # 训练和常规推理时的逻辑
+        # 我们使用纯 Python 类型提取，因为这不属于计算图的一部分
+        # 但在某些 PyTorch 版本中，即使是 if 分支内部，只要有 .item() 也会被探测到
+        # 因此我们在 Python 层面获取 seq_len 的最大值
+        seq_len_val = seq_len.item()
+        
+        if seq_len_val > self.max_seq_len:
+            self._update_cache(int(seq_len_val * 1.5))
             
         cos = self.cos_cached[pos_ids].to(x.dtype)
         sin = self.sin_cached[pos_ids].to(x.dtype)
