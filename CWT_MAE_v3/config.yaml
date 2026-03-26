@@ -74,26 +74,3 @@ model:
   # --- Loss Weighting ---
   time_loss_weight: 1.0     # [建议] 稍微提高时域权重，因为加入了残差连接，时域重建更重要了
   
-  # --- Contrastive Learning ---
-  proj_dim: 256             
-  temperature: 0.07         
-  contrastive_weight: 1.0
-
-# ------------------------------------------------------------------------------
-# 4. 3-Stage Training Strategy
-# ------------------------------------------------------------------------------
-stage:
-  stage1_epochs: 4         # Stage 1: Feature Construction (Epoch 0-10)
-  stage2_epochs: 10         # Stage 2: Alignment Transition (Epoch 10-20)
-  
-  # Stage 1 Weights
-  stage1_alpha: 0.0         # Contrastive Loss Weight
-  stage1_mae: 1.0           # MAE Loss Weight
-  
-  # Stage 2 Weights (Target Alpha, Linear Warmup)
-  stage2_target_alpha: 1.0  # Final Alpha for Stage 2 & 3
-  stage2_mae: 1.0           # MAE Loss Weight
-  
-  # Stage 3 Weights (Semantic Refinement)
-  stage3_alpha: 1.0         # Contrastive Loss Weight
-  stage3_mae: 0.1           # MAE Loss Weight

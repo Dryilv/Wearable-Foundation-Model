@@ -26,7 +26,7 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
-from model import CWT_MAE_RoPE, SingleTowerContrastiveMAE
+from model import CWT_MAE_RoPE
 from dataset import PhysioSignalDataset, DataSplitter, fixed_channel_collate_fn
 from utils_metrics import ExperimentTracker, train_linear_probe, evaluate_features_quality
 from utils import save_reconstruction_images
@@ -159,10 +159,9 @@ def validate(model, dataloader, device, config):
             batch = batch.to(device, non_blocking=True)
             
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                # Split channels
-                x_ecg = batch[:, 0, :]
-                x_ppg = batch[:, 1, :]
-                loss, loss_dict = model(x_ppg, x_ecg)
+                # Split channels (if dataset outputs 2 channels, or just use as is)
+                # But since CWT_MAE_RoPE expects (B, M, L), we can just pass batch directly
+                loss, loss_dict, _, _, _, _, _ = model(batch)
                 
             metric_logger['loss'].update(loss.item())
             metric_logger['loss_spec'].update(loss_dict.get('loss_spec', torch.tensor(0.0)).item())
@@ -189,16 +188,12 @@ def validate(model, dataloader, device, config):
     return val_loss, val_loss_spec, val_loss_time
 
 def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global, 
-                    total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0,
-                    alpha=None, mae_weight=1.0):
+                    total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0):
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_spec'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_time'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
-    metric_logger['loss_mae'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
-    metric_logger['loss_contrastive'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
-    metric_logger['loss_consist'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     metric_logger['grad_norm'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
     metric_logger['throughput'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
@@ -273,19 +268,13 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                # Split channels: 0 -> ECG, 1 -> PPG
-                # batch shape: (B, 2, L)
-                x_ecg = batch[:, 0, :]
-                x_ppg = batch[:, 1, :]
-                
-                loss, loss_dict = model(x_ppg, x_ecg, mask_ratio=mask_ratio, alpha=alpha, mae_weight=mae_weight)
+                # 直接传入 batch
+                loss, loss_dict, _, _, _, _, _ = model(batch, mask_ratio=mask_ratio)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
             loss_spec_val = loss_dict.get('loss_spec', torch.tensor(0.0)).item()
             loss_time_val = loss_dict.get('loss_time', torch.tensor(0.0)).item()
-            loss_mae_val = loss_dict.get('loss_mae', torch.tensor(0.0)).item()
-            loss_contrastive_val = loss_dict.get('loss_contrastive', torch.tensor(0.0)).item()
             
             if not math.isfinite(loss_value):
                 print(f"Loss is {loss_value}, stopping training")
@@ -326,8 +315,6 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         metric_logger['loss'].update(loss_value)
         metric_logger['loss_spec'].update(loss_spec_val)
         metric_logger['loss_time'].update(loss_time_val)
-        metric_logger['loss_mae'].update(loss_mae_val)
-        metric_logger['loss_contrastive'].update(loss_contrastive_val)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
         metric_logger['throughput'].update(throughput)
 
@@ -352,8 +339,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             logger.info(
                 f"{header} Step: [{step}/{num_steps_per_epoch}] "
                 f"Loss: {metric_logger['loss']} "
-                f"MAE: {metric_logger['loss_mae']} "
-                f"CL: {metric_logger['loss_contrastive']} "
+                f"Spec: {metric_logger['loss_spec']} "
+                f"Time: {metric_logger['loss_time']} "
                 f"LR: {metric_logger['lr']} "
                 f"Grad: {metric_logger['grad_norm']} "
                 f"Speed: {metric_logger['throughput'].avg:.1f} samples/s "
@@ -492,14 +479,9 @@ def main():
     }
 
     if is_main_process():
-        logger.info("Initializing SingleTowerContrastiveMAE...")
+        logger.info("Initializing CWT_MAE_RoPE...")
     
-    model = SingleTowerContrastiveMAE(
-        base_model_config=base_model_config,
-        proj_dim=config['model'].get('proj_dim', 256),
-        temperature=config['model'].get('temperature', 0.07),
-        alpha=config['model'].get('contrastive_weight', 1.0)
-    )
+    model = CWT_MAE_RoPE(**base_model_config)
     model.to(device)
 
     # 编译模型
@@ -513,24 +495,19 @@ def main():
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True)
 
-    # 优化器参数分组：区分基座网络和投影头
+    # 优化器参数分组
     base_params = []
-    proj_head_params = []
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'proj_head' in name:
-            proj_head_params.append(param)
-        else:
-            base_params.append(param)
+        base_params.append(param)
             
     if is_main_process():
-        logger.info(f"Optimizer groups: Base Params={len(base_params)}, Proj Head Params={len(proj_head_params)}")
+        logger.info(f"Optimizer groups: Base Params={len(base_params)}")
 
     optimizer = optim.AdamW([
-        {'params': base_params, 'lr': base_lr},
-        {'params': proj_head_params, 'lr': base_lr * 10.0} 
+        {'params': base_params, 'lr': base_lr}
     ], weight_decay=float(config['train']['weight_decay']))
     
     # GradScaler 用于混合精度
@@ -576,33 +553,8 @@ def main():
         current_warmup_steps = warmup_steps
         current_lr_start_step = 0
         
-        # --- 3-Stage Training Strategy ---
-        stage_cfg = config.get('stage', {})
-        s1_end = stage_cfg.get('stage1_epochs', 10)
-        s2_end = stage_cfg.get('stage2_epochs', 20)
-        
-        target_alpha = stage_cfg.get('stage2_target_alpha', 1.0)
-        
-        if epoch < s1_end:
-            current_alpha = stage_cfg.get('stage1_alpha', 0.0)
-            current_mae_weight = stage_cfg.get('stage1_mae', 1.0)
-            stage_name = f"Stage 1: Feature Construction (Epoch 0-{s1_end})"
-        elif s1_end <= epoch < s2_end:
-            # Linear warmup for alpha
-            progress = (epoch - s1_end) / float(s2_end - s1_end)
-            start_alpha = stage_cfg.get('stage1_alpha', 0.0)
-            current_alpha = start_alpha + (target_alpha - start_alpha) * progress
-            current_mae_weight = stage_cfg.get('stage2_mae', 1.0)
-            stage_name = f"Stage 2: Alignment Transition (Epoch {s1_end}-{s2_end})"
-        else:
-            current_alpha = stage_cfg.get('stage3_alpha', 1.0)
-            current_mae_weight = stage_cfg.get('stage3_mae', 0.1)
-            stage_name = f"Stage 3: Semantic Refinement (Epoch {s2_end}+)"
-            
         if is_main_process():
             logger.info(f"Epoch {epoch} Configuration: Mask Ratio = {current_mask_ratio:.4f}, Base LR Target = {current_base_lr}")
-            logger.info(f"Training Stage: {stage_name}")
-            logger.info(f"Weights: Alpha (Contrastive) = {current_alpha:.4f}, MAE Weight = {current_mae_weight:.4f}")
             
         # Train
         train_metrics = train_one_epoch(
@@ -612,9 +564,7 @@ def main():
             base_lr=current_base_lr,
             min_lr=min_lr,
             mask_ratio=current_mask_ratio,
-            lr_start_step=current_lr_start_step,
-            alpha=current_alpha,
-            mae_weight=current_mae_weight
+            lr_start_step=current_lr_start_step
         )
         
         # Validation Removed
@@ -661,8 +611,8 @@ def main():
             # Log Metrics
             metrics_dict = {
                 'train_loss': train_metrics['loss'],
-                'loss_mae': train_metrics['loss_mae'],
-                'loss_contrastive': train_metrics['loss_contrastive'],
+                'loss_spec': train_metrics['loss_spec'],
+                'loss_time': train_metrics['loss_time'],
                 'grad_norm': train_metrics['grad_norm'],
                 'gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 / 1024,
                 'throughput': train_metrics['throughput'],
