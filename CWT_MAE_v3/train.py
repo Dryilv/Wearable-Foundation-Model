@@ -353,8 +353,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     # Return metrics dict
     return {
         'loss': metric_logger['loss'].global_avg,
-        'loss_mae': metric_logger['loss_mae'].global_avg,
-        'loss_contrastive': metric_logger['loss_contrastive'].global_avg,
+        'loss_spec': metric_logger['loss_spec'].global_avg,
+        'loss_time': metric_logger['loss_time'].global_avg,
         'grad_norm': metric_logger['grad_norm'].global_avg,
         'throughput': metric_logger['throughput'].global_avg * (dist.get_world_size() if dist.is_initialized() else 1)
     }
