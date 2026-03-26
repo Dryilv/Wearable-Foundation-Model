@@ -484,14 +484,18 @@ def main():
     model = CWT_MAE_RoPE(**base_model_config)
     model.to(device)
 
-    # 编译模型
-    try:
-        model = torch.compile(model)
+    # 编译模型 (TITAN V 不完全支持编译特性，建议通过 config 控制)
+    if config['train'].get('use_compile', False):
+        try:
+            model = torch.compile(model)
+            if is_main_process():
+                logger.info("Model compiled with torch.compile()")
+        except Exception as e:
+            if is_main_process():
+                logger.warning(f"Could not compile model: {e}")
+    else:
         if is_main_process():
-            logger.info("Model compiled with torch.compile()")
-    except Exception as e:
-        if is_main_process():
-            logger.warning(f"Could not compile model: {e}")
+            logger.info("torch.compile() is disabled via config.")
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True) if dist.is_initialized() else model
 

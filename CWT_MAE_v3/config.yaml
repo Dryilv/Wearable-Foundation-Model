@@ -24,6 +24,7 @@ train:
   weight_decay: 0.05        
   clip_grad: 3.0            
   use_amp: True             
+  use_compile: False        # TITAN V 不完全支持 bfloat16 的本地编译，建议关闭
 
   log_interval: 50          
   save_freq: 1             # 改为每轮保存
