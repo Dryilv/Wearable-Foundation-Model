@@ -493,7 +493,7 @@ def main():
         if is_main_process():
             logger.warning(f"Could not compile model: {e}")
 
-    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True)
+    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True) if dist.is_initialized() else model
 
     # 优化器参数分组
     base_params = []
@@ -522,7 +522,19 @@ def main():
     start_epoch = 0
     if config['train']['resume'] and os.path.isfile(config['train']['resume']):
         checkpoint = torch.load(config['train']['resume'], map_location='cpu')
-        model.module.load_state_dict(checkpoint['model'])
+        
+        # 处理 DDP state_dict 加载
+        state_dict = checkpoint['model']
+        if not dist.is_initialized():
+            # 如果当前不是 DDP，但 checkpoint 是 DDP 保存的，去掉 'module.' 前缀
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                name = k.replace('module.', '')
+                new_state_dict[name] = v
+            model.load_state_dict(new_state_dict)
+        else:
+            model.module.load_state_dict(state_dict)
+            
         optimizer.load_state_dict(checkpoint['optimizer'])
         scaler.load_state_dict(checkpoint['scaler'])
         start_epoch = checkpoint['epoch'] + 1
@@ -650,7 +662,7 @@ def main():
             
             # 保存 Checkpoint
             save_dict = {
-                'model': model.module.state_dict(),
+                'model': model.module.state_dict() if dist.is_initialized() else model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scaler': scaler.state_dict(),
                 'epoch': epoch,
