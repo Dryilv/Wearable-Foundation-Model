@@ -253,6 +253,44 @@ class FocalLoss(nn.Module):
             return loss
         return loss.mean()
 
+class MultiLabelFocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.25, pos_weight=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # alpha is for positive class, 1-alpha for negative
+        self.reduction = reduction
+        # pos_weight should be a tensor of shape [num_classes]
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, logits, targets):
+        # Use BCEWithLogitsLoss with reduction='none' to get per-element BCE loss
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none', pos_weight=self.pos_weight
+        )
+        
+        # Calculate pt (probability of the true label)
+        # Using pt = p if y=1 else 1-p, which can be computed efficiently:
+        probs = torch.sigmoid(logits)
+        pt = targets * probs + (1 - targets) * (1 - probs)
+        
+        # Calculate modulating factor (1 - pt) ^ gamma
+        focal_weight = (1.0 - pt) ** self.gamma
+        
+        # Optional alpha weighting
+        if self.alpha is not None:
+            alpha_weight = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+            focal_weight = alpha_weight * focal_weight
+            
+        loss = focal_weight * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, grad_clip_norm=3.0, scheduler=None):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
@@ -710,18 +748,33 @@ def main():
         if dist.is_initialized():
             dist.broadcast(weights_tensor, src=0)
             
-        criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor)
-        if is_main_process():
-            print(f"Loss: BCEWithLogitsLoss with auto pos_weight={weights_tensor.tolist()}")
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss(pos_weight=weights_tensor)
+            if is_main_process():
+                print(f"Loss: MultiLabelFocalLoss with auto pos_weight={weights_tensor.tolist()}")
+        else:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor)
+            if is_main_process():
+                print(f"Loss: BCEWithLogitsLoss with auto pos_weight={weights_tensor.tolist()}")
     elif train_cfg.get('pos_weight') is not None:
         weights = torch.tensor(train_cfg['pos_weight'], dtype=torch.float32).to(device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=weights)
-        if is_main_process():
-            print(f"Loss: BCEWithLogitsLoss with config pos_weight={weights.tolist()}")
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss(pos_weight=weights)
+            if is_main_process():
+                print(f"Loss: MultiLabelFocalLoss with config pos_weight={weights.tolist()}")
+        else:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=weights)
+            if is_main_process():
+                print(f"Loss: BCEWithLogitsLoss with config pos_weight={weights.tolist()}")
     else:
-        criterion = nn.BCEWithLogitsLoss()
-        if is_main_process():
-            print("Loss: BCEWithLogitsLoss")
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss()
+            if is_main_process():
+                print("Loss: MultiLabelFocalLoss")
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+            if is_main_process():
+                print("Loss: BCEWithLogitsLoss")
 
     best_metric = float("-inf")
     best_threshold = 0.5
