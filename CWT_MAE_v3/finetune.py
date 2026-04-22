@@ -737,7 +737,8 @@ def main():
             neg_counts = len(labels_np) - pos_counts
             
             pos_counts = np.maximum(pos_counts, 1)
-            calculated_weights = neg_counts / pos_counts
+            # 使用开根号平滑策略 (Square Root Smoothing) 避免权重过于极端
+            calculated_weights = np.sqrt(neg_counts / pos_counts)
             # 限制最大权重避免极端不平衡导致的梯度爆炸
             calculated_weights = np.clip(calculated_weights, 1.0, 50.0) 
             
@@ -751,30 +752,30 @@ def main():
         if train_cfg.get('use_focal_loss'):
             criterion = MultiLabelFocalLoss(pos_weight=weights_tensor)
             if is_main_process():
-                print(f"Loss: MultiLabelFocalLoss with auto pos_weight={weights_tensor.tolist()}")
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  auto pos_weight: {weights_tensor.tolist()}")
         else:
             criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor)
             if is_main_process():
-                print(f"Loss: BCEWithLogitsLoss with auto pos_weight={weights_tensor.tolist()}")
+                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  auto pos_weight: {weights_tensor.tolist()}")
     elif train_cfg.get('pos_weight') is not None:
         weights = torch.tensor(train_cfg['pos_weight'], dtype=torch.float32).to(device)
         if train_cfg.get('use_focal_loss'):
             criterion = MultiLabelFocalLoss(pos_weight=weights)
             if is_main_process():
-                print(f"Loss: MultiLabelFocalLoss with config pos_weight={weights.tolist()}")
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  config pos_weight: {weights.tolist()}")
         else:
             criterion = nn.BCEWithLogitsLoss(pos_weight=weights)
             if is_main_process():
-                print(f"Loss: BCEWithLogitsLoss with config pos_weight={weights.tolist()}")
+                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  config pos_weight: {weights.tolist()}")
     else:
         if train_cfg.get('use_focal_loss'):
             criterion = MultiLabelFocalLoss()
             if is_main_process():
-                print("Loss: MultiLabelFocalLoss")
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  pos_weight: None")
         else:
             criterion = nn.BCEWithLogitsLoss()
             if is_main_process():
-                print("Loss: BCEWithLogitsLoss")
+                print("Loss Details:\n  Type: BCEWithLogitsLoss\n  pos_weight: None")
 
     best_metric = float("-inf")
     best_threshold = 0.5
