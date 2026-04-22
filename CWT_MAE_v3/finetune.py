@@ -739,7 +739,7 @@ def main():
             pos_counts = np.maximum(pos_counts, 1)
             calculated_weights = neg_counts / pos_counts
             # 限制最大权重避免极端不平衡导致的梯度爆炸
-            calculated_weights = np.clip(calculated_weights, 1.0, 100.0) 
+            calculated_weights = np.clip(calculated_weights, 1.0, 50.0) 
             
             weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32, device=device)
         else:
