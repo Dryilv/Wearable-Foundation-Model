@@ -121,10 +121,10 @@ class DownstreamClassificationDataset(Dataset):
 
             # --- 2. 加载标签 ---
             LABEL_NAMES = [
-                '高血压', '高血糖', '高血脂', '下肢动脉硬化闭塞症', 
-                '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', 
-                '脑卒中（中风）', '颈动脉斑块'
-            ]
+            '高血压', '高血糖', '高血脂', 
+            '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', 
+            '颈动脉斑块'
+        ]
             
             if isinstance(content, dict) and 'label' in content:
                 target_label = content['label']

@@ -254,7 +254,7 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 class MultiLabelFocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.25, pos_weight=None, reduction='mean'):
+    def __init__(self, gamma=2.0, alpha=None, pos_weight=None, reduction='mean'):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha  # alpha is for positive class, 1-alpha for negative
@@ -710,9 +710,9 @@ def main():
             import pickle
             
             LABEL_NAMES = [
-                '高血压', '高血糖', '高血脂', '下肢动脉硬化闭塞症', 
+                '高血压', '高血糖', '高血脂', 
                 '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', 
-                '脑卒中（中风）', '颈动脉斑块'
+                '颈动脉斑块'
             ]
             
             def load_label_vector(idx):
