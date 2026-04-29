@@ -151,17 +151,15 @@ def validate(model, dataloader, device, config):
     
     with torch.no_grad():
         for batch_data in dataloader:
-            if len(batch_data) == 3:
-                batch, modality_ids, labels = batch_data
-            else:
-                batch, labels = batch_data
-                
+            # 【修改】适配新的返回值格式: (batch, channel_ids, labels)
+            batch, channel_ids, labels = batch_data
+
             batch = batch.to(device, non_blocking=True)
-            
+            channel_ids = channel_ids.to(device, non_blocking=True)
+
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                # Split channels (if dataset outputs 2 channels, or just use as is)
-                # But since CWT_MAE_RoPE expects (B, M, L), we can just pass batch directly
-                loss, loss_dict, _, _, _, _, _ = model(batch)
+                # 【修改】传递 channel_ids
+                loss, loss_dict, _, _, _, _, _ = model(batch, channel_ids)
                 
             metric_logger['loss'].update(loss.item())
             metric_logger['loss_spec'].update(loss_dict.get('loss_spec', torch.tensor(0.0)).item())
@@ -223,11 +221,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     for step, batch_data in enumerate(dataloader):
         step_start_time = time.time()
         global_step = epoch * num_steps_per_epoch + step
-        
-        if len(batch_data) == 3:
-            batch, modality_ids, labels = batch_data
-        else:
-            batch, labels = batch_data
+
+        # 【修改】适配新的返回值格式: (batch, channel_ids, labels)
+        batch, channel_ids, labels = batch_data
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
@@ -268,8 +264,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                # 直接传入 batch
-                loss, loss_dict, _, _, _, _, _ = model(batch, mask_ratio=mask_ratio)
+                # 【修改】传递 channel_ids
+                channel_ids = channel_ids.to(device, non_blocking=True)
+                loss, loss_dict, _, _, _, _, _ = model(batch, channel_ids, mask_ratio=mask_ratio)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
