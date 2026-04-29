@@ -640,24 +640,22 @@ def main():
 
             # 保存可视化
             if vis_batch is not None:
-                # 修复：可视化全部通道 (ECG & PPG)
-                # vis_batch shape: (B, 2, L), 其中 0:ECG, 1:PPG
-                # save_reconstruction_images 接受的输入是 (B, M, L)
-                
+                # 单通道可视化：需要 channel_ids
+                vis_batch_data, vis_channel_ids, _ = vis_batch
+
                 # 1. 提取 Encoder (CWT_MAE_RoPE)
                 real_model = model.module if hasattr(model, 'module') else model
                 if hasattr(real_model, 'encoder'):
                     encoder_model = real_model.encoder
                 else:
-                    encoder_model = real_model 
+                    encoder_model = real_model
 
-                # 2. 传入所有通道进行可视化
-                # 注意：CWT_MAE_RoPE 默认设计是可以处理多通道输入的 (M > 1)
-                # 它会对每个通道分别进行 Mask 和重构
+                # 2. 传入单通道数据和 channel_ids 进行可视化
                 save_reconstruction_images(
-                    encoder_model, 
-                    vis_batch,  # 传入完整 (B, 2, L) 数据
-                    epoch, 
+                    encoder_model,
+                    vis_batch_data,  # (B, 1, L)
+                    vis_channel_ids,  # (B,)
+                    epoch,
                     config['train']['save_dir']
                 )
             
