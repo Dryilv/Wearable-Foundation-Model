@@ -272,8 +272,11 @@ class PhysioSignalDataset(Dataset):
                  # Keep index 0 and 4
                  keep_indices = [0, 4]
                  safe_signal = safe_signal[keep_indices, :]
+            else:
+                 # 如果通道数不足 5，默认使用第一个通道
+                 safe_signal = safe_signal[0:1, :]
             # 【修改】随机选择单通道
-            safe_channel = random.choice([0, 1])
+            safe_channel = 0  # fallback 时固定使用通道 0，避免越界
             safe_signal = safe_signal[safe_channel:safe_channel+1, :self.signal_len]
             # 简单的归一化
             safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
