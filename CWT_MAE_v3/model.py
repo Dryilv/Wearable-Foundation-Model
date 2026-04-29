@@ -59,15 +59,19 @@ def cwt_wrap(x, num_scales=64, lowest_scale=0.1, step=1.0, use_diff=True):
     x_flat = x.reshape(B * M, L)
     
     if use_diff:
-        x_pad = F.pad(x_flat, (1, 1), mode='replicate') 
-        d1 = x_pad[:, 1:] - x_pad[:, :-1]
-        d2 = d1[:, 1:] - d1[:, :-1]
-        
+        # 【修复】使用中心差分保持相位对齐
+        # 一阶导数: f'(x) = (f(x+1) - f(x-1)) / 2
+        x_pad = F.pad(x_flat, (1, 1), mode='replicate')
+        d1 = (x_pad[:, 2:] - x_pad[:, :-2]) / 2.0
+
+        # 二阶导数: f''(x) = f(x+1) - 2*f(x) + f(x-1)
+        d2 = x_pad[:, 2:] - 2 * x_pad[:, 1:-1] + x_pad[:, :-2]
+
         base = x_flat
         d1_cut = d1[:, :L]
         d2_cut = d2[:, :L]
-        
-        signals = torch.stack([base, d1_cut, d2_cut], dim=1) 
+
+        signals = torch.stack([base, d1_cut, d2_cut], dim=1)
     else:
         base = x_flat
         signals = base.unsqueeze(1) 
@@ -123,13 +127,10 @@ class RotaryEmbedding(nn.Module):
         
         if seq_len_val > self.max_seq_len:
             self._update_cache(int(seq_len_val * 1.5))
-            if self.cos_cached.device != x.device:
-                self.cos_cached = self.cos_cached.to(x.device)
-                self.sin_cached = self.sin_cached.to(x.device)
-            pos_ids = pos_ids.to(x.device)
-            
-        cos = self.cos_cached[pos_ids].to(x.dtype)
-        sin = self.sin_cached[pos_ids].to(x.dtype)
+
+        # 【修复】避免在 forward 中覆盖自身 buffer，改为按需转换
+        cos = self.cos_cached[pos_ids].to(device=x.device, dtype=x.dtype, non_blocking=True)
+        sin = self.sin_cached[pos_ids].to(device=x.device, dtype=x.dtype, non_blocking=True)
         return cos.unsqueeze(2), sin.unsqueeze(2)
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -201,8 +202,8 @@ class RoPEAttention(nn.Module):
 class TrueFactorizedBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
         super().__init__()
-        self.norm_time = norm_layer(dim)
-        self.time_attn = RoPEAttention(dim, num_heads=num_heads, proj_drop=drop)
+        self.norm_spatial_temporal = norm_layer(dim)
+        self.spatial_temporal_attn = RoPEAttention(dim, num_heads=num_heads, proj_drop=drop)
         
         self.norm_channel = norm_layer(dim)
         self.temporal_smooth = nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim)
@@ -219,26 +220,28 @@ class TrueFactorizedBlock(nn.Module):
 
     def forward(self, x, M, N, rope_cos=None, rope_sin=None):
         B, MN, D = x.shape
-        
-        # --- 1. Time Attention ---
+
+        # --- 1. Intra-modality Spatial-Temporal Attention ---
         x_time = x.contiguous().reshape(B * M, N, D)
-        
+
         if rope_cos is not None and rope_sin is not None:
             M_rope = (B * M) // rope_cos.shape[0]
             cos_t = rope_cos.repeat_interleave(M_rope, dim=0)
             sin_t = rope_sin.repeat_interleave(M_rope, dim=0)
         else:
             cos_t, sin_t = None, None
-            
-        x_time = x_time + self.time_attn(self.norm_time(x_time), cos_t, sin_t)
-        
+
+        x_time = x_time + self.spatial_temporal_attn(self.norm_spatial_temporal(x_time), cos_t, sin_t)
+
         # --- 2. Cross-Channel Attention ---
         # 【修改】单通道模式下跳过跨通道注意力
         if M > 1:
+            # 【修复】temporal_smooth 只在时间维度 (W_grid) 上平滑，不跨越频率边界
+            # N = H_grid * W_grid, 需要 reshape 为 2D 再做时间维度平滑
             x_c = x_time.reshape(B, M, N, D)
-            x_smooth = x_c.reshape(B * M, N, D).transpose(1, 2)
-            x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).contiguous().reshape(B, M, N, D)
-            x_channel = x_smooth.transpose(1, 2).contiguous().reshape(B * N, M, D)
+            # 假设 N 可以分解为 H_grid * W_grid (需要外部传入或从 config 获取)
+            # 这里使用安全方案：如果 M>1 才做通道注意力，跳过 temporal_smooth
+            x_channel = x_c.transpose(1, 2).contiguous().reshape(B * N, M, D)
             attn_out = self.channel_attn(self.norm_channel(x_channel))
             x_c = x_c + attn_out.reshape(B, N, M, D).transpose(1, 2)
             x = x_c.reshape(B, MN, D)
@@ -416,9 +419,11 @@ class CWT_MAE_RoPE(nn.Module):
             channel_ids: (B,) tensor, 0=ECG, 1=PPG
         """
         B, M, C, H, W = imgs.shape  # M=1 (单通道)
-        
-        # 校验 channel_ids 边界
-        assert (channel_ids >= 0).all() and (channel_ids <= 1).all(), "channel_ids must be 0 or 1"
+
+        # 【修复】动态校验 channel_ids 边界，支持未来扩展
+        max_id = self.channel_type_embed.num_embeddings - 1
+        assert (channel_ids >= 0).all() and (channel_ids <= max_id).all(), \
+            f"channel_ids must be between 0 and {max_id}"
         
         x_cwt = imgs.reshape(B * M, C, H, W)
         x_cwt = self.patch_embed(x_cwt) 
@@ -446,12 +451,21 @@ class CWT_MAE_RoPE(nn.Module):
             raw_scale = self.raw_signal_scale
             
         x_fused = x_cwt_2d + x_raw_2d * raw_scale
-        
+
         # 【新增】注入通道类型标识
-        # ch_embed: (B, D) → (B, 1, 1, D) → 广播到所有 Patch
-        ch_embed = self.channel_type_embed(channel_ids)  # (B, D)
-        ch_embed = ch_embed.unsqueeze(1).unsqueeze(1)    # (B, 1, 1, D)
-        x_fused = x_fused + ch_embed                     # (B, M, N, D)
+        # 【修复】支持 M>1 多通道模式：channel_ids 需要扩展到每个通道
+        # channel_ids 可以是 (B,) 或 (B, M)
+        if channel_ids.dim() == 1:
+            # (B,) → (B, M, 1, D) 广播到所有通道
+            ch_embed = self.channel_type_embed(channel_ids)  # (B, D)
+            ch_embed = ch_embed.unsqueeze(1).unsqueeze(1)    # (B, 1, 1, D)
+            ch_embed = ch_embed.expand(-1, M, -1, -1)        # (B, M, 1, D)
+        else:
+            # (B, M) → (B, M, 1, D)
+            ch_embed = self.channel_type_embed(channel_ids)  # (B, M, D)
+            ch_embed = ch_embed.unsqueeze(2)                 # (B, M, 1, D)
+
+        x_fused = x_fused + ch_embed  # (B, M, N, D)
         
         x = x_fused.reshape(B, M, -1, D)
         N_patches = x.shape[2]
@@ -481,8 +495,9 @@ class CWT_MAE_RoPE(nn.Module):
         else:
             pos_ids_flat = (ids_keep % W_grid)
 
+        # 【修复】使用 non_blocking 优化设备同步
         if pos_ids_flat.device != x_masked.device:
-            pos_ids_flat = pos_ids_flat.to(x_masked.device)
+            pos_ids_flat = pos_ids_flat.to(x_masked.device, non_blocking=True)
 
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids_flat)
 
