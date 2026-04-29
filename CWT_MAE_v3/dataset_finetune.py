@@ -120,18 +120,22 @@ class DownstreamClassificationDataset(Dataset):
             raw_signal = raw_data.astype(np.float32) # (M, L_raw)
 
             # --- 2. 加载标签 ---
-            label = 0
+            LABEL_NAMES = [
+            '高血压', '高血糖', '高血脂', 
+            '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', 
+            '颈动脉斑块'
+        ]
+            
             if isinstance(content, dict) and 'label' in content:
                 target_label = content['label']
-                if isinstance(target_label, list):
-                    if self.task_index < len(target_label):
-                        label_item = target_label[self.task_index]
-                        label = int(label_item['class']) if isinstance(label_item, dict) else int(label_item)
+                if isinstance(target_label, dict):
+                    # Multi-label dict
+                    label_vector = [float(target_label.get(name, 0)) for name in LABEL_NAMES]
                 else:
-                    label = int(target_label)
-            
-            # 异常标签限制
-            label = max(0, min(label, self.num_classes - 1))
+                    # fallback
+                    label_vector = [0.0] * self.num_classes
+            else:
+                label_vector = [0.0] * self.num_classes
 
             # --- 3. 同步裁剪/填充 ---
             processed_signal = self._sync_crop_or_pad(raw_signal)
@@ -175,9 +179,8 @@ class DownstreamClassificationDataset(Dataset):
                         soft_label = soft_label / soft_sum
                     return signal_tensor, modality_ids, soft_label
             else:
-                # 返回硬标签 (Long Tensor)
-                return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
-            return signal_tensor, modality_ids, torch.tensor(label, dtype=torch.long)
+                # 返回多标签 FloatTensor
+                return signal_tensor, modality_ids, torch.tensor(label_vector, dtype=torch.float32)
 
         except Exception as e:
             self.error_count += 1
@@ -186,7 +189,7 @@ class DownstreamClassificationDataset(Dataset):
             if self.on_error == 'raise':
                 raise
             modality_ids = torch.zeros(1, dtype=torch.long)
-            return torch.zeros(1, self.signal_len), modality_ids, torch.tensor(0, dtype=torch.long)
+            return torch.zeros(1, self.signal_len), modality_ids, torch.zeros(self.num_classes, dtype=torch.float32)
 
     def _sync_crop_or_pad(self, signal):
         """

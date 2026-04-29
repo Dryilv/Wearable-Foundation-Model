@@ -253,6 +253,44 @@ class FocalLoss(nn.Module):
             return loss
         return loss.mean()
 
+class MultiLabelFocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None, pos_weight=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # alpha is for positive class, 1-alpha for negative
+        self.reduction = reduction
+        # pos_weight should be a tensor of shape [num_classes]
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, logits, targets):
+        # Use BCEWithLogitsLoss with reduction='none' to get per-element BCE loss
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none', pos_weight=self.pos_weight
+        )
+        
+        # Calculate pt (probability of the true label)
+        # Using pt = p if y=1 else 1-p, which can be computed efficiently:
+        probs = torch.sigmoid(logits)
+        pt = targets * probs + (1 - targets) * (1 - probs)
+        
+        # Calculate modulating factor (1 - pt) ^ gamma
+        focal_weight = (1.0 - pt) ** self.gamma
+        
+        # Optional alpha weighting
+        if self.alpha is not None:
+            alpha_weight = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+            focal_weight = alpha_weight * focal_weight
+            
+        loss = focal_weight * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, grad_clip_norm=3.0, scheduler=None):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
@@ -346,7 +384,7 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
                 total_loss += loss.item()
             count += 1
             
-            probs = F.softmax(logits.float(), dim=1)
+            probs = torch.sigmoid(logits.float())
             
             local_labels.append(y)
             local_probs.append(probs) 
@@ -374,44 +412,37 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_labels_np = all_labels.cpu().numpy()
         all_probs_np = all_probs.cpu().numpy()
 
-        row_sums = all_probs_np.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0 
-        all_probs_np = all_probs_np / row_sums
-
-        # 阈值搜索 (Binary Classification)
+        # Multi-label thresholds
         best_threshold = fixed_threshold
-        if num_classes == 2:
-            y_scores = all_probs_np[:, 1]
-            if search_threshold:
-                thresholds = np.arange(0.01, 1.00, 0.01)
-                best_score_search = -1.0
-                for th in thresholds:
-                    preds_th = (y_scores >= th).astype(int)
-                    # 使用 F0.5 分数进行阈值搜索，以满足高精度需求 (Precision权重高于Recall)
-                    score_th = fbeta_score(all_labels_np, preds_th, beta=0.5, average='macro')
-                    if score_th > best_score_search:
-                        best_score_search = score_th
-                        best_threshold = th
-                print(f"\n[Threshold Search] Best Threshold: {best_threshold:.2f} | Best Macro F0.5 (High Precision): {best_score_search:.4f}")
-            final_preds = (y_scores >= best_threshold).astype(int)
-        else:
-            final_preds = np.argmax(all_probs_np, axis=1)
+        final_preds = (all_probs_np >= best_threshold).astype(int)
 
-        try:
-            if num_classes == 2:
-                auroc = roc_auc_score(all_labels_np, all_probs_np[:, 1])
-            else:
-                auroc = roc_auc_score(all_labels_np, all_probs_np, multi_class='ovr', average='macro')
-        except Exception:
-            auroc = 0.0
+        # 循环 9 次，分别计算每种疾病的指标 (Macro AUC)
+        auc_list = []
+        for i in range(num_classes):
+            disease_true = all_labels_np[:, i]
+            disease_prob = all_probs_np[:, i]
+            try:
+                # 只有正负样本都存在时才能算 AUC
+                if len(np.unique(disease_true)) > 1:
+                    auc_i = roc_auc_score(disease_true, disease_prob)
+                else:
+                    auc_i = 0.5
+            except Exception:
+                auc_i = 0.5
+            auc_list.append(auc_i)
+            # 可以在此处打印每个类的AUC，或者仅由主进程打印
+            # if is_main_process() and epoch is not None:
+            #     print(f"Disease {i} AUC: {auc_i:.4f}")
+                
+        auroc = float(np.mean(auc_list))
 
-        final_acc = accuracy_score(all_labels_np, final_preds)
-        # 将验证集最终报告和输出的 F1 指标也修改为 F0.5，保持前后一致
-        final_f1 = fbeta_score(all_labels_np, final_preds, beta=0.5, average='macro')
+        # 计算多标签下的其他宏平均指标
+        final_acc = accuracy_score(all_labels_np, final_preds) # Exact match accuracy
+        final_f1 = fbeta_score(all_labels_np, final_preds, beta=0.5, average='macro', zero_division=0)
         precision = precision_score(all_labels_np, final_preds, average='macro', zero_division=0)
         recall = recall_score(all_labels_np, final_preds, average='macro', zero_division=0)
         
-        report_str = classification_report(all_labels_np, final_preds, digits=4)
+        report_str = classification_report(all_labels_np, final_preds, digits=4, zero_division=0)
         
         avg_loss = total_loss / count
 
@@ -555,144 +586,12 @@ def main():
         val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
         test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False)
         shuffle_train = False
-        
-        # 即使在 DDP 模式下，我们也应该计算一下类别权重，传给 FocalLoss
-        try:
-            if is_main_process():
-                print("Calculating class weights for FocalLoss alpha in DDP mode...")
-                
-                if isinstance(train_ds, Subset):
-                    indices = train_ds.indices
-                    base_ds = train_ds.dataset
-                else:
-                    indices = list(range(len(train_ds)))
-                    base_ds = train_ds
-                
-                from concurrent.futures import ThreadPoolExecutor
-                import pickle
-                def load_label(idx):
-                    try:
-                        filename = base_ds.file_list[idx]
-                        file_path = os.path.join(base_ds.data_root, filename)
-                        with open(file_path, 'rb') as f:
-                            content = pickle.load(f)
-                        label = 0
-                        if isinstance(content, dict) and 'label' in content:
-                            target_label = content['label']
-                            if isinstance(target_label, list):
-                                if base_ds.task_index < len(target_label):
-                                    label_item = target_label[base_ds.task_index]
-                                    label = int(label_item['class']) if isinstance(label_item, dict) else int(label_item)
-                            else:
-                                label = int(target_label)
-                        label = max(0, min(label, data_cfg['num_classes'] - 1))
-                        return label
-                    except:
-                        return 0
-                
-                if len(indices) < 100000:
-                    with ThreadPoolExecutor(max_workers=16) as executor:
-                        labels = list(tqdm(executor.map(load_label, indices), total=len(indices), desc="Loading labels for Alpha"))
-                    labels = np.array(labels)
-                    class_counts = np.bincount(labels, minlength=data_cfg['num_classes'])
-                    class_counts = np.maximum(class_counts, 1)
-                    # 频率的倒数作为权重，然后归一化使得均值为 1
-                    weights = 1.0 / class_counts
-                    weights = weights / np.sum(weights) * len(class_counts)
-                    print(f"Calculated FocalLoss Alpha: {weights}")
-                    
-                    # 将权重写入配置中，后续 FocalLoss 初始化会用到
-                    train_cfg['focal_alpha'] = weights.tolist()
-        except Exception as e:
-            if is_main_process():
-                print(f"Failed to calculate DDP alpha: {e}")
     else:
-        # 单卡模式：使用 WeightedRandomSampler
+        # 单卡模式
         train_sampler = None
         val_sampler = None
         test_sampler = None
         shuffle_train = True
-        
-        # 尝试提取标签以计算权重
-        try:
-            if is_main_process():
-                print("Single-GPU detected. Analyzing class distribution for WeightedRandomSampler...")
-            
-            # 1. 获取所有索引
-            if isinstance(train_ds, Subset):
-                indices = train_ds.indices
-                base_ds = train_ds.dataset
-            else:
-                indices = list(range(len(train_ds)))
-                base_ds = train_ds
-            
-            # 2. 快速读取标签 (使用简单的多线程)
-            # 定义一个读取函数
-            from concurrent.futures import ThreadPoolExecutor
-            import pickle
-            
-            def load_label(idx):
-                try:
-                    # 直接访问 base_ds 的逻辑，避免 dataset.__getitem__ 的额外开销 (如 CWT, Norm)
-                    filename = base_ds.file_list[idx]
-                    file_path = os.path.join(base_ds.data_root, filename)
-                    with open(file_path, 'rb') as f:
-                        content = pickle.load(f)
-                    
-                    label = 0
-                    if isinstance(content, dict) and 'label' in content:
-                        target_label = content['label']
-                        if isinstance(target_label, list):
-                            if base_ds.task_index < len(target_label):
-                                label_item = target_label[base_ds.task_index]
-                                label = int(label_item['class']) if isinstance(label_item, dict) else int(label_item)
-                        else:
-                            label = int(target_label)
-                    label = max(0, min(label, data_cfg['num_classes'] - 1))
-                    return label
-                except:
-                    return 0 # Default fallback
-
-            # 3. 并行加载
-            # 限制样本数以免卡太久，或者全量加载
-            if len(indices) < 100000: # 限制一下规模
-                with ThreadPoolExecutor(max_workers=16) as executor:
-                    labels = list(tqdm(executor.map(load_label, indices), total=len(indices), desc="Loading labels"))
-                
-                # 4. 计算权重
-                labels = np.array(labels)
-                class_counts = np.bincount(labels, minlength=data_cfg['num_classes'])
-                
-                # 避免除以零
-                class_counts = np.maximum(class_counts, 1)
-                class_weights = 1.0 / class_counts
-                
-                # 每个样本的权重
-                sample_weights = class_weights[labels]
-                
-                if is_main_process():
-                    print(f"Class counts: {class_counts}")
-                    print(f"Class weights: {class_weights}")
-                
-                # 5. 创建 Sampler
-                train_sampler = WeightedRandomSampler(
-                    weights=torch.from_numpy(sample_weights).double(),
-                    num_samples=len(sample_weights),
-                    replacement=True
-                )
-                shuffle_train = False # Sampler implies shuffle
-                if is_main_process():
-                    print("WeightedRandomSampler initialized successfully.")
-            else:
-                if is_main_process():
-                    print("Dataset too large for quick label scanning. Skipping WeightedRandomSampler.")
-                    
-        except Exception as e:
-            if is_main_process():
-                print(f"Failed to init WeightedRandomSampler: {e}")
-                print("Falling back to standard shuffling.")
-            train_sampler = None
-            shuffle_train = True
 
     # DataLoader: 必须使用 variable_channel_collate_fn_cls
     pin_memory = data_cfg.get('pin_memory', True)
@@ -797,25 +696,86 @@ def main():
     else:
         scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg['min_lr'])
     
-    use_focal_loss = train_cfg.get('use_focal_loss', False)
-    label_smoothing = train_cfg.get('label_smoothing', 0.1)
-    if use_focal_loss:
-        criterion = FocalLoss(
-            gamma=train_cfg.get('focal_gamma', 2.0),
-            alpha=train_cfg.get('focal_alpha', None),
-            reduction=train_cfg.get('focal_reduction', 'mean'),
-            label_smoothing=label_smoothing
-        )
+    if train_cfg.get('pos_weight') == 'auto':
         if is_main_process():
-            print(
-                f"Loss: FocalLoss(gamma={train_cfg.get('focal_gamma', 2.0)}, "
-                f"alpha={train_cfg.get('focal_alpha', None)}, "
-                f"label_smoothing={label_smoothing})"
-            )
+            print("Calculating pos_weight for multi-label BCE automatically...")
+            if isinstance(train_ds, Subset):
+                indices = train_ds.indices
+                base_ds = train_ds.dataset
+            else:
+                indices = list(range(len(train_ds)))
+                base_ds = train_ds
+            
+            from concurrent.futures import ThreadPoolExecutor
+            import pickle
+            
+            LABEL_NAMES = [
+                '高血压', '高血糖', '高血脂', 
+                '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', 
+                '颈动脉斑块'
+            ]
+            
+            def load_label_vector(idx):
+                try:
+                    filename = base_ds.file_list[idx]
+                    file_path = os.path.join(base_ds.data_root, filename)
+                    with open(file_path, 'rb') as f:
+                        content = pickle.load(f)
+                    if isinstance(content, dict) and 'label' in content:
+                        target_label = content['label']
+                        if isinstance(target_label, dict):
+                            return np.array([float(target_label.get(name, 0)) for name in LABEL_NAMES])
+                    return np.zeros(len(LABEL_NAMES))
+                except:
+                    return np.zeros(len(LABEL_NAMES))
+                    
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                labels_list = list(tqdm(executor.map(load_label_vector, indices), total=len(indices), desc="Loading labels for pos_weight"))
+            
+            labels_np = np.array(labels_list)
+            pos_counts = labels_np.sum(axis=0)
+            neg_counts = len(labels_np) - pos_counts
+            
+            pos_counts = np.maximum(pos_counts, 1)
+            # 使用开根号平滑策略 (Square Root Smoothing) 避免权重过于极端
+            calculated_weights = np.sqrt(neg_counts / pos_counts)
+            # 限制最大权重避免极端不平衡导致的梯度爆炸
+            calculated_weights = np.clip(calculated_weights, 1.0, 50.0) 
+            
+            weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32, device=device)
+        else:
+            weights_tensor = torch.zeros(data_cfg['num_classes'], dtype=torch.float32, device=device)
+            
+        if dist.is_initialized():
+            dist.broadcast(weights_tensor, src=0)
+            
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss(pos_weight=weights_tensor)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  auto pos_weight: {weights_tensor.tolist()}")
+        else:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  auto pos_weight: {weights_tensor.tolist()}")
+    elif train_cfg.get('pos_weight') is not None:
+        weights = torch.tensor(train_cfg['pos_weight'], dtype=torch.float32).to(device)
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss(pos_weight=weights)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  config pos_weight: {weights.tolist()}")
+        else:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=weights)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  config pos_weight: {weights.tolist()}")
     else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        if is_main_process():
-            print(f"Loss: CrossEntropyLoss(label_smoothing={label_smoothing})")
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss()
+            if is_main_process():
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  pos_weight: None")
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+            if is_main_process():
+                print("Loss Details:\n  Type: BCEWithLogitsLoss\n  pos_weight: None")
 
     best_metric = float("-inf")
     best_threshold = 0.5
