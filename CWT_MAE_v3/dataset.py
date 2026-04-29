@@ -174,14 +174,18 @@ class PhysioSignalDataset(Dataset):
                 # [Modified] 直接读取 data，不再使用 row 索引
                 # User specified: data key is a 5-channel numpy array
                 raw_signal = content['data']
-                
+
                 # [FILTER] Remove ACC channels (Indices 1, 2, 3)
                 # Original channels: 0:ECG, 1:ACC_X, 2:ACC_Y, 3:ACC_Z, 4:PPG (Assumption based on 5 channels)
                 # Requirement: Keep only ECG (0) and PPG (4).
                 if raw_signal.ndim == 2 and raw_signal.shape[0] > 4:
                      # Keep index 0 and 4
                      keep_indices = [0, 4]
-                     raw_signal = raw_signal[keep_indices, :]
+                     raw_signal = raw_signal[keep_indices, :]  # (2, L)
+
+                # 【新增】随机选择单通道 (0=ECG, 1=PPG)
+                channel_idx = random.choice([0, 1])
+                raw_signal = raw_signal[channel_idx:channel_idx+1, :]  # (1, L)
                 
                 if raw_signal.ndim == 1:
                     raw_signal = raw_signal[np.newaxis, :]
@@ -190,10 +194,9 @@ class PhysioSignalDataset(Dataset):
                     raw_signal = raw_signal.astype(np.float32)
                 
                 # Update expected channels for check
-                current_expected_channels = self.expected_channels
-                if self.expected_channels == 5:
-                     current_expected_channels = 2
-                
+                # 【修改】单通道模式下，期望通道数为 1
+                current_expected_channels = 1
+
                 # 1. 基础检查
                 # 注意：raw_signal 可能是只读的（来自缓存），如果后续有原地修改操作需要 copy
                 # 目前的代码逻辑主要是读取和计算，或者 create new tensor，是安全的。
@@ -247,9 +250,10 @@ class PhysioSignalDataset(Dataset):
                      continue
 
                 # 转为 Tensor
-                signal_tensor = torch.from_numpy(processed_signal) 
-                
-                return signal_tensor, torch.tensor(label, dtype=torch.long)
+                signal_tensor = torch.from_numpy(processed_signal)
+
+                # 【修改】返回 channel_id (0=ECG, 1=PPG)
+                return signal_tensor, torch.tensor(channel_idx, dtype=torch.long), torch.tensor(label, dtype=torch.long)
 
             except Exception as e:
                 print(f"Error loading sample {idx}: {e}")
@@ -268,14 +272,16 @@ class PhysioSignalDataset(Dataset):
                  # Keep index 0 and 4
                  keep_indices = [0, 4]
                  safe_signal = safe_signal[keep_indices, :]
-            safe_signal = safe_signal[:, :self.signal_len]
+            # 【修改】随机选择单通道
+            safe_channel = random.choice([0, 1])
+            safe_signal = safe_signal[safe_channel:safe_channel+1, :self.signal_len]
             # 简单的归一化
             safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
-            return torch.from_numpy(safe_signal).float(), torch.tensor(0, dtype=torch.long)
+            return torch.from_numpy(safe_signal).float(), torch.tensor(safe_channel, dtype=torch.long), torch.tensor(0, dtype=torch.long)
         except:
             # 极度兜底：返回全一信号而非全零
-            fallback_signal = torch.ones((2, self.signal_len), dtype=torch.float32) * 0.01
-            return fallback_signal, torch.tensor(0, dtype=torch.long)
+            fallback_signal = torch.ones((1, self.signal_len), dtype=torch.float32) * 0.01
+            return fallback_signal, torch.tensor(0, dtype=torch.long), torch.tensor(0, dtype=torch.long)
 
     def _process_signal(self, signal, fixed_start=None):
         """
@@ -310,13 +316,15 @@ class PhysioSignalDataset(Dataset):
 
 def fixed_channel_collate_fn(batch):
     """
-    针对 5 通道对齐数据的 Collate Function。
-    Output: (B, 5, L), (B,)
+    单通道数据的 Collate Function。
+    Output: (B, 1, L), (B,) channel_ids, (B,) labels
     """
     signals = [item[0] for item in batch]
-    labels = [item[1] for item in batch]
-    
-    padded_signals = torch.stack(signals) # (B, 5, L)
-    labels = torch.stack(labels)
-    
-    return padded_signals, labels
+    channel_ids = [item[1] for item in batch]
+    labels = [item[2] for item in batch]
+
+    padded_signals = torch.stack(signals)  # (B, 1, L)
+    channel_ids = torch.stack(channel_ids)  # (B,)
+    labels = torch.stack(labels)  # (B,)
+
+    return padded_signals, channel_ids, labels
