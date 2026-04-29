@@ -72,6 +72,11 @@ model:
   use_diff: True
   diff_loss_weight: [1.0, 0.5, 0.1]
 
+  # --- Input Strategy ---
+  # 单通道策略：每个样本随机选择 ECG 或 PPG，模型通过共享权重学习通用生理信号表征
+  # 通道类型通过 channel_type_embed 标识
+  max_modalities: 1  # 单通道模式
+
   # --- Loss Weighting ---
-  time_loss_weight: 1.0     # [建议] 稍微提高时域权重，因为加入了残差连接，时域重建更重要了
+  time_loss_weight: 1.0     # 时域重建损失权重
   
