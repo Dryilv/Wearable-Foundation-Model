@@ -184,6 +184,12 @@ class PhysioSignalDataset(Dataset):
                      raw_signal = raw_signal[keep_indices, :]  # (2, L)
 
                 # 【新增】随机选择单通道 (0=ECG, 1=PPG)
+                # 边界检查：确保至少有 2 通道
+                if raw_signal.shape[0] < 2:
+                    print(f"Warning: Sample {original_idx} has {raw_signal.shape[0]} channels, expected >= 2, skipping...")
+                    idx = random.randint(0, len(self.samples) - 1)
+                    continue
+                    
                 channel_idx = random.choice([0, 1])
                 raw_signal = raw_signal[channel_idx:channel_idx+1, :]  # (1, L)
                 
@@ -275,8 +281,8 @@ class PhysioSignalDataset(Dataset):
             else:
                  # 如果通道数不足 5，默认使用第一个通道
                  safe_signal = safe_signal[0:1, :]
-            # 【修改】随机选择单通道
-            safe_channel = 0  # fallback 时固定使用通道 0，避免越界
+            # fallback 时固定使用通道 0，避免越界
+            safe_channel = 0
             safe_signal = safe_signal[safe_channel:safe_channel+1, :self.signal_len]
             # 简单的归一化
             safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
