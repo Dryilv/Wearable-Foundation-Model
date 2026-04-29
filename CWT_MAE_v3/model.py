@@ -233,15 +233,17 @@ class TrueFactorizedBlock(nn.Module):
         x_time = x_time + self.time_attn(self.norm_time(x_time), cos_t, sin_t)
         
         # --- 2. Cross-Channel Attention ---
+        # 【修改】单通道模式下跳过跨通道注意力
         if M > 1:
             x_c = x_time.reshape(B, M, N, D)
-            x_smooth = x_c.reshape(B * M, N, D).transpose(1, 2) 
+            x_smooth = x_c.reshape(B * M, N, D).transpose(1, 2)
             x_smooth = self.temporal_smooth(x_smooth).transpose(1, 2).contiguous().reshape(B, M, N, D)
             x_channel = x_smooth.transpose(1, 2).contiguous().reshape(B * N, M, D)
             attn_out = self.channel_attn(self.norm_channel(x_channel))
             x_c = x_c + attn_out.reshape(B, N, M, D).transpose(1, 2)
             x = x_c.reshape(B, MN, D)
         else:
+            # M=1，直接返回时间注意力输出
             x = x_time.reshape(B, MN, D)
             
         # --- 3. MLP ---
