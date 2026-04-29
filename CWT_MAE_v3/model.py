@@ -196,41 +196,7 @@ class RoPEAttention(nn.Module):
         return x
 
 # ===================================================================
-# 3. 【新增】Attention Residuals 核心组件
-# ===================================================================
-class AttentionResidual(nn.Module):
-    """
-    Kimi 团队提出的 Attention Residuals 模块
-    用于替换传统的固定残差累加，解决深层特征稀释问题
-    """
-    def __init__(self, dim):
-        super().__init__()
-        # 每一层持有一个独立的可学习 Query 向量，必须初始化为 0
-        self.query = nn.Parameter(torch.zeros(dim))
-        # 使用 PyTorch 2.5.1 原生的高效 RMSNorm
-        self.norm = nn.RMSNorm(dim)
-        
-    def forward(self, history_states):
-        """
-        history_states: list of tensors, 每个 tensor 形状为 (B, N, D)
-        """
-        # 将历史状态堆叠: (L, B, N, D)
-        V = torch.stack(history_states)
-        K = self.norm(V)
-        
-        # 计算 Attention Logits: query 和 K 点乘
-        # query: (D,), K: (L, B, N, D) -> logits: (L, B, N)
-        logits = torch.einsum('d, lbnd -> lbn', self.query.to(K.dtype), K)
-        
-        # 在深度维度 (L) 上做 Softmax
-        attn_weights = F.softmax(logits, dim=0)
-
-        # 加权求和得到当前层的输入: (B, N, D)
-        out = torch.einsum('lbn, lbnd -> bnd', attn_weights.to(V.dtype), V)
-        return out
-
-# ===================================================================
-# 4. 时空因子化 Block
+# 3. 时空因子化 Block
 # ===================================================================
 class TrueFactorizedBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
@@ -353,14 +319,12 @@ class CWT_MAE_RoPE(nn.Module):
         
         self.raw_signal_scale = nn.Parameter(torch.ones(1, 1, 1, embed_dim) * 0.1)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
-        
+
+        # 【新增】通道类型 Embedding (0=ECG, 1=PPG)
+        self.channel_type_embed = nn.Embedding(2, embed_dim)
+
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
         self.rope_decoder = RotaryEmbedding(dim=decoder_embed_dim // decoder_num_heads)
-
-        # 【新增】为 Encoder 的每一层注册 Attention Residual 模块
-        self.attn_res_layers = nn.ModuleList([
-            AttentionResidual(embed_dim) for _ in range(depth)
-        ])
 
         self.blocks = nn.ModuleList([
             TrueFactorizedBlock(embed_dim, num_heads, norm_layer=norm_layer) 
@@ -394,6 +358,8 @@ class CWT_MAE_RoPE(nn.Module):
         torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.decoder_pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.mask_token, std=.02)
+        # 【新增】初始化通道类型 Embedding
+        torch.nn.init.trunc_normal_(self.channel_type_embed.weight, std=.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -442,8 +408,12 @@ class CWT_MAE_RoPE(nn.Module):
     def mixed_masking(self, x, mask_ratio, M, N_patches):
         return self.tubelet_masking(x, mask_ratio, M, N_patches) + (M,)
 
-    def forward_encoder(self, x_raw, imgs, mask_ratio=None):
-        B, M, C, H, W = imgs.shape
+    def forward_encoder(self, x_raw, imgs, channel_ids, mask_ratio=None):
+        """
+        新增参数:
+            channel_ids: (B,) tensor, 0=ECG, 1=PPG
+        """
+        B, M, C, H, W = imgs.shape  # M=1 (单通道)
         
         x_cwt = imgs.reshape(B * M, C, H, W)
         x_cwt = self.patch_embed(x_cwt) 
@@ -471,7 +441,14 @@ class CWT_MAE_RoPE(nn.Module):
             raw_scale = self.raw_signal_scale
             
         x_fused = x_cwt_2d + x_raw_2d * raw_scale
-        x = x_fused.reshape(B, M, -1, D) 
+        
+        # 【新增】注入通道类型标识
+        # ch_embed: (B, D) → (B, 1, 1, D) → 广播到所有 Patch
+        ch_embed = self.channel_type_embed(channel_ids)  # (B, D)
+        ch_embed = ch_embed.unsqueeze(1).unsqueeze(1)    # (B, 1, 1, D)
+        x_fused = x_fused + ch_embed                     # (B, M, N, D)
+        
+        x = x_fused.reshape(B, M, -1, D)
         N_patches = x.shape[2]
 
         if self.pos_embed.device != x.device:
@@ -501,29 +478,12 @@ class CWT_MAE_RoPE(nn.Module):
             pos_ids_flat = pos_ids_flat.to(x_masked.device)
             
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids_flat)
-        
-        # ===================================================================
-        # 【核心修改】引入 Attention Residuals 替换标准残差累加
-        # ===================================================================
-        len_keep = ids_keep.shape[-1]
-        
-        # 初始化历史状态列表，第一项是 Embedding 层的输出 (v_0)
-        history_states = [x_masked] 
-        
+
+        # 标准的前向传播，使用残差连接
         for i, blk in enumerate(self.blocks):
-            # 1. 使用 AttnRes 聚合历史信息，作为当前层的输入
-            # 第 0 层时 history_states 只有 1 个元素，等价于直接输入
-            current_input = self.attn_res_layers[i](history_states)
-            
-            # 2. 通过 TrueFactorizedBlock
-            layer_out = blk(current_input, M_enc, len_keep, rope_cos=rope_cos, rope_sin=rope_sin)
-            
-            # 3. 将当前层的输出加入历史记录
-            history_states.append(layer_out)
-            
-        # 最后一层的输出作为最终特征
-        x_masked = self.norm(history_states[-1])
-        # ===================================================================
+            x_masked = blk(x_masked, M_enc, len_keep, rope_cos=rope_cos, rope_sin=rope_sin)
+
+        x_masked = self.norm(x_masked)
         
         return x_masked, mask, global_ids_restore, M
 
@@ -619,9 +579,13 @@ class CWT_MAE_RoPE(nn.Module):
         imgs = torch.clamp(imgs, min=-100.0, max=100.0)
         return imgs.to(dtype=next(self.parameters()).dtype)
 
-    def forward(self, x, mask_ratio=None):
+    def forward(self, x, channel_ids, mask_ratio=None):
+        """
+        新增参数:
+            channel_ids: (B,) tensor
+        """
         imgs = self.prepare_tokens(x)
-        latent, mask, ids, M = self.forward_encoder(x, imgs, mask_ratio=mask_ratio)
+        latent, mask, ids, M = self.forward_encoder(x, imgs, channel_ids, mask_ratio=mask_ratio)
         decoder_features = self.forward_decoder(latent, ids, M)
         
         pred_spec = self.decoder_pred_spec(decoder_features)
