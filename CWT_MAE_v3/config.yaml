@@ -24,6 +24,7 @@ train:
   weight_decay: 0.05        
   clip_grad: 3.0            
   use_amp: True             
+  use_compile: False        # TITAN V 不完全支持 bfloat16 的本地编译，建议关闭
 
   log_interval: 50          
   save_freq: 1             # 改为每轮保存
@@ -71,29 +72,11 @@ model:
   use_diff: True
   diff_loss_weight: [1.0, 0.5, 0.1]
 
-  # --- Loss Weighting ---
-  time_loss_weight: 1.0     # [建议] 稍微提高时域权重，因为加入了残差连接，时域重建更重要了
-  
-  # --- Contrastive Learning ---
-  proj_dim: 256             
-  temperature: 0.07         
-  contrastive_weight: 1.0
+  # --- Input Strategy ---
+  # 单通道策略：每个样本随机选择 ECG 或 PPG，模型通过共享权重学习通用生理信号表征
+  # 通道类型通过 channel_type_embed 标识
+  max_modalities: 1  # 单通道模式
 
-# ------------------------------------------------------------------------------
-# 4. 3-Stage Training Strategy
-# ------------------------------------------------------------------------------
-stage:
-  stage1_epochs: 4         # Stage 1: Feature Construction (Epoch 0-10)
-  stage2_epochs: 10         # Stage 2: Alignment Transition (Epoch 10-20)
+  # --- Loss Weighting ---
+  time_loss_weight: 1.0     # 时域重建损失权重
   
-  # Stage 1 Weights
-  stage1_alpha: 0.0         # Contrastive Loss Weight
-  stage1_mae: 1.0           # MAE Loss Weight
-  
-  # Stage 2 Weights (Target Alpha, Linear Warmup)
-  stage2_target_alpha: 1.0  # Final Alpha for Stage 2 & 3
-  stage2_mae: 1.0           # MAE Loss Weight
-  
-  # Stage 3 Weights (Semantic Refinement)
-  stage3_alpha: 1.0         # Contrastive Loss Weight
-  stage3_mae: 0.1           # MAE Loss Weight
