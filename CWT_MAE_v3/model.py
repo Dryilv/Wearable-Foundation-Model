@@ -401,12 +401,12 @@ class CWT_MAE_RoPE(nn.Module):
         global_ids_restore =[]
         for m in range(M):
             global_ids_restore.append(ids_restore + m * N_patches)
-        global_ids_restore = torch.cat(global_ids_restore, dim=1) 
-        
-        return x_masked, mask, global_ids_restore, ids_keep
+        global_ids_restore = torch.cat(global_ids_restore, dim=1)
+
+        return x_masked, mask, global_ids_restore, ids_keep, len_keep
 
     def mixed_masking(self, x, mask_ratio, M, N_patches):
-        return self.tubelet_masking(x, mask_ratio, M, N_patches) + (M,)
+        return self.tubelet_masking(x, mask_ratio, M, N_patches)
 
     def forward_encoder(self, x_raw, imgs, channel_ids, mask_ratio=None):
         """
@@ -414,6 +414,9 @@ class CWT_MAE_RoPE(nn.Module):
             channel_ids: (B,) tensor, 0=ECG, 1=PPG
         """
         B, M, C, H, W = imgs.shape  # M=1 (单通道)
+        
+        # 校验 channel_ids 边界
+        assert (channel_ids >= 0).all() and (channel_ids <= 1).all(), "channel_ids must be 0 or 1"
         
         x_cwt = imgs.reshape(B * M, C, H, W)
         x_cwt = self.patch_embed(x_cwt) 
@@ -465,18 +468,20 @@ class CWT_MAE_RoPE(nn.Module):
             global_ids_restore = torch.arange(M * N_patches, device=x.device).unsqueeze(0).expand(B, -1)
             ids_keep = torch.arange(N_patches, device=x.device).unsqueeze(0).expand(B, -1)
             M_enc = M
+            len_keep = N_patches  # 无 masking 时保留所有 patches
         else:
-            x_masked, mask, global_ids_restore, ids_keep, M_enc = self.mixed_masking(x, current_mask_ratio, M, N_patches)
+            x_masked, mask, global_ids_restore, ids_keep, len_keep = self.mixed_masking(x, current_mask_ratio, M, N_patches)
+            M_enc = M
 
         is_async = (ids_keep.dim() == 3)
         if is_async:
-            pos_ids_flat = (ids_keep % W_grid).reshape(B * M_enc, -1) 
+            pos_ids_flat = (ids_keep % W_grid).reshape(B * M_enc, -1)
         else:
-            pos_ids_flat = (ids_keep % W_grid) 
-            
+            pos_ids_flat = (ids_keep % W_grid)
+
         if pos_ids_flat.device != x_masked.device:
             pos_ids_flat = pos_ids_flat.to(x_masked.device)
-            
+
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids_flat)
 
         # 标准的前向传播，使用残差连接
