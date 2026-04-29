@@ -221,7 +221,7 @@ class TF_MAE_Classifier(nn.Module):
         
         state_dict[key] = patch_tokens
 
-    def forward(self, x, label=None, return_features=False, channel_mask=None):
+    def forward(self, x, label=None, return_features=False, channel_mask=None, channel_ids=None):
         if x.dim() == 2: x = x.unsqueeze(1)
 
         imgs = self.encoder_model.prepare_tokens(x)
@@ -233,7 +233,11 @@ class TF_MAE_Classifier(nn.Module):
                 imgs = imgs.to(x.device)
 
         self.encoder_model.mask_ratio = 0.0
-        latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs)
+        # 【修改】传递 channel_ids 给 forward_encoder
+        # 如果是多通道模式且未提供 channel_ids，默认使用 0
+        if channel_ids is None:
+            channel_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs, channel_ids)
         
         patch_tokens = latent 
         token_padding_mask = None

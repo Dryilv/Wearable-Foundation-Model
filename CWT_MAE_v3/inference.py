@@ -414,8 +414,8 @@ def main():
 
                 amp_ctx = autocast(device_type="cuda", dtype=amp_dtype) if use_amp else contextlib.nullcontext()
                 with amp_ctx:
-                    # 推理时也要传入 channel_mask
-                    logits = model(x, channel_mask=channel_mask)
+                    # 推理时也要传入 channel_mask 和 channel_ids
+                    logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
                 probs = F.softmax(logits.float(), dim=1)
                 all_probs_list.append(probs.cpu().numpy())
                 if batch_pbar is not None:

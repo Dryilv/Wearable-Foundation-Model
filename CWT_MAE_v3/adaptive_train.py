@@ -263,7 +263,7 @@ def main():
             
             amp_ctx = autocast(device_type="cuda", dtype=amp_dtype) if use_amp else contextlib.nullcontext()
             with amp_ctx:
-                logits = model(x, channel_mask=channel_mask)
+                logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
                 loss = entropy_loss(logits)
             
             if use_amp and amp_dtype == torch.float16:

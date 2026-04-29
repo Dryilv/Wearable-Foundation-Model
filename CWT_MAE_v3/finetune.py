@@ -314,10 +314,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             if is_arcface:
                 t = y.argmax(dim=1) if y.dim() > 1 else y
-                logits = model(x, label=t, channel_mask=channel_mask)
+                logits = model(x, label=t, channel_mask=channel_mask, channel_ids=modality_ids)
                 loss = criterion(logits, y)
             else:
-                logits = model(x, channel_mask=channel_mask)
+                logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
                 loss = criterion(logits, y)
         
         if use_amp and amp_dtype == torch.float16:
@@ -374,7 +374,7 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
             x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
             
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                logits = model(x, channel_mask=channel_mask)
+                logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
                 loss = criterion(logits, y)
             
             if dist.is_initialized():
