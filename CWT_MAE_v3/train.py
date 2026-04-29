@@ -544,11 +544,13 @@ def main():
 
     # 获取一个 Batch 用于固定可视化
     vis_batch = None
+    vis_channel_ids = None
     if is_main_process():
         try:
-            # Retrieve the first batch; the dataloader returns (signals, labels)
+            # Retrieve the first batch; the dataloader returns (signals, channel_ids, labels)
             batch = next(iter(train_dataloader)) # Use train loader for vis
             vis_batch = batch[0].to(device)
+            vis_channel_ids = batch[1].to(device)
         except StopIteration:
             pass
 
@@ -641,8 +643,6 @@ def main():
             # 保存可视化
             if vis_batch is not None:
                 # 单通道可视化：需要 channel_ids
-                vis_batch_data, vis_channel_ids, _ = vis_batch
-
                 # 1. 提取 Encoder (CWT_MAE_RoPE)
                 real_model = model.module if hasattr(model, 'module') else model
                 if hasattr(real_model, 'encoder'):
@@ -653,7 +653,7 @@ def main():
                 # 2. 传入单通道数据和 channel_ids 进行可视化
                 save_reconstruction_images(
                     encoder_model,
-                    vis_batch_data,  # (B, 1, L)
+                    vis_batch,  # (B, 1, L)
                     vis_channel_ids,  # (B,)
                     epoch,
                     config['train']['save_dir']
