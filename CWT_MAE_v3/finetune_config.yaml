@@ -1,7 +1,7 @@
 train:
   # ===== 训练轮次与数据划分 =====
   epochs: 30
-  batch_size: 32
+  batch_size: 128
   val_mode: "test"
   test_mode: "test"
 
