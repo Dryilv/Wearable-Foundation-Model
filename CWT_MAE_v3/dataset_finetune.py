@@ -107,10 +107,15 @@ class DownstreamClassificationDataset(Dataset):
                     content = pickle.load(f)
                 except ModuleNotFoundError as e:
                     if 'numpy' in str(e):
-                        # 尝试使用不同的 numpy 编码方式重新加载
-                        import pickletools
+                        # 使用自定义 Unpickler 修复 numpy 模块路径
+                        class NumpyUnpickler(pickle.Unpickler):
+                            def find_class(self, module, name):
+                                # 将旧的 numpy 内部模块映射到当前可用模块
+                                if module.startswith('numpy._core') or module.startswith('numpy.core'):
+                                    module = 'numpy'
+                                return super().find_class(module, name)
                         f.seek(0)
-                        content = pickle.load(f, encoding='latin1')
+                        content = NumpyUnpickler(f).load()
                     else:
                         raise
             
