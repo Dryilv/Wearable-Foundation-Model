@@ -171,19 +171,21 @@ class DownstreamClassificationDataset(Dataset):
             # 模型将接收所有可用通道，并被强制从信号波形本身学习特征，而不是依赖通道顺序。
             
             M = signal_tensor.shape[0]
-            
-            # 由于我们不再告诉模型哪个通道是 ECG/PPG，我们统一赋予相同的 modality_id (例如 0)
-            # 或者赋予它们原始的相对索引，但在训练时打乱
-            modality_ids = torch.zeros(M, dtype=torch.long)
-            
+
+            # 双通道: 通道0=ECG(id=0), 通道1=PPG(id=1)
+            # 单通道: 默认为 ECG(id=0)
+            modality_ids = torch.arange(min(M, 2), dtype=torch.long)
+            if M > 2:
+                # 超过2个通道时，循环分配 0,1,0,1...
+                modality_ids = torch.arange(M, dtype=torch.long) % 2
+
             # 在训练时，随机打乱通道顺序 (Channel Shuffling)
             # 这强制模型必须独立分析每个通道的波形，而不是依赖 "通道0总是ECG" 这种捷径
             if self.mode == 'train':
                 if M > 1:
                     perm_indices = torch.randperm(M)
                     signal_tensor = signal_tensor[perm_indices]
-                    # 如果 modality_ids 不是全0，这里也需要同步打乱
-                    # modality_ids = modality_ids[perm_indices]
+                    modality_ids = modality_ids[perm_indices]
             
             # --- 7. 返回标签 (硬标签 or 软标签) ---
             if self.refined_labels is not None and idx in self.refined_labels:
