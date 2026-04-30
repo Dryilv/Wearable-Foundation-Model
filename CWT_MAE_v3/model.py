@@ -455,12 +455,23 @@ class CWT_MAE_RoPE(nn.Module):
         # 【新增】注入通道类型标识
         # 【修复】支持 M>1 多通道模式：channel_ids 需要扩展到每个通道
         # channel_ids 可以是 (B,) 或 (B, M)
+        # 【修复】确保 channel_ids 的形状与 M 匹配
         if channel_ids.dim() == 1:
             # (B,) → (B, M, 1, D) 广播到所有通道
             ch_embed = self.channel_type_embed(channel_ids)  # (B, D)
             ch_embed = ch_embed.unsqueeze(1).unsqueeze(1)    # (B, 1, 1, D)
             ch_embed = ch_embed.expand(-1, M, -1, -1)        # (B, M, 1, D)
         else:
+            # (B, M_ids) → 需要与 M 对齐
+            M_ids = channel_ids.shape[1]
+            if M_ids != M:
+                # 填充或截断 channel_ids 以匹配 M
+                if M_ids < M:
+                    # 填充到 M
+                    channel_ids = torch.nn.functional.pad(channel_ids, (0, M - M_ids), value=0)
+                else:
+                    # 截断到 M
+                    channel_ids = channel_ids[:, :M]
             # (B, M) → (B, M, 1, D)
             ch_embed = self.channel_type_embed(channel_ids)  # (B, M, D)
             ch_embed = ch_embed.unsqueeze(2)                 # (B, M, 1, D)
