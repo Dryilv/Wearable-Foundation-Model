@@ -22,7 +22,7 @@ train:
   focal_reduction: "mean"
 
   # ===== 训练稳定性与加速 =====
-  use_amp: false
+  use_amp: true
   mixup_alpha: 0.2
   grad_clip_norm: 1.0
   find_unused_parameters: false
@@ -41,12 +41,12 @@ train:
 
 data:
   # ===== 数据路径 =====
-  data_root: ""
-  split_file: ""
+  data_root: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/ppgchd/ppgchd/data_updated"
+  split_file: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/ppgchd/ppgchd/train_test_split.json"
 
   # ===== 数据形态 =====
   signal_len: 1000
-  num_classes: 7
+  num_classes: 2
 
   # ===== DataLoader =====
   num_workers: 4
@@ -63,7 +63,7 @@ data:
 
 model:
   # ===== 预训练权重 =====
-  pretrained_path: null
+  pretrained_path: "./checkpoint/checkpoint_last.pth"
 
   # ===== 编码器结构 =====
   embed_dim: 768
@@ -72,7 +72,7 @@ model:
   cwt_scales: 64
   patch_size_time: 25
   patch_size_freq: 8
-  use_diff: false
+  use_diff: true
 
   # ===== 解码器结构（分类阶段仅用于初始化） =====
   decoder_embed_dim: 512
