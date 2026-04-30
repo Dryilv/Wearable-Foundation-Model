@@ -184,6 +184,8 @@ def move_batch_to_device(batch, device):
         channel_mask = None
     x = x.to(device, non_blocking=True)
     y = y.to(device, non_blocking=True)
+    if modality_ids is not None:
+        modality_ids = modality_ids.to(device, non_blocking=True)
     if channel_mask is not None:
         channel_mask = channel_mask.to(device, non_blocking=True)
     return x, modality_ids, y, channel_mask
