@@ -102,7 +102,17 @@ class DownstreamClassificationDataset(Dataset):
                 raise FileNotFoundError(f"Data file not found: {file_path}")
 
             with open(file_path, 'rb') as f:
-                content = pickle.load(f)
+                # 处理 numpy 版本不兼容问题
+                try:
+                    content = pickle.load(f)
+                except ModuleNotFoundError as e:
+                    if 'numpy' in str(e):
+                        # 尝试使用不同的 numpy 编码方式重新加载
+                        import pickletools
+                        f.seek(0)
+                        content = pickle.load(f, encoding='latin1')
+                    else:
+                        raise
             
             # --- 1. 加载数据 ---
             # 兼容不同结构的 content
