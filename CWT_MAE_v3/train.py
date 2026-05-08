@@ -27,8 +27,8 @@ torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
 from model import CWT_MAE_RoPE
-from dataset import PhysioSignalDataset, DataSplitter, fixed_channel_collate_fn
-from utils_metrics import ExperimentTracker, train_linear_probe, evaluate_features_quality
+from dataset import PhysioSignalDataset, fixed_channel_collate_fn
+from utils_metrics import ExperimentTracker
 from utils import save_reconstruction_images
 
 # 启用 TensorFloat-32 (A100/3090/4090 必备加速)
@@ -141,50 +141,6 @@ def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_s
 # -------------------------------------------------------------------
 # 5. 训练与验证逻辑
 # -------------------------------------------------------------------
-def validate(model, dataloader, device, config):
-    model.eval()
-    metric_logger = defaultdict(lambda: SmoothedValue(window_size=100))
-    header = 'Test:'
-    
-    # 优先使用 bfloat16
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    
-    with torch.no_grad():
-        for batch_data in dataloader:
-            # 【修改】适配新的返回值格式: (batch, channel_ids, labels)
-            batch, channel_ids, labels = batch_data
-
-            batch = batch.to(device, non_blocking=True)
-            channel_ids = channel_ids.to(device, non_blocking=True)
-
-            with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                # 【修改】传递 channel_ids
-                loss, loss_dict, _, _, _, _, _ = model(batch, channel_ids)
-                
-            metric_logger['loss'].update(loss.item())
-            metric_logger['loss_spec'].update(loss_dict.get('loss_spec', torch.tensor(0.0)).item())
-            metric_logger['loss_time'].update(loss_dict.get('loss_time', torch.tensor(0.0)).item())
-            
-    # Gather metrics from all processes
-    # 这里简单起见，只看主进程的，或者依赖 SmoothedValue 的 global_avg (如果它是跨进程同步的？当前实现不是)
-    # 严格来说应该在这里做 all_reduce，但对于验证集 Loss，单进程近似通常足够，除非数据分布极不均匀
-    # 为了准确，我们在 SmoothedValue 外面做一次 reduce
-    
-    val_loss = metric_logger['loss'].global_avg
-    val_loss_spec = metric_logger['loss_spec'].global_avg
-    val_loss_time = metric_logger['loss_time'].global_avg
-    
-    if dist.is_initialized():
-        # Create a tensor with all metrics
-        metrics_tensor = torch.tensor([val_loss, val_loss_spec, val_loss_time], device=device)
-        dist.all_reduce(metrics_tensor)
-        metrics_tensor /= dist.get_world_size()
-        val_loss = metrics_tensor[0].item()
-        val_loss_spec = metrics_tensor[1].item()
-        val_loss_time = metrics_tensor[2].item()
-        
-    return val_loss, val_loss_spec, val_loss_time
-
 def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global, 
                     total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0):
     model.train()
@@ -382,53 +338,18 @@ def main():
     
     logger = setup_logger(config['train']['save_dir'])
 
-    # 1. Dataset Split Strategy
-    if is_main_process():
-        logger.info("Initializing Data Splitter...")
-        splitter = DataSplitter(
-            index_file=config['data']['index_path'],
-            split_ratio=0.1, # 10% 验证集
-            seed=42 # 固定 Seed
-        )
-        train_indices, val_indices = splitter.get_split()
-    else:
-        train_indices, val_indices = None, None
-    
-    # Broadcast indices to other ranks
-    if dist.is_initialized():
-        # 简单起见，这里让每个 rank 都重新计算 split (DataSplitter 是确定性的)
-        # 或者 broadcast，这里选用重新计算方式，只要 seed 一致
-        splitter = DataSplitter(
-            index_file=config['data']['index_path'],
-            split_ratio=0.1,
-            seed=42
-        )
-        # 这里不需要再次保存 metadata，get_split 内部会处理
-        train_indices, val_indices = splitter.get_split()
-
-    # Dataset
+    # 1. Dataset - 使用全部数据作为训练集
     train_dataset = PhysioSignalDataset(
-        index_file=config['data']['index_path'], # 实际上 Dataset 内部会再次加载 full index，优化空间：传入 index_data
-        indices=train_indices,
+        index_file=config['data']['index_path'],
+        indices=None,  # None 表示使用全部数据
         signal_len=config['data']['signal_len'],
         mode='train',
-        data_ratio=config['model'].get('data_ratio', 1.0), # 传入 data_ratio
-        use_sliding_window=config['data'].get('use_sliding_window', False),
-        window_stride=config['data'].get('window_stride', 500)
-    )
-    
-    val_dataset = PhysioSignalDataset(
-        index_file=config['data']['index_path'],
-        indices=val_indices,
-        signal_len=config['data']['signal_len'],
-        mode='test', # Val use test mode (deterministic crop)
-        data_ratio=config['model'].get('data_ratio', 1.0), # 传入 data_ratio (通常 Val 也要采样吗？这里假设是)
+        data_ratio=config['model'].get('data_ratio', 1.0),
         use_sliding_window=config['data'].get('use_sliding_window', False),
         window_stride=config['data'].get('window_stride', 500)
     )
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    # val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     
     # DataLoader (使用自定义 collate_fn)
     train_dataloader = DataLoader(
@@ -440,6 +361,16 @@ def main():
         drop_last=True,
         collate_fn=fixed_channel_collate_fn
     )
+    
+    # 创建可视化专用 DataLoader (batch_size=1, shuffle=True)
+    vis_dataloader = DataLoader(
+        train_dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=1,
+        pin_memory=True,
+        collate_fn=fixed_channel_collate_fn
+    ) if is_main_process() else None
 
     num_steps_per_epoch = len(train_dataloader)
     total_epochs = config['train']['epochs']
@@ -542,18 +473,6 @@ def main():
         if is_main_process():
             logger.info(f"Resumed from epoch {start_epoch}")
 
-    # 获取一个 Batch 用于固定可视化
-    vis_batch = None
-    vis_channel_ids = None
-    if is_main_process():
-        try:
-            # Retrieve the first batch; the dataloader returns (signals, channel_ids, labels)
-            batch = next(iter(train_dataloader)) # Use train loader for vis
-            vis_batch = batch[0].to(device)
-            vis_channel_ids = batch[1].to(device)
-        except StopIteration:
-            pass
-
     start_time_global = time.time()
     
     for epoch in range(start_epoch, total_epochs):
@@ -581,46 +500,6 @@ def main():
             mask_ratio=current_mask_ratio,
             lr_start_step=current_lr_start_step
         )
-        
-        # Validation Removed
-        val_loss, val_loss_spec, val_loss_time = 0.0, 0.0, 0.0
-        
-        # Feature Evaluation
-        linear_acc = -1.0
-        sil_score = -1.0
-        db_score = -1.0
-        
-        # [Optimization] Disable feature evaluation for unlabeled dataset
-        # Since train and test sets have no labels (or dummy labels), 
-        # Linear Probe and Clustering metrics are meaningless and time-consuming.
-        eval_freq = config['train'].get('eval_freq', 20)
-        # if epoch % eval_freq == 0 and epoch > 0:
-        if False: # Disabled
-            if is_main_process():
-                logger.info("Running Feature Evaluation (Linear Probe & Clustering)...")
-                # Linear Probe
-                linear_acc = train_linear_probe(
-                    model, 
-                    train_dataloader, 
-                    val_dataloader, 
-                    device, 
-                    num_classes=2,
-                    limit_batches=config['train'].get('linear_probe_limit', 100)
-                )
-                # Clustering
-                sil_score, db_score = evaluate_features_quality(
-                    model, 
-                    val_dataloader, 
-                    device, 
-                    config['train']['save_dir'], 
-                    epoch
-                )
-                logger.info(f"Feature Eval: Acc={linear_acc:.4f}, Sil={sil_score:.4f}, DB={db_score:.4f}")
-            
-            # Barrier to wait for main process eval? 
-            # 实际上 Linear Probe 比较慢，建议只在 rank 0 上跑，其他 rank 等待
-            # 但 DDP model 在单进程跑可能需要处理，这里 evaluate_features_quality 内部处理了 model.module
-            dist.barrier()
 
         if is_main_process():
             # Log Metrics
@@ -640,24 +519,32 @@ def main():
                 logger.info("Early stopping triggered due to no improvement in feature quality.")
                 # break # 取消注释以启用
 
-            # 保存可视化
-            if vis_batch is not None:
-                # 单通道可视化：需要 channel_ids
-                # 1. 提取 Encoder (CWT_MAE_RoPE)
-                real_model = model.module if hasattr(model, 'module') else model
-                if hasattr(real_model, 'encoder'):
-                    encoder_model = real_model.encoder
-                else:
-                    encoder_model = real_model
+            # 保存可视化 - 随机抽取一个样本
+            if vis_dataloader is not None:
+                try:
+                    # 随机获取一个样本进行可视化
+                    vis_batch_data = next(iter(vis_dataloader))
+                    vis_batch = vis_batch_data[0].to(device)
+                    vis_channel_ids = vis_batch_data[1].to(device)
+                    
+                    # 单通道可视化：需要 channel_ids
+                    # 1. 提取 Encoder (CWT_MAE_RoPE)
+                    real_model = model.module if hasattr(model, 'module') else model
+                    if hasattr(real_model, 'encoder'):
+                        encoder_model = real_model.encoder
+                    else:
+                        encoder_model = real_model
 
-                # 2. 传入单通道数据和 channel_ids 进行可视化
-                save_reconstruction_images(
-                    encoder_model,
-                    vis_batch,  # (B, 1, L)
-                    vis_channel_ids,  # (B,)
-                    epoch,
-                    config['train']['save_dir']
-                )
+                    # 2. 传入单通道数据和 channel_ids 进行可视化
+                    save_reconstruction_images(
+                        encoder_model,
+                        vis_batch,  # (B, 1, L)
+                        vis_channel_ids,  # (B,)
+                        epoch,
+                        config['train']['save_dir']
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to get batch for visualization at epoch {epoch}: {e}")
             
             # 保存 Checkpoint
             save_dict = {
