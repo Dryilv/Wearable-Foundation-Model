@@ -34,7 +34,7 @@ train:
 # 2. Dataset Configuration
 # ------------------------------------------------------------------------------
 data:
-  index_path: "train_index_cleaned.json"
+  index_path: "train_index.json"
   signal_len: 1000          
   num_workers: 16           
   use_sliding_window: True 
