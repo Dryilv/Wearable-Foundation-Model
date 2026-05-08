@@ -375,13 +375,14 @@ class CWT_MAE_RoPE(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def tubelet_masking(self, x, mask_ratio, M, N_patches):
+    def tubelet_masking(self, x, mask_ratio, M, N_patches, noise_w=None):
         B, _, D = x.shape
         H_grid, W_grid = self.grid_size
         len_keep_w = int(W_grid * (1 - mask_ratio))
         len_keep = len_keep_w * H_grid
         
-        noise_w = torch.rand(B, W_grid, device=x.device)
+        if noise_w is None:
+            noise_w = torch.rand(B, W_grid, device=x.device)
         ids_shuffle_w = torch.argsort(noise_w, dim=1)
         ids_restore_w = torch.argsort(ids_shuffle_w, dim=1)
         
@@ -410,10 +411,10 @@ class CWT_MAE_RoPE(nn.Module):
 
         return x_masked, mask, global_ids_restore, ids_keep, len_keep
 
-    def mixed_masking(self, x, mask_ratio, M, N_patches):
-        return self.tubelet_masking(x, mask_ratio, M, N_patches)
+    def mixed_masking(self, x, mask_ratio, M, N_patches, noise_w=None):
+        return self.tubelet_masking(x, mask_ratio, M, N_patches, noise_w)
 
-    def forward_encoder(self, x_raw, imgs, channel_ids, mask_ratio=None):
+    def forward_encoder(self, x_raw, imgs, channel_ids, mask_ratio=None, noise_w=None):
         """
         新增参数:
             channel_ids: (B,) tensor, 0=ECG, 1=PPG
@@ -497,7 +498,7 @@ class CWT_MAE_RoPE(nn.Module):
             M_enc = M
             len_keep = N_patches  # 无 masking 时保留所有 patches
         else:
-            x_masked, mask, global_ids_restore, ids_keep, len_keep = self.mixed_masking(x, current_mask_ratio, M, N_patches)
+            x_masked, mask, global_ids_restore, ids_keep, len_keep = self.mixed_masking(x, current_mask_ratio, M, N_patches, noise_w)
             M_enc = M
 
         is_async = (ids_keep.dim() == 3)
@@ -617,16 +618,54 @@ class CWT_MAE_RoPE(nn.Module):
         新增参数:
             channel_ids: (B,) tensor
         """
-        imgs = self.prepare_tokens(x)
-        latent, mask, ids, M = self.forward_encoder(x, imgs, channel_ids, mask_ratio=mask_ratio)
+        B = x.shape[0]
+        current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
+        
+        # 1. 方案二 (Pre-Masking): 在原始 1D 信号上生成 Mask 并进行破坏
+        if current_mask_ratio > 0.0:
+            H_grid, W_grid = self.grid_size
+            noise_w = torch.rand(B, W_grid, device=x.device)
+            ids_shuffle_w = torch.argsort(noise_w, dim=1)
+            len_keep_w = int(W_grid * (1 - current_mask_ratio))
+            ids_keep_w = ids_shuffle_w[:, :len_keep_w]
+            
+            mask_w_bool = torch.zeros(B, W_grid, device=x.device)
+            mask_w_bool.scatter_(1, ids_keep_w, 1.0) # 1 为保留，0 为丢弃
+            
+            M_dim = x.shape[1] if x.dim() == 3 else 1
+            L_dim = x.shape[-1]
+            
+            mask_raw = mask_w_bool.unsqueeze(1).unsqueeze(-1).repeat(1, M_dim, 1, self.patch_size_time)
+            mask_raw = mask_raw.reshape(B, M_dim, W_grid * self.patch_size_time)
+            if mask_raw.shape[-1] != L_dim:
+                mask_raw = mask_raw[..., :L_dim]
+                
+            if x.dim() == 2:
+                x_masked = x.unsqueeze(1) * mask_raw
+                x_masked = x_masked.squeeze(1)
+            else:
+                x_masked = x * mask_raw
+        else:
+            x_masked = x
+            noise_w = None
+
+        # 2. 对被破坏的信号做 CWT (作为 Encoder 输入)
+        imgs_input = self.prepare_tokens(x_masked)
+        latent, mask, ids, M = self.forward_encoder(x_masked, imgs_input, channel_ids, mask_ratio=mask_ratio, noise_w=noise_w)
+        
+        # 3. Decoder
         decoder_features = self.forward_decoder(latent, ids, M)
-        
         pred_spec = self.decoder_pred_spec(decoder_features)
-        loss_spec = self.forward_loss_spec(imgs, pred_spec, mask)
         
-        B, M_dec, N, D = decoder_features.shape
+        # 4. 对未被破坏的原始信号做 CWT (作为 Loss 目标)
+        with torch.no_grad():
+            imgs_target = self.prepare_tokens(x)
+            
+        loss_spec = self.forward_loss_spec(imgs_target, pred_spec, mask)
+        
+        B_dec, M_dec, N, D = decoder_features.shape
         H_grid, W_grid = self.grid_size
-        feat_2d = decoder_features.reshape(B * M_dec, N, D).transpose(1, 2).reshape(B * M_dec, D, H_grid, W_grid)
+        feat_2d = decoder_features.reshape(B_dec * M_dec, N, D).transpose(1, 2).reshape(B_dec * M_dec, D, H_grid, W_grid)
         
         feat_time_agg = self.time_reducer[0](feat_2d) 
         feat_time_agg = self.time_reducer[1](feat_time_agg) 
@@ -634,12 +673,13 @@ class CWT_MAE_RoPE(nn.Module):
         feat_time_agg = feat_time_agg.squeeze(2).transpose(1, 2)
         feat_time_agg = self.time_reducer[2](feat_time_agg) 
         
-        pred_time = self.time_pred(feat_time_agg).flatten(1).reshape(B, M_dec, -1)
+        pred_time = self.time_pred(feat_time_agg).flatten(1).reshape(B_dec, M_dec, -1)
         
+        # 时间域重构也是预测原始未被破坏的信号 x
         loss_time = self.forward_loss_time(x, pred_time, mask)
         
         loss = loss_spec + self.time_loss_weight * loss_time
         loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
 
-        return loss, loss_dict, pred_spec, pred_time, imgs, mask, latent
+        return loss, loss_dict, pred_spec, pred_time, imgs_target, mask, latent
 
