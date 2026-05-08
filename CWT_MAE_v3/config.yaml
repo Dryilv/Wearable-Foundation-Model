@@ -26,7 +26,6 @@ train:
   use_amp: True             
   use_compile: False        # TITAN V 不完全支持 bfloat16 的本地编译，建议关闭
 
-  log_interval: 50          
   save_freq: 1             # 改为每轮保存
   save_dir: "./checkpoint_vit_base_contrastive_optimistic" 
   resume: "./checkpoint_vit_base_contrastive_optimistic/checkpoint_last.pth"                
@@ -47,7 +46,6 @@ data:
 model:
   # --- Input Processing ---
   cwt_scales: 64            
-  use_conv_stem: True       
   
   # 保持你优秀的 Token 计算逻辑 (800 Tokens)
   patch_size_time: 25       
@@ -58,7 +56,6 @@ model:
   embed_dim: 768            
   depth: 12                 
   num_heads: 12             # 768 / 64 = 12 heads
-  mlp_rank_ratio: 4.0       # [标准] ViT 标准 MLP ratio 是 4.0，0.5 太小了！
 
   # --- Transformer Decoder ---
   decoder_embed_dim: 512    # 配合 Encoder 升级
@@ -71,11 +68,6 @@ model:
   # --- Signal Difference ---
   use_diff: True
   diff_loss_weight: [1.0, 0.5, 0.1]
-
-  # --- Input Strategy ---
-  # 单通道策略：每个样本随机选择 ECG 或 PPG，模型通过共享权重学习通用生理信号表征
-  # 通道类型通过 channel_type_embed 标识
-  max_modalities: 1  # 单通道模式
 
   # --- Loss Weighting ---
   time_loss_weight: 1.0     # 时域重建损失权重
