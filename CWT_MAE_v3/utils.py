@@ -145,10 +145,6 @@ def get_layer_wise_lr(model, base_lr, layer_decay):
         for param in model.head.parameters():
             if param.requires_grad:
                 add_group('head', param, base_lr)
-    if hasattr(model, 'arcface_head'):
-        for param in model.arcface_head.parameters():
-            if param.requires_grad:
-                add_group('head', param, base_lr)
 
     all_params = {p for p in model.parameters() if p.requires_grad}
     ungrouped_params = all_params - handled

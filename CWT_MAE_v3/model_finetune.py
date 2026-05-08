@@ -2,9 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import math
 
-# 确保 model.py (包含 CWT_MAE_RoPE 和 cwt_wrap) 在同一目录下
 from model import CWT_MAE_RoPE, cwt_wrap
 
 def is_main_process():
@@ -62,55 +60,14 @@ class LatentReasoningHead(nn.Module):
         return logits
 
 # ===================================================================
-# 2. ArcFace Head (Deep Metric Learning)
-# ===================================================================
-class ArcFaceHead(nn.Module):
-    def __init__(self, in_features, out_features, s=30.0, m=0.50):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.s = s
-        self.m = m
-        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
-        nn.init.xavier_uniform_(self.weight)
-        
-        self.cos_m = math.cos(m)
-        self.sin_m = math.sin(m)
-        self.th = math.cos(math.pi - m)
-        self.mm = math.sin(math.pi - m) * m
-
-    def forward(self, input, label=None):
-        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
-        
-        if label is None:
-            return cosine * self.s
-        
-        sine = torch.sqrt((1.0 - torch.pow(cosine, 2)).clamp(0, 1))
-        phi = cosine * self.cos_m - sine * self.sin_m
-        
-        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
-        
-        one_hot = torch.zeros(cosine.size(), device=input.device)
-        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
-        
-        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        output *= self.s
-        return output
-
-# ===================================================================
-# 3. 主分类器模型封装
+# 2. 主分类器模型封装
 # ===================================================================
 class TF_MAE_Classifier(nn.Module):
     def __init__(self, pretrained_path, num_classes, 
                  use_cot=True, 
-                 use_arcface=False,
-                 arcface_s=30.0,
-                 arcface_m=0.50,
                  num_reasoning_tokens=16, 
                  **kwargs):
         super().__init__()
-        
-        self.use_arcface = use_arcface
         
         self.encoder_model = CWT_MAE_RoPE(
             mask_ratio=0.0, 
@@ -129,22 +86,15 @@ class TF_MAE_Classifier(nn.Module):
             self.head = LatentReasoningHead(
                 embed_dim=self.embed_dim,
                 num_heads=kwargs.get('num_heads', 12),
-                num_classes=num_classes if not use_arcface else self.embed_dim, 
+                num_classes=num_classes,
                 num_reasoning_tokens=num_reasoning_tokens,
                 dropout=0.2
             )
-            self.feature_dim = num_classes if not use_arcface else self.embed_dim
         else:
-            self.feature_dim = self.embed_dim
             self.head = nn.Sequential(
                 nn.LayerNorm(self.embed_dim),
-                nn.Identity() if use_arcface else nn.Linear(self.embed_dim, num_classes)
+                nn.Linear(self.embed_dim, num_classes)
             )
-
-        if use_arcface:
-            if is_main_process():
-                print(f">>> Initializing ArcFace Head (s={arcface_s}, m={arcface_m})")
-            self.arcface_head = ArcFaceHead(self.feature_dim, num_classes, s=arcface_s, m=arcface_m)
 
 
     def _delete_decoder_components(self):
@@ -221,7 +171,7 @@ class TF_MAE_Classifier(nn.Module):
         
         state_dict[key] = patch_tokens
 
-    def forward(self, x, label=None, return_features=False, channel_mask=None, channel_ids=None):
+    def forward(self, x, channel_mask=None, channel_ids=None):
         if x.dim() == 2: x = x.unsqueeze(1)
 
         imgs = self.encoder_model.prepare_tokens(x)
@@ -233,8 +183,6 @@ class TF_MAE_Classifier(nn.Module):
                 imgs = imgs.to(x.device)
 
         self.encoder_model.mask_ratio = 0.0
-        # 【修改】传递 channel_ids 给 forward_encoder
-        # 如果是多通道模式且未提供 channel_ids，默认使用 0
         if channel_ids is None:
             channel_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs, channel_ids)
@@ -250,19 +198,9 @@ class TF_MAE_Classifier(nn.Module):
                 token_padding_mask = (~channel_mask).unsqueeze(-1).expand(B_mask, M_mask, n_patches).reshape(B_mask, total_tokens)
         
         if isinstance(self.head, LatentReasoningHead):
-            features = self.head(patch_tokens, token_padding_mask=token_padding_mask)
+            logits = self.head(patch_tokens, token_padding_mask=token_padding_mask)
         else:
             global_feat = patch_tokens.mean(dim=1)
-            features = self.head(global_feat)
+            logits = self.head(global_feat)
         
-        if isinstance(return_features, torch.Tensor):
-            return_features = return_features.item()
-            
-        if return_features:
-            return features
-
-        if self.use_arcface:
-            logits = self.arcface_head(features, label)
-            return logits
-        else:
-            return features
+        return logits

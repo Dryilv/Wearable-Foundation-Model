@@ -313,18 +313,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
         x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
-        
-        real_model = unwrap_model(model)
-        is_arcface = hasattr(real_model, 'use_arcface') and real_model.use_arcface
 
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            if is_arcface:
-                t = y.argmax(dim=1) if y.dim() > 1 else y
-                logits = model(x, label=t, channel_mask=channel_mask, channel_ids=modality_ids)
-                loss = criterion(logits, y)
-            else:
-                logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
-                loss = criterion(logits, y)
+            logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
+            loss = criterion(logits, y)
         
         if use_amp and amp_dtype == torch.float16:
             if scaler is None:
@@ -632,7 +624,6 @@ def main():
     model = TF_MAE_Classifier(
         pretrained_path=model_cfg.get('pretrained_path'),
         num_classes=data_cfg['num_classes'],
-        # Encoder 参数
         signal_len=data_cfg['signal_len'],
         cwt_scales=model_cfg.get('cwt_scales', 64),
         patch_size_time=model_cfg.get('patch_size_time', 25),
@@ -641,17 +632,11 @@ def main():
         depth=model_cfg.get('depth', 12),
         num_heads=model_cfg.get('num_heads', 12),
         use_diff=model_cfg.get('use_diff', False),
-        # Decoder 参数 (虽然会被删除，但初始化 Encoder 时需要)
         decoder_embed_dim=model_cfg.get('decoder_embed_dim', 512), 
         decoder_depth=model_cfg.get('decoder_depth', 8),
         decoder_num_heads=model_cfg.get('decoder_num_heads', 16),
-        # CoT 参数
         use_cot=model_cfg.get('use_cot', True),
-        num_reasoning_tokens=model_cfg.get('num_reasoning_tokens', 16),
-        # ArcFace 参数
-        use_arcface=model_cfg.get('use_arcface', False),
-        arcface_s=model_cfg.get('arcface_s', 30.0),
-        arcface_m=model_cfg.get('arcface_m', 0.50)
+        num_reasoning_tokens=model_cfg.get('num_reasoning_tokens', 16)
     )
     model.to(device)
     

@@ -78,7 +78,4 @@ model:
   use_cot: true
   num_reasoning_tokens: 16
 
-  # ===== ArcFace 头 =====
-  use_arcface: false
-  arcface_s: 20.0
-  arcface_m: 0.2
+  
