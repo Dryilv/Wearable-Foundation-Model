@@ -120,6 +120,10 @@ def gather_tensors(tensor, device):
     max_size = max([x.item() for x in all_sizes])
 
     size_diff = max_size - local_size.item()
+    
+    # 确保 tensor 在 GPU 上以支持 NCCL
+    tensor = tensor.to(device)
+    
     if size_diff > 0:
         padding = torch.zeros((size_diff, *tensor.shape[1:]), device=device, dtype=tensor.dtype)
         tensor_padded = torch.cat((tensor, padding))
@@ -339,11 +343,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
         if scheduler is not None:
             scheduler.step()
 
-        if dist.is_initialized():
-            reduced_loss = reduce_tensor(loss.detach())
-            total_loss += reduced_loss.item()
-        else:
-            total_loss += loss.item()
+        # 避免每步进行 all_reduce 导致严重的同步阻塞，仅在本地累加 loss
+        total_loss += loss.item()
             
         count += 1
         
@@ -388,8 +389,8 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
             
             probs = torch.sigmoid(logits.float())
             
-            local_labels.append(y)
-            local_probs.append(probs) 
+            local_labels.append(y.cpu())
+            local_probs.append(probs.cpu()) 
 
     if count == 0 or len(local_labels) == 0:
         if is_main_process():

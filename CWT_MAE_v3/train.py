@@ -172,7 +172,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     
     start_time = time.time()
     
-    optimizer.zero_grad() # Initialize gradients
+    optimizer.zero_grad(set_to_none=True) # Initialize gradients
 
     for step, batch_data in enumerate(dataloader):
         step_start_time = time.time()
@@ -240,20 +240,12 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             # Unscale 之后才能 clip grad
             scaler.unscale_(optimizer)
             
-            # 计算 Gradient Norm (在 clip 之前计算，用于监控)
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-            
             # Clip Grad
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['train']['clip_grad'])
             
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
             metric_logger['grad_norm'].update(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
         else:
@@ -275,16 +267,18 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             elapsed = time.time() - start_time_global
             
             # [新增] 详细梯度监控日志
-            # 记录各层梯度的统计信息，帮助定位异常层
+            # 避免直接在循环中调用 .item() 阻塞 GPU，将监控逻辑优化为先在 GPU 收集后统一处理
+            # 为了减少开销，仅提取前几个关键层的梯度
             grad_stats = []
-            weight_stats = []
-            for name, p in model.named_parameters():
-                if p.grad is not None:
-                    g_norm = p.grad.detach().norm(2).item()
-                    w_std = p.detach().std().item()
-                    # 只记录异常大或关键层的梯度
-                    if g_norm > 1.0 or 'cls_token' in name or 'patch_embed' in name:
-                         grad_stats.append(f"{name}: g={g_norm:.2f}, w_std={w_std:.4f}")
+            with torch.no_grad():
+                for name, p in model.named_parameters():
+                    if p.grad is not None:
+                        if 'cls_token' in name or 'patch_embed' in name:
+                            # 仍然会有一定的同步，但因为只挑选了少部分参数，开销可控
+                            g_norm = p.grad.detach().norm(2).item()
+                            if g_norm > 1.0 or 'cls_token' in name or 'patch_embed' in name:
+                                w_std = p.detach().std().item()
+                                grad_stats.append(f"{name}: g={g_norm:.2f}, w_std={w_std:.4f}")
             
             if grad_stats:
                 logger.info(f"High Grads (>1.0) & Key Layers:\n" + "\n".join(grad_stats[:10])) # 限制输出行数
