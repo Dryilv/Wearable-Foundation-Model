@@ -640,7 +640,7 @@ def main():
     )
     model.to(device)
     
-    find_unused_parameters = train_cfg.get('find_unused_parameters', False)
+    find_unused_parameters = train_cfg.get('find_unused_parameters', True)
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=find_unused_parameters)
 
