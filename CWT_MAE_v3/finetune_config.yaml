@@ -20,7 +20,7 @@ train:
   # ===== 训练稳定性与加速 =====
   use_amp: true
   grad_clip_norm: 1.0
-  find_unused_parameters: false
+  find_unused_parameters: true
   allow_tf32: true
   cudnn_benchmark: true
 
