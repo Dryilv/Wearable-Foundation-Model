@@ -11,7 +11,7 @@ train:
   # [显存优化] 80GB 显卡火力全开
   # 单塔模式下内部 Batch 会翻倍，但 256 依然很轻松。
   # 如果显存不够，降到 128；如果显存还有剩，大胆开到 512。
-  batch_size: 360           
+  batch_size: 64           
   
   accum_iter: 1             
 
@@ -27,8 +27,8 @@ train:
   use_compile: False        # TITAN V 不完全支持 bfloat16 的本地编译，建议关闭
 
   save_freq: 1             # 改为每轮保存
-  save_dir: "./checkpoint_vit_base_contrastive_optimistic" 
-  resume: "./checkpoint_vit_base_contrastive_optimistic/checkpoint_last.pth"                
+  save_dir: "./checkpoint" 
+  resume: ""                
 
 # ------------------------------------------------------------------------------
 # 2. Dataset Configuration
