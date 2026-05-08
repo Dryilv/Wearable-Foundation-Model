@@ -28,7 +28,7 @@ train:
 
   save_freq: 1             # 改为每轮保存
   save_dir: "./checkpoint" 
-  resume: ""                
+  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint/checkpoint_last.pth"                
 
 # ------------------------------------------------------------------------------
 # 2. Dataset Configuration
@@ -67,7 +67,7 @@ model:
 
   # --- Signal Difference ---
   use_diff: True
-  diff_loss_weight: [1.0, 0.5, 0.1]
+  diff_loss_weight: [1.0, 0.6, 0.5]
 
   # --- Loss Weighting ---
   time_loss_weight: 1.0     # 时域重建损失权重
