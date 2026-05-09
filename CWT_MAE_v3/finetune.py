@@ -408,10 +408,32 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
         all_probs_np = all_probs.cpu().numpy()
 
         # Multi-label thresholds
-        best_threshold = fixed_threshold
-        final_preds = (all_probs_np >= best_threshold).astype(int)
+        if search_threshold and num_classes > 2:
+            best_thresholds = []
+            for i in range(num_classes):
+                disease_true = all_labels_np[:, i]
+                disease_prob = all_probs_np[:, i]
+                
+                if len(np.unique(disease_true)) > 1:
+                    best_th_i = 0.5
+                    best_f1_i = 0.0
+                    for th in np.arange(0.1, 0.9, 0.05):
+                        preds_i = (disease_prob >= th).astype(int)
+                        f1_i = fbeta_score(disease_true, preds_i, beta=0.5, zero_division=0)
+                        if f1_i > best_f1_i:
+                            best_f1_i = f1_i
+                            best_th_i = th
+                    best_thresholds.append(best_th_i)
+                else:
+                    best_thresholds.append(0.5)
+            
+            best_threshold = np.array(best_thresholds)
+            final_preds = (all_probs_np >= best_threshold).astype(int)
+        else:
+            best_threshold = fixed_threshold
+            final_preds = (all_probs_np >= best_threshold).astype(int)
 
-        # 循环 9 次，分别计算每种疾病的指标 (Macro AUC)
+        # 循环计算每种疾病的指标 (Macro AUC)
         auc_list = []
         for i in range(num_classes):
             disease_true = all_labels_np[:, i]
@@ -766,7 +788,7 @@ def main():
                 print("Loss Details:\n  Type: BCEWithLogitsLoss\n  pos_weight: None")
 
     best_metric = float("-inf")
-    best_threshold = 0.5
+    best_threshold = np.array([0.5] * data_cfg['num_classes']) if data_cfg['num_classes'] > 2 else 0.5
     best_epoch = -1
     start_epoch = 0
     no_improve_epochs = 0
@@ -789,7 +811,11 @@ def main():
         resume_ckpt = load_checkpoint(resume_path, model, optimizer=optimizer, scheduler=scheduler, scaler=scaler)
         start_epoch = int(resume_ckpt.get('epoch', -1)) + 1
         best_metric = float(resume_ckpt.get('best_metric', best_metric))
-        best_threshold = float(resume_ckpt.get('best_threshold', best_threshold))
+        saved_threshold = resume_ckpt.get('best_threshold', best_threshold)
+        if isinstance(saved_threshold, (list, np.ndarray)):
+            best_threshold = np.array(saved_threshold)
+        else:
+            best_threshold = float(saved_threshold)
         if is_main_process():
             logger.info(f"resume_from={resume_path} start_epoch={start_epoch}")
 
@@ -810,7 +836,7 @@ def main():
             model, val_loader, criterion, device, data_cfg['num_classes'], 
             total_len=val_dataset_len, 
             use_amp=use_amp,
-            search_threshold=(data_cfg['num_classes'] == 2),
+            search_threshold=True,
             fixed_threshold=best_threshold,
             save_dir=train_cfg['save_dir'],
             epoch=epoch+1
@@ -822,6 +848,8 @@ def main():
             print("-" * 60)
             if data_cfg['num_classes'] == 2:
                 print(f"Applied Threshold: {best_th:.2f}")
+            elif data_cfg['num_classes'] > 2 and isinstance(best_th, np.ndarray):
+                print(f"Applied Thresholds: {np.round(best_th, 2).tolist()}")
             print(f"{eval_split_name}准确率 (Accuracy): {val_acc:.4f}")
             print(f"AUC Score: {val_auc:.4f}")
             print("-" * 60)
@@ -892,7 +920,7 @@ def main():
                 scaler=scaler
             )
         if is_main_process():
-            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={best_th:.4f}")
+            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={np.round(best_th, 4).tolist() if isinstance(best_th, np.ndarray) else best_th:.4f}")
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             if is_main_process():
                 print(f"Early stopping triggered at epoch {epoch+1}")
@@ -906,7 +934,7 @@ def main():
 
     if is_main_process():
         threshold_payload = {
-            "threshold": float(best_threshold),
+            "threshold": float(best_threshold) if data_cfg['num_classes'] == 2 else best_threshold.tolist() if isinstance(best_threshold, np.ndarray) else best_threshold,
             "epoch": int(best_epoch),
             "split_used": val_mode
         }
@@ -929,11 +957,16 @@ def main():
     if is_main_process():
         print(f"\nBest Epoch: {best_epoch}")
         if threshold_calibration_only:
-            print(f"Inference Threshold: {best_threshold:.2f} (from split: {val_mode})")
+            if data_cfg['num_classes'] == 2:
+                print(f"Inference Threshold: {best_threshold:.2f} (from split: {val_mode})")
+            elif data_cfg['num_classes'] > 2 and isinstance(best_threshold, np.ndarray):
+                print(f"Inference Thresholds: {np.round(best_threshold, 2).tolist()} (from split: {val_mode})")
         else:
             print(f"Test  Loss: {test_loss:.4f}")
             if data_cfg['num_classes'] == 2:
                 print(f"Test Applied Threshold: {best_threshold:.2f}")
+            elif data_cfg['num_classes'] > 2 and isinstance(best_threshold, np.ndarray):
+                print(f"Test Applied Thresholds: {np.round(best_threshold, 2).tolist()}")
             print(f"最终测试集准确率 (Accuracy): {test_acc:.4f}")
             print(f"AUC Score: {test_auc:.4f}")
             print("-" * 60)

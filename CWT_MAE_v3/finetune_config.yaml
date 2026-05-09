@@ -27,7 +27,7 @@ train:
   # ===== 复现性与恢复训练 =====
   seed: 42
   deterministic: false
-  auto_resume: true
+  auto_resume: false
   resume_path: null
   early_stop_patience: 0
 
