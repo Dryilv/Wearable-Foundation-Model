@@ -920,7 +920,8 @@ def main():
                 scaler=scaler
             )
         if is_main_process():
-            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={np.round(best_th, 4).tolist() if isinstance(best_th, np.ndarray) else best_th:.4f}")
+            th_str = str(np.round(best_th, 4).tolist()) if isinstance(best_th, np.ndarray) else f"{best_th:.4f}"
+            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={th_str}")
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             if is_main_process():
                 print(f"Early stopping triggered at epoch {epoch+1}")
