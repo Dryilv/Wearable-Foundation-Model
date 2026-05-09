@@ -170,7 +170,7 @@ class ExperimentTracker:
         # Init CSV header
         if not os.path.exists(self.metrics_file):
             with open(self.metrics_file, 'w') as f:
-                f.write("epoch,train_loss,val_loss,grad_norm,gpu_mem_mb,throughput,linear_acc,sil_score,db_score\n")
+                f.write("epoch,train_loss,loss_spec,loss_time,grad_norm,gpu_mem_mb,throughput\n")
                 
     def log(self, epoch, metrics_dict):
         # Update internal dict
@@ -179,28 +179,9 @@ class ExperimentTracker:
             
         # Write to CSV
         with open(self.metrics_file, 'a') as f:
-            f.write(f"{epoch},{metrics_dict.get('train_loss', 0):.4f},{metrics_dict.get('val_loss', 0):.4f},"
-                    f"{metrics_dict.get('grad_norm', 0):.4f},{metrics_dict.get('gpu_mem_mb', 0):.1f},"
-                    f"{metrics_dict.get('throughput', 0):.2f},{metrics_dict.get('linear_acc', 0):.4f},"
-                    f"{metrics_dict.get('sil_score', 0):.4f},{metrics_dict.get('db_score', 0):.4f}\n")
+            f.write(f"{epoch},{metrics_dict.get('train_loss', 0):.4f},{metrics_dict.get('loss_spec', 0):.4f},"
+                    f"{metrics_dict.get('loss_time', 0):.4f},{metrics_dict.get('grad_norm', 0):.4f},"
+                    f"{metrics_dict.get('gpu_mem_mb', 0):.1f},{metrics_dict.get('throughput', 0):.2f}\n")
 
     def check_early_stopping(self, patience=3):
-        """
-        检查特征质量指标是否连续 patience 轮无提升
-        这里主要看 Silhouette Score (越大越好)
-        """
-        scores = self.metrics.get('sil_score', [])
-        # 过滤掉 -1 (未计算的轮次)
-        valid_scores = [s for s in scores if s > -1]
-        
-        if len(valid_scores) < patience + 1:
-            return False
-            
-        recent = valid_scores[-patience:]
-        best_prev = max(valid_scores[:-patience])
-        
-        # 如果最近 patience 轮的最大值都没有超过之前的最佳值，且有下降趋势
-        if max(recent) <= best_prev:
-            return True
-            
         return False
