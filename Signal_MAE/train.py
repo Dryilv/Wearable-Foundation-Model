@@ -146,8 +146,6 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
-    metric_logger['loss_spec'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
-    metric_logger['loss_time'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     metric_logger['grad_norm'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
     metric_logger['throughput'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
@@ -226,9 +224,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
-            loss_spec_val = loss_dict.get('loss_spec', torch.tensor(0.0)).item()
-            loss_time_val = loss_dict.get('loss_time', torch.tensor(0.0)).item()
-            
+
             if not math.isfinite(loss_value):
                 print(f"Loss is {loss_value}, stopping training")
                 sys.exit(1)
@@ -258,8 +254,6 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         throughput = batch_size / step_duration # samples/sec per GPU
         
         metric_logger['loss'].update(loss_value)
-        metric_logger['loss_spec'].update(loss_spec_val)
-        metric_logger['loss_time'].update(loss_time_val)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
         metric_logger['throughput'].update(throughput)
 
@@ -286,8 +280,6 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             logger.info(
                 f"{header} Step: [{step}/{num_steps_per_epoch}] "
                 f"Loss: {metric_logger['loss']} "
-                f"Spec: {metric_logger['loss_spec']} "
-                f"Time: {metric_logger['loss_time']} "
                 f"LR: {metric_logger['lr']} "
                 f"Grad: {metric_logger['grad_norm']} "
                 f"Speed: {metric_logger['throughput'].avg:.1f} samples/s "
@@ -296,12 +288,10 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             
     if is_main_process():
         logger.info(f"Epoch {epoch} done. Avg Loss: {metric_logger['loss'].global_avg:.4f}")
-    
+
     # Return metrics dict
     return {
         'loss': metric_logger['loss'].global_avg,
-        'loss_spec': metric_logger['loss_spec'].global_avg,
-        'loss_time': metric_logger['loss_time'].global_avg,
         'grad_norm': metric_logger['grad_norm'].global_avg,
         'throughput': metric_logger['throughput'].global_avg * (dist.get_world_size() if dist.is_initialized() else 1)
     }
@@ -494,8 +484,6 @@ def main():
             # Log Metrics
             metrics_dict = {
                 'train_loss': train_metrics['loss'],
-                'loss_spec': train_metrics['loss_spec'],
-                'loss_time': train_metrics['loss_time'],
                 'grad_norm': train_metrics['grad_norm'],
                 'gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 / 1024,
                 'throughput': train_metrics['throughput'],
