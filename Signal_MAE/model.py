@@ -209,7 +209,7 @@ class Signal_MAE_RoPE(nn.Module):
         """
         对 token 进行随机 masking
         x: (B, N, D)
-        返回: x_masked, mask, ids_restore
+        返回: x_masked, mask, ids_restore, ids_keep
         """
         B, N, D = x.shape
         len_keep = int(N * (1 - mask_ratio))
@@ -231,7 +231,7 @@ class Signal_MAE_RoPE(nn.Module):
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
-        return x_masked, mask, ids_restore
+        return x_masked, mask, ids_restore, ids_keep
 
     def forward_encoder(self, x, channel_ids, mask_ratio=None, noise=None):
         """
@@ -281,10 +281,9 @@ class Signal_MAE_RoPE(nn.Module):
             x_masked = x
             mask = torch.zeros(B, M * N, device=x.device)
             ids_restore = torch.arange(M * N, device=x.device).unsqueeze(0).expand(B, -1)
-            ids_keep = torch.arange(N, device=x.device).unsqueeze(0).expand(B, -1)
+            ids_keep = torch.arange(M * N, device=x.device).unsqueeze(0).expand(B, -1)
         else:
-            x_masked, mask, ids_restore = self.random_masking(x, current_mask_ratio, noise)
-            ids_keep = torch.argsort(ids_restore, dim=1)[:, :int(N * (1 - current_mask_ratio))]
+            x_masked, mask, ids_restore, ids_keep = self.random_masking(x, current_mask_ratio, noise)
 
         # RoPE 位置编码
         pos_ids = ids_keep % self.num_patches
@@ -339,11 +338,12 @@ class Signal_MAE_RoPE(nn.Module):
         x = x.reshape(B, M, N, D_dec)
         return x
 
-    def forward_loss(self, x, pred):
+    def forward_loss(self, x, pred, mask):
         """
         计算重建损失
         x: (B, M, L) 原始信号
         pred: (B, M, N, patch_size*in_chans) 预测的 patch
+        mask: (B, M*N) 0为保留, 1为掩码
         """
         B, M, L = x.shape
         N = self.num_patches
@@ -361,7 +361,13 @@ class Signal_MAE_RoPE(nn.Module):
 
         # MSE 损失
         loss = (pred - x_patches) ** 2
-        loss = loss.mean()
+        loss = loss.mean(dim=-1)  # [B, M, N]
+        
+        # 展开为 [B, M*N]
+        loss = loss.reshape(B, M * N)
+        
+        # 只在 mask == 1 (被掩码的 token) 上计算损失
+        loss = (loss * mask).sum() / mask.sum()
 
         return loss
 
@@ -407,7 +413,7 @@ class Signal_MAE_RoPE(nn.Module):
         pred = self.decoder_pred(decoder_features)
 
         # 5. 计算重建损失 (使用未归一化的原始信号作为目标)
-        loss = self.forward_loss(x, pred)
+        loss = self.forward_loss(x, pred, mask)
 
         loss_dict = {'loss': loss}
 

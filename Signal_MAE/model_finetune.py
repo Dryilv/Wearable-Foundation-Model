@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from model import CWT_MAE_RoPE, cwt_wrap
+from model import Signal_MAE_RoPE
 
 def is_main_process():
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
@@ -69,7 +69,7 @@ class TF_MAE_Classifier(nn.Module):
                  **kwargs):
         super().__init__()
         
-        self.encoder_model = CWT_MAE_RoPE(
+        self.encoder_model = Signal_MAE_RoPE(
             mask_ratio=0.0, 
             **kwargs
         )
@@ -99,7 +99,7 @@ class TF_MAE_Classifier(nn.Module):
 
     def _delete_decoder_components(self):
         components_to_delete =[
-            'decoder_blocks', 'decoder_embed', 'decoder_pred_spec',
+            'decoder_blocks', 'decoder_embed', 'decoder_pred_spec', 'decoder_pred',
             'time_reducer', 'time_pred', 'mask_token',
             'decoder_pos_embed', 'rope_decoder', 'decoder_norm',
             'decoder_channel_embed', 'channel_embed' 
@@ -159,33 +159,30 @@ class TF_MAE_Classifier(nn.Module):
         
         patch_tokens = old_pos_embed 
         
-        grid_h, grid_w_new = self.encoder_model.grid_size
-        n_old = patch_tokens.shape[1]
-        
-        grid_w_old = n_old // grid_h
+        n_new = new_pos_embed.shape[1]
         dim = patch_tokens.shape[-1]
         
-        patch_tokens = patch_tokens.transpose(1, 2).reshape(1, dim, grid_h, grid_w_old)
-        patch_tokens = F.interpolate(patch_tokens, size=(grid_h, grid_w_new), mode='bicubic', align_corners=False)
-        patch_tokens = patch_tokens.flatten(2).transpose(1, 2)
+        patch_tokens = patch_tokens.transpose(1, 2) # (1, dim, N_old)
+        patch_tokens = F.interpolate(patch_tokens, size=n_new, mode='linear', align_corners=False)
+        patch_tokens = patch_tokens.transpose(1, 2) # (1, n_new, dim)
         
         state_dict[key] = patch_tokens
 
     def forward(self, x, channel_mask=None, channel_ids=None):
         if x.dim() == 2: x = x.unsqueeze(1)
 
-        imgs = self.encoder_model.prepare_tokens(x)
+        x_norm = self.encoder_model.prepare_tokens(x)
 
         if torch.onnx.is_in_onnx_export():
             if x.device != next(self.encoder_model.parameters()).device:
                 x = x.to(next(self.encoder_model.parameters()).device)
-            if imgs.device != x.device:
-                imgs = imgs.to(x.device)
+            if x_norm.device != x.device:
+                x_norm = x_norm.to(x.device)
 
         self.encoder_model.mask_ratio = 0.0
         if channel_ids is None:
             channel_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs, channel_ids)
+        latent, _, _, _ = self.encoder_model.forward_encoder(x_norm, channel_ids)
         
         patch_tokens = latent 
         token_padding_mask = None
