@@ -411,4 +411,4 @@ class Signal_MAE_RoPE(nn.Module):
 
         loss_dict = {'loss': loss}
 
-        return loss, loss_dict, pred, x, mask, latent
+        return loss, loss_dict, pred, x, mask, latent, None
