@@ -154,119 +154,104 @@ def get_layer_wise_lr(model, base_lr, layer_decay):
             add_group('default', param, base_lr)
 
     return list(param_groups.values())
-# Visualization (已修改：支持 5 通道多变量可视化)
+# -------------------------------------------------------------------
+# Visualization (适配 Signal_MAE: 1D 原始信号重建可视化)
 # -------------------------------------------------------------------
 def save_reconstruction_images(model, x_time, channel_ids, epoch, save_dir):
     """
-    单通道 Visualization for CWT-MAE-v3
+    Signal_MAE Visualization (1D 信号)
     """
     model.eval()
     vis_dir = os.path.join(save_dir, "vis_results")
     os.makedirs(vis_dir, exist_ok=True)
 
     with torch.no_grad():
-        # 1. 获取模型实例 (处理 DDP/Compile 包装)
         real_model = model.module if hasattr(model, 'module') else model
         if hasattr(real_model, '_orig_mod'):
             real_model = real_model._orig_mod
 
-        # 2. 模型推理 (直接使用原始信号，模型内部处理 CWT 和归一化)
-        # x_time shape: (B, 1, L)
-        output = real_model(x_time, channel_ids)
-        
-        # Unpack output (Handling potentially varying return values)
-        # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask, latent
-        if len(output) == 7:
-            loss, loss_dict, pred_spec, pred_time, imgs, mask, latent = output
-        elif len(output) == 6:
-            # Fallback for old signature (loss, loss_dict, pred_spec, pred_time, imgs, mask)
-            loss, loss_dict, pred_spec, pred_time, imgs, mask = output
-        elif len(output) == 5:
-            # Fallback for even older signature or other models
-            loss, pred_spec, pred_time, imgs, mask = output
+        x_time_input = x_time
+        output = real_model(x_time_input, channel_ids)
+
+        # Signal_MAE returns: loss, loss_dict, pred, x_target, mask, latent, _
+        if len(output) >= 6:
+            loss, loss_dict, pred, x_target, mask, latent = output[:6]
         else:
             raise ValueError(f"Unexpected model output length: {len(output)}")
-        
-        # 3. 数据后处理 (取第一个样本 idx=0)
-        idx = 0
-        orig_signal = x_time[idx].cpu().numpy()      # (M, L)
-        
-        # Log statistics for debugging
-        print(f"[Vis Epoch {epoch}] Orig Signal Stats: Mean={orig_signal.mean():.4e}, Std={orig_signal.std():.4e}, Max={orig_signal.max():.4e}, Min={orig_signal.min():.4e}")
-        
-        x_f32 = x_time.float()
-        mean = x_f32.mean(dim=-1, keepdim=True)
-        std = torch.clamp(x_f32.std(dim=-1, keepdim=True), min=1e-5)
-        pred_time_denorm = pred_time.float() * std + mean
-        recon_signal = pred_time_denorm[idx].cpu().numpy()    # (M, L)
-        mask_val = mask[idx].cpu().numpy()            # (M * N_patches,)
-        
-        M, L = orig_signal.shape
-        N_freq, N_time = real_model.grid_size
-        N_patches = N_freq * N_time
-        patch_size = real_model.patch_size_time
-        
-        # 4. 绘图 (M 行, 3 列)
-        fig, axs = plt.subplots(M, 3, figsize=(18, 3 * M), squeeze=False)
-        plt.suptitle(f"Epoch {epoch} Reconstruction ({M} Channels)", fontsize=16)
-        
-        # 通道名称示例 (根据实际情况调整)
-        # Assuming index 0 is ECG, 1 is PPG (based on dataset logic)
-        channel_names = ["ECG", "PPG"]
-        if M != 2:
-            channel_names = [f"Ch {i}" for i in range(M)]
 
-        for m in range(M):
-            # --- Column 1: Original Signal ---
+        idx = 0
+        orig_signal = x_time_input[idx].cpu().numpy()  # (M, L)
+        print(f"[Vis Epoch {epoch}] Orig Signal Stats: Mean={orig_signal.mean():.4e}, Std={orig_signal.std():.4e}, Max={orig_signal.max():.4e}, Min={orig_signal.min():.4e}")
+
+        # Signal_MAE: pred shape (B, M, N_patches, patch_size)
+        # 将 pred reshape 回原始信号长度
+        B, M, N_patches, patch_size = pred.shape
+        L = N_patches * patch_size
+        pred_signal = pred.reshape(B, M, L).cpu().numpy()
+        recon_signal = pred_signal[idx]  # (M, L)
+
+        mask_val = mask[idx].cpu().numpy()  # (M * N_patches,) or (N_patches,)
+
+        M_ch, L_orig = orig_signal.shape
+
+        # 获取 patch_size
+        if hasattr(real_model, 'patch_size'):
+            p_size = real_model.patch_size
+        else:
+            p_size = L // N_patches
+
+        fig, axs = plt.subplots(M_ch, 3, figsize=(18, 3 * M_ch), squeeze=False)
+        plt.suptitle(f"Epoch {epoch} Signal-MAE Reconstruction ({M_ch} Channels)", fontsize=16)
+
+        channel_names = ["ECG", "PPG"]
+        if M_ch != 2:
+            channel_names = [f"Ch {i}" for i in range(M_ch)]
+
+        for m in range(M_ch):
+            # Mask 处理: Signal_MAE mask shape 可能是 (B, M*N) 或 (B, N)
+            # 简化: 假设 mask 是 (B, N_patches) 统一应用于所有通道
+            if mask_val.shape[0] == M_ch * N_patches:
+                m_mask = mask_val[m * N_patches : (m + 1) * N_patches]
+            else:
+                m_mask = mask_val[:N_patches]
+
+            m_mask_expanded = np.repeat(m_mask, p_size)
+            if m_mask_expanded.shape[0] < L_orig:
+                m_mask_expanded = np.pad(m_mask_expanded, (0, L_orig - m_mask_expanded.shape[0]), constant_values=0)
+            else:
+                m_mask_expanded = m_mask_expanded[:L_orig]
+
+            # Column 1: Original Signal
             axs[m, 0].plot(orig_signal[m], 'k', lw=1)
             axs[m, 0].set_ylabel(channel_names[m] if m < len(channel_names) else f"Ch {m}")
             if m == 0: axs[m, 0].set_title("Original")
             axs[m, 0].grid(True, alpha=0.3)
 
-            # --- Column 2: Masked Input ---
-            # 提取该通道对应的 mask 片段
-            # 注意：mask 的顺序是所有通道拼接在一起的
-            m_mask = mask_val[m * N_patches : (m + 1) * N_patches]
-            # 这里的 mask 真正代表的是时间步的 Mask
-            # 经过修复，所有频率在同一时间点的 Mask 是一致的。
-            # mask_val (M * N_patches,) 包含了每个通道每一块 Patch 的判定，
-            # 由于 N_patches = N_freq * N_time, 我们只取时间轴：
-            m_mask_2d = m_mask.reshape(N_freq, N_time)
-            
-            # 【修复】提取纯时间步 Mask (直接取第一行，因为整个列都是相同的值)
-            m_mask_time = m_mask_2d[0, :] # shape: (N_time,)
-            
-            # 将粗粒度的时间 Patch 扩展到原始信号级
-            m_mask_time_expanded = np.repeat(m_mask_time, patch_size)
-            if m_mask_time_expanded.shape[0] < L:
-                m_mask_time_expanded = np.pad(m_mask_time_expanded, (0, L - m_mask_time_expanded.shape[0]), constant_values=0)
-            else:
-                m_mask_time_expanded = m_mask_time_expanded[:L]
+            # Column 2: Masked Input
             masked_signal = orig_signal[m].copy()
-            masked_signal[m_mask_time_expanded == 1] = np.nan
-            
+            masked_signal[m_mask_expanded == 1] = np.nan
             axs[m, 1].plot(orig_signal[m], 'lightgray', alpha=0.5, label='Original')
             axs[m, 1].plot(masked_signal, 'b', lw=1, label='Visible')
-            if m == 0: 
+            if m == 0:
                 axs[m, 1].set_title("Masked Input (Blue=Visible)")
                 axs[m, 1].legend(loc='upper right', fontsize='small')
             axs[m, 1].grid(True, alpha=0.3)
 
-            # --- Column 3: Reconstruction Overlay ---
-            # 【修复】构建混合信号：Visible 部分使用原始信号，Masked 部分使用重构信号
+            # Column 3: Reconstruction Overlay
             combined_signal = orig_signal[m].copy()
-            # 仅在被 Mask 的区域使用模型预测值
-            combined_signal[m_mask_time_expanded == 1] = recon_signal[m][m_mask_time_expanded == 1]
+            combined_signal[m_mask_expanded == 1] = recon_signal[m][m_mask_expanded == 1]
 
-            axs[m, 2].plot(orig_signal[m], 'gray', alpha=0.5, label='Original')
-            axs[m, 2].plot(combined_signal, 'r', alpha=0.8, lw=1, label='Reconstructed')
-            if m == 0: 
-                axs[m, 2].set_title("Reconstruction (Merged)")
+            axs[m, 2].plot(orig_signal[m], 'k', lw=1, label='Original', alpha=0.5)
+            axs[m, 2].plot(recon_signal[m], 'r', lw=1, label='Reconstructed (Masked)')
+            if m == 0:
+                axs[m, 2].set_title("Reconstruction (Red=Masked Area)")
                 axs[m, 2].legend(loc='upper right', fontsize='small')
             axs[m, 2].grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(os.path.join(vis_dir, f"epoch_{epoch}.png"))
+        save_path = os.path.join(vis_dir, f"recon_epoch_{epoch:03d}.png")
+        plt.savefig(save_path, dpi=100)
         plt.close(fig)
-        
+        print(f"[Vis] Saved to {save_path}")
+
     model.train()
