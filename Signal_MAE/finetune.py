@@ -1,0 +1,981 @@
+import os
+import argparse
+import yaml
+import json
+import random
+import logging
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report, precision_recall_curve, average_precision_score, fbeta_score
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import torch.nn.functional as F
+import numpy as np
+from torch.amp import autocast, GradScaler
+import copy
+
+import warnings
+from sklearn.exceptions import UndefinedMetricWarning
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+
+from dataset_finetune import DownstreamClassificationDataset
+from model_finetune import TF_MAE_Classifier
+from utils import get_layer_wise_lr
+
+# -------------------------------------------------------------------
+# 1. DDP 辅助函数
+# -------------------------------------------------------------------
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+        dist.barrier()
+        return local_rank, rank, world_size
+    else:
+        print("Not using distributed mode")
+        return 0, 0, 1
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process():
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+def unwrap_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+def set_seed(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+def setup_logger(save_dir):
+    logger = logging.getLogger("finetune")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+    if is_main_process():
+        file_handler = logging.FileHandler(os.path.join(save_dir, "finetune.log"), encoding="utf-8")
+        stream_handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+    else:
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+def save_checkpoint(path, model, optimizer, scheduler, epoch, best_metric, best_threshold, scaler):
+    payload = {
+        'epoch': epoch,
+        'model': unwrap_model(model).state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'best_metric': best_metric,
+        'best_threshold': best_threshold
+    }
+    if scaler is not None:
+        payload['scaler'] = scaler.state_dict()
+    torch.save(payload, path)
+
+def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None):
+    checkpoint = torch.load(path, map_location='cpu')
+    state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+    unwrap_model(model).load_state_dict(state_dict, strict=True)
+    if optimizer is not None and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    if scheduler is not None and 'scheduler' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    if scaler is not None and 'scaler' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler'])
+    return checkpoint
+
+def reduce_tensor(tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= dist.get_world_size()
+    return rt
+
+def gather_tensors(tensor, device):
+    if not dist.is_initialized():
+        return tensor
+    
+    local_size = torch.tensor([tensor.shape[0]], device=device)
+    all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
+    dist.all_gather(all_sizes, local_size)
+    max_size = max([x.item() for x in all_sizes])
+
+    size_diff = max_size - local_size.item()
+    
+    # 确保 tensor 在 GPU 上以支持 NCCL
+    tensor = tensor.to(device)
+    
+    if size_diff > 0:
+        padding = torch.zeros((size_diff, *tensor.shape[1:]), device=device, dtype=tensor.dtype)
+        tensor_padded = torch.cat((tensor, padding))
+    else:
+        tensor_padded = tensor
+
+    gathered_tensors = [torch.zeros_like(tensor_padded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered_tensors, tensor_padded)
+
+    output = []
+    for i, gathered_tensor in enumerate(gathered_tensors):
+        output.append(gathered_tensor[:all_sizes[i].item()])
+    
+    return torch.cat(output)
+
+# -------------------------------------------------------------------
+# 2. 关键：处理变长通道的 Collate Function (与 Pretrain 保持一致)
+# -------------------------------------------------------------------
+def variable_channel_collate_fn_cls(batch):
+    """
+    处理分类任务中不同样本通道数不一致的情况。
+    Batch: list of tuples (signal_tensor, modality_ids, label)
+    signal_tensor shape: (M_i, L)
+    """
+    # 分离信号和标签
+    signals = [item[0] for item in batch]
+    modality_ids = [item[1] for item in batch]
+    labels = [item[2] for item in batch]
+    
+    # 1. 找到当前 Batch 中最大的通道数
+    max_m = max([s.shape[0] for s in signals])
+    signal_len = signals[0].shape[1]
+    batch_size = len(batch)
+    
+    # 2. 初始化全 0 张量 (B, Max_M, L)
+    padded_signals = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
+    padded_modality_ids = torch.zeros((batch_size, max_m), dtype=torch.long)
+    channel_mask = torch.zeros((batch_size, max_m), dtype=torch.bool)
+    
+    # 3. 填充数据
+    for i, s in enumerate(signals):
+        m = s.shape[0]
+        padded_signals[i, :m, :] = s
+        padded_modality_ids[i, :m] = modality_ids[i]
+        channel_mask[i, :m] = True
+        
+    return padded_signals, padded_modality_ids, torch.stack(labels), channel_mask
+
+# -------------------------------------------------------------------
+# 3. 训练与验证逻辑
+# -------------------------------------------------------------------
+
+def move_batch_to_device(batch, device):
+    if len(batch) == 4:
+        x, modality_ids, y, channel_mask = batch
+    elif len(batch) == 3:
+        x, modality_ids, y = batch
+        channel_mask = None
+    else:
+        x, y = batch
+        modality_ids = None
+        channel_mask = None
+    x = x.to(device, non_blocking=True)
+    y = y.to(device, non_blocking=True)
+    if modality_ids is not None:
+        modality_ids = modality_ids.to(device, non_blocking=True)
+    if channel_mask is not None:
+        channel_mask = channel_mask.to(device, non_blocking=True)
+    return x, modality_ids, y, channel_mask
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean', label_smoothing=0.0):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.reduction = reduction
+        self.label_smoothing = float(label_smoothing)
+        self.alpha_scalar = None
+        if alpha is None:
+            self.register_buffer("alpha_tensor", None)
+        elif isinstance(alpha, (list, tuple)):
+            self.register_buffer("alpha_tensor", torch.tensor(alpha, dtype=torch.float32))
+        else:
+            self.register_buffer("alpha_tensor", None)
+            self.alpha_scalar = float(alpha)
+
+    def forward(self, logits, targets):
+        # targets can be either hard labels (long) or soft labels (float)
+        if targets.dtype == torch.long:
+            # For hard labels, get standard cross entropy
+            ce_loss = F.cross_entropy(
+                logits,
+                targets,
+                reduction='none',
+                label_smoothing=self.label_smoothing
+            )
+            # Calculate probabilities of the target class
+            pt = torch.exp(-ce_loss)
+            focal_weight = (1.0 - pt) ** self.gamma
+            loss = focal_weight * ce_loss
+
+            if self.alpha_tensor is not None:
+                alpha_t = self.alpha_tensor[targets]
+                loss = alpha_t * loss
+            elif self.alpha_scalar is not None:
+                loss = self.alpha_scalar * loss
+
+        else:
+            # For soft labels, use KL divergence or compute manually
+            log_probs = F.log_softmax(logits, dim=-1)
+            # Manually apply label smoothing if needed for soft labels
+            if self.label_smoothing > 0:
+                num_classes = logits.size(-1)
+                targets = targets * (1.0 - self.label_smoothing) + self.label_smoothing / num_classes
+                
+            ce_loss = -(targets * log_probs).sum(dim=-1)
+            probs = torch.exp(log_probs)
+            # pt is the probability of the true distribution
+            pt = (targets * probs).sum(dim=-1)
+            
+            focal_weight = (1.0 - pt) ** self.gamma
+            loss = focal_weight * ce_loss
+            
+            if self.alpha_tensor is not None:
+                # Approximate alpha for soft labels by taking expected alpha
+                alpha_t = (targets * self.alpha_tensor).sum(dim=-1)
+                loss = alpha_t * loss
+            elif self.alpha_scalar is not None:
+                loss = self.alpha_scalar * loss
+
+        if self.reduction == 'sum':
+            return loss.sum()
+        if self.reduction == 'none':
+            return loss
+        return loss.mean()
+
+class MultiLabelFocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None, pos_weight=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # alpha is for positive class, 1-alpha for negative
+        self.reduction = reduction
+        # pos_weight should be a tensor of shape [num_classes]
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, logits, targets):
+        # Use BCEWithLogitsLoss with reduction='none' to get per-element BCE loss
+        bce_loss = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none', pos_weight=self.pos_weight
+        )
+        
+        # Calculate pt (probability of the true label)
+        # Using pt = p if y=1 else 1-p, which can be computed efficiently:
+        probs = torch.sigmoid(logits)
+        pt = targets * probs + (1 - targets) * (1 - probs)
+        
+        # Calculate modulating factor (1 - pt) ^ gamma
+        focal_weight = (1.0 - pt) ** self.gamma
+        
+        # Optional alpha weighting
+        if self.alpha is not None:
+            alpha_weight = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+            focal_weight = alpha_weight * focal_weight
+            
+        loss = focal_weight * bce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, grad_clip_norm=3.0, scheduler=None):
+    model.train()
+    if hasattr(loader.sampler, 'set_epoch'):
+        loader.sampler.set_epoch(epoch)
+
+    total_loss = 0
+    count = 0
+    
+    amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+    amp_enabled = use_amp and device.type == 'cuda'
+    iterator = tqdm(loader, desc=f"Epoch {epoch + 1} Train") if is_main_process() else loader
+    
+    for batch in iterator:
+        x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
+            loss = criterion(logits, y)
+        
+        if use_amp and amp_dtype == torch.float16:
+            if scaler is None:
+                raise RuntimeError("GradScaler is required for float16 AMP training.")
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            optimizer.step()
+        
+        # Step-based scheduler
+        if scheduler is not None:
+            scheduler.step()
+
+        # 避免每步进行 all_reduce 导致严重的同步阻塞，仅在本地累加 loss
+        total_loss += loss.item()
+            
+        count += 1
+        
+        if is_main_process():
+            current_lr = optimizer.param_groups[0]['lr']
+            iterator.set_postfix({
+                'loss': total_loss / count,
+                'lr': f"{current_lr:.2e}"
+            })
+
+    if count == 0:
+        return 0.0
+    return total_loss / count
+
+def validate(model, loader, criterion, device, num_classes, total_len, use_amp=True, search_threshold=True, fixed_threshold=0.5, save_dir=None, epoch=None):
+    model.eval()
+    total_loss = 0
+    count = 0
+    
+    local_labels = []
+    local_probs = []
+    
+    amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+    amp_enabled = use_amp and device.type == 'cuda'
+
+    iterator = tqdm(loader, desc="Validating") if is_main_process() else loader
+
+    with torch.no_grad():
+        for batch in iterator:
+            x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
+            
+            with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
+                loss = criterion(logits, y)
+            
+            if dist.is_initialized():
+                reduced_loss = reduce_tensor(loss)
+                total_loss += reduced_loss.item()
+            else:
+                total_loss += loss.item()
+            count += 1
+            
+            probs = torch.sigmoid(logits.float())
+            
+            local_labels.append(y.cpu())
+            local_probs.append(probs.cpu()) 
+
+    if count == 0 or len(local_labels) == 0:
+        if is_main_process():
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "Empty validation loader.", fixed_threshold
+        return 0, 0, 0, 0, 0, 0, None, 0
+
+    local_labels = torch.cat(local_labels)
+    local_probs = torch.cat(local_probs)
+
+    if dist.is_initialized():
+        all_labels = gather_tensors(local_labels, device)
+        all_probs = gather_tensors(local_probs, device)
+    else:
+        all_labels = local_labels
+        all_probs = local_probs
+
+    if is_main_process():
+        if len(all_labels) > total_len:
+            all_labels = all_labels[:total_len]
+            all_probs = all_probs[:total_len]
+
+        all_labels_np = all_labels.cpu().numpy()
+        all_probs_np = all_probs.cpu().numpy()
+
+        # Multi-label thresholds
+        if search_threshold and num_classes > 2:
+            best_thresholds = []
+            for i in range(num_classes):
+                disease_true = all_labels_np[:, i]
+                disease_prob = all_probs_np[:, i]
+                
+                if len(np.unique(disease_true)) > 1:
+                    best_th_i = 0.5
+                    best_f1_i = 0.0
+                    for th in np.arange(0.1, 0.9, 0.05):
+                        preds_i = (disease_prob >= th).astype(int)
+                        f1_i = fbeta_score(disease_true, preds_i, beta=0.5, zero_division=0)
+                        if f1_i > best_f1_i:
+                            best_f1_i = f1_i
+                            best_th_i = th
+                    best_thresholds.append(best_th_i)
+                else:
+                    best_thresholds.append(0.5)
+            
+            best_threshold = np.array(best_thresholds)
+            final_preds = (all_probs_np >= best_threshold).astype(int)
+        else:
+            best_threshold = fixed_threshold
+            final_preds = (all_probs_np >= best_threshold).astype(int)
+
+        # 循环计算每种疾病的指标 (Macro AUC)
+        auc_list = []
+        for i in range(num_classes):
+            disease_true = all_labels_np[:, i]
+            disease_prob = all_probs_np[:, i]
+            try:
+                # 只有正负样本都存在时才能算 AUC
+                if len(np.unique(disease_true)) > 1:
+                    auc_i = roc_auc_score(disease_true, disease_prob)
+                else:
+                    auc_i = 0.5
+            except Exception:
+                auc_i = 0.5
+            auc_list.append(auc_i)
+            # 可以在此处打印每个类的AUC，或者仅由主进程打印
+            # if is_main_process() and epoch is not None:
+            #     print(f"Disease {i} AUC: {auc_i:.4f}")
+                
+        auroc = float(np.mean(auc_list))
+
+        # 计算多标签下的其他宏平均指标
+        final_acc = accuracy_score(all_labels_np, final_preds) # Exact match accuracy
+        final_f1 = fbeta_score(all_labels_np, final_preds, beta=0.5, average='macro', zero_division=0)
+        precision = precision_score(all_labels_np, final_preds, average='macro', zero_division=0)
+        recall = recall_score(all_labels_np, final_preds, average='macro', zero_division=0)
+        
+        report_str = classification_report(all_labels_np, final_preds, digits=4, zero_division=0)
+        
+        avg_loss = total_loss / count
+
+        # Plot Precision-Recall Curve if applicable
+        if num_classes == 2 and save_dir is not None:
+            try:
+                # Ensure using Agg backend to avoid GUI issues
+                current_backend = plt.get_backend()
+                if 'agg' not in current_backend.lower():
+                    plt.switch_backend('agg')
+
+                precisions, recalls, _ = precision_recall_curve(all_labels_np, all_probs_np[:, 1])
+                avg_precision = average_precision_score(all_labels_np, all_probs_np[:, 1])
+                
+                plt.figure(figsize=(8, 6))
+                plt.plot(recalls, precisions, label=f'AP={avg_precision:.4f}')
+                plt.xlabel('Recall')
+                plt.ylabel('Precision')
+                plt.title(f'Precision-Recall Curve (Epoch {epoch})')
+                plt.legend(loc='lower left')
+                plt.grid(True)
+                
+                filename = f"pr_curve_epoch_{epoch}.png" if epoch is not None else "pr_curve_test.png"
+                plot_path = os.path.join(save_dir, filename)
+                plt.savefig(plot_path)
+                plt.close()
+                if is_main_process():
+                    print(f"[Plot] Precision-Recall Curve saved to {plot_path}")
+            except Exception as e:
+                if is_main_process():
+                    print(f"[Warning] Failed to plot PR curve: {e}")
+
+        return avg_loss, final_acc, precision, recall, final_f1, auroc, report_str, best_threshold
+    else:
+        return 0, 0, 0, 0, 0, 0, None, 0
+
+# -------------------------------------------------------------------
+# 主函数
+# -------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='finetune_config.yaml', type=str)
+    args = parser.parse_args()
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+
+    train_cfg = config['train']
+    data_cfg = config['data']
+    model_cfg = config['model']
+    seed = train_cfg.get('seed', 42)
+    deterministic = train_cfg.get('deterministic', False)
+    set_seed(seed, deterministic=deterministic)
+
+    if torch.cuda.is_available():
+        local_rank, rank, world_size = setup_distributed()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        local_rank, rank, world_size = 0, 0, 1
+        device = torch.device("cpu")
+    
+    if is_main_process():
+        os.makedirs(train_cfg['save_dir'], exist_ok=True)
+        print(f"World Size: {world_size}, Master running on {device}")
+    logger = setup_logger(train_cfg['save_dir'])
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = train_cfg.get('allow_tf32', True)
+        torch.backends.cudnn.allow_tf32 = train_cfg.get('allow_tf32', True)
+        if not deterministic:
+            torch.backends.cudnn.benchmark = train_cfg.get('cudnn_benchmark', True)
+
+    with open(data_cfg['split_file'], 'r') as f:
+        split_info = json.load(f)
+    requested_val_mode = train_cfg.get('val_mode', 'val')
+    requested_test_mode = train_cfg.get('test_mode', 'test')
+    val_mode = requested_val_mode if requested_val_mode in split_info else ('test' if 'test' in split_info else requested_val_mode)
+    test_mode = requested_test_mode if requested_test_mode in split_info else (val_mode if val_mode in split_info else requested_test_mode)
+    threshold_calibration_only = (val_mode == test_mode)
+    eval_split_name = "阈值校准集" if threshold_calibration_only else "验证集"
+    if is_main_process():
+        print(f"Validation split: {val_mode} | Test split: {test_mode}")
+        if threshold_calibration_only:
+            print("No separate validation split detected. The same split is used to tune inference threshold.")
+
+    train_ds = DownstreamClassificationDataset(
+        data_cfg['data_root'], data_cfg['split_file'], mode='train', 
+        signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
+        on_error=data_cfg.get('on_error', 'raise'),
+        max_error_logs=data_cfg.get('max_error_logs', 20),
+        refined_labels_path=data_cfg.get('refined_labels_path', None)
+    )
+    val_ds = DownstreamClassificationDataset(
+        data_cfg['data_root'], data_cfg['split_file'], mode=val_mode, 
+        signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
+        on_error=data_cfg.get('on_error', 'raise'),
+        max_error_logs=data_cfg.get('max_error_logs', 20)
+    )
+    test_ds = DownstreamClassificationDataset(
+        data_cfg['data_root'], data_cfg['split_file'], mode=test_mode, 
+        signal_len=data_cfg['signal_len'], num_classes=data_cfg['num_classes'],
+        on_error=data_cfg.get('on_error', 'raise'),
+        max_error_logs=data_cfg.get('max_error_logs', 20)
+    )
+
+    val_dataset_len = len(val_ds)
+    test_dataset_len = len(test_ds)
+
+    # 数据清洗逻辑 (可选)
+    clean_indices_path = data_cfg.get('clean_indices_path')
+    clean_val_indices_path = data_cfg.get('clean_val_indices_path')
+    clean_test_indices_path = data_cfg.get('clean_test_indices_path')
+    if clean_indices_path and os.path.exists(clean_indices_path):
+        if is_main_process():
+            print(f"\n[Data Cleaning] Loading clean indices from {clean_indices_path}...")
+        clean_indices = np.load(clean_indices_path)
+        clean_indices = clean_indices[clean_indices < len(train_ds)]
+        train_ds = Subset(train_ds, clean_indices)
+        
+    if clean_val_indices_path and os.path.exists(clean_val_indices_path):
+        if is_main_process():
+            print(f"\n[Val Cleaning] Loading indices from {clean_val_indices_path}...")
+        clean_val_indices = np.load(clean_val_indices_path)
+        clean_val_indices = clean_val_indices[clean_val_indices < len(val_ds)]
+        val_ds = Subset(val_ds, clean_val_indices)
+        val_dataset_len = len(val_ds)
+
+    if clean_test_indices_path and os.path.exists(clean_test_indices_path):
+        if is_main_process():
+            print(f"\n[Test Cleaning] Loading indices from {clean_test_indices_path}...")
+        clean_test_indices = np.load(clean_test_indices_path)
+        clean_test_indices = clean_test_indices[clean_test_indices < len(test_ds)]
+        test_ds = Subset(test_ds, clean_test_indices)
+        test_dataset_len = len(test_ds)
+
+    # 单卡模式下使用 WeightedRandomSampler
+    # --- 重要修复：如果在 DDP 模式下，也需要解决类别不平衡问题 ---
+    # 但 DDP 下使用 WeightedRandomSampler 比较复杂，所以最稳妥的办法是：
+    # 确保 FocalLoss 的 gamma 设置得足够大，或者传入 alpha 权重
+    
+    if dist.is_initialized():
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank, shuffle=False)
+        test_sampler = DistributedSampler(test_ds, num_replicas=world_size, rank=rank, shuffle=False)
+        shuffle_train = False
+    else:
+        # 单卡模式
+        train_sampler = None
+        val_sampler = None
+        test_sampler = None
+        shuffle_train = True
+
+    # DataLoader: 必须使用 variable_channel_collate_fn_cls
+    pin_memory = data_cfg.get('pin_memory', True)
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=train_cfg['batch_size'], 
+        sampler=train_sampler, 
+        shuffle=shuffle_train,
+        num_workers=data_cfg.get('num_workers', 4), 
+        pin_memory=pin_memory,
+        collate_fn=variable_channel_collate_fn_cls # 关键修改
+    )
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=train_cfg['batch_size'], 
+        sampler=val_sampler, 
+        shuffle=False,
+        num_workers=data_cfg.get('num_workers', 4), 
+        pin_memory=pin_memory,
+        collate_fn=variable_channel_collate_fn_cls # 关键修改
+    )
+    test_loader = DataLoader(
+        test_ds, 
+        batch_size=train_cfg['batch_size'], 
+        sampler=test_sampler, 
+        shuffle=False,
+        num_workers=data_cfg.get('num_workers', 4), 
+        pin_memory=pin_memory,
+        collate_fn=variable_channel_collate_fn_cls
+    )
+
+    if is_main_process():
+        print(f"Initializing CWT-MAE Classifier (RoPE + Tensorized + CoT={model_cfg.get('use_cot', True)})...")
+        
+    model = TF_MAE_Classifier(
+        pretrained_path=model_cfg.get('pretrained_path'),
+        num_classes=data_cfg['num_classes'],
+        signal_len=data_cfg['signal_len'],
+        cwt_scales=model_cfg.get('cwt_scales', 64),
+        patch_size_time=model_cfg.get('patch_size_time', 25),
+        patch_size_freq=model_cfg.get('patch_size_freq', 8),
+        embed_dim=model_cfg.get('embed_dim', 768),
+        depth=model_cfg.get('depth', 12),
+        num_heads=model_cfg.get('num_heads', 12),
+        use_diff=model_cfg.get('use_diff', False),
+        decoder_embed_dim=model_cfg.get('decoder_embed_dim', 512), 
+        decoder_depth=model_cfg.get('decoder_depth', 8),
+        decoder_num_heads=model_cfg.get('decoder_num_heads', 16),
+        use_cot=model_cfg.get('use_cot', True),
+        num_reasoning_tokens=model_cfg.get('num_reasoning_tokens', 16)
+    )
+    model.to(device)
+    
+    find_unused_parameters = train_cfg.get('find_unused_parameters', True)
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=find_unused_parameters)
+
+    use_layer_wise_lr = train_cfg.get('use_layer_wise_lr', True)
+    if use_layer_wise_lr:
+        param_groups = get_layer_wise_lr(
+            unwrap_model(model),
+            base_lr=train_cfg['base_lr'],
+            layer_decay=train_cfg.get('layer_decay', 0.65)
+        )
+        optimizer = optim.AdamW(param_groups, weight_decay=train_cfg['weight_decay'])
+        if is_main_process():
+            print("Optimizer: AdamW with layer-wise LR decay")
+    else:
+        optimizer = optim.AdamW(
+            unwrap_model(model).parameters(),
+            lr=train_cfg['base_lr'],
+            weight_decay=train_cfg['weight_decay']
+        )
+        if is_main_process():
+            print("Optimizer: AdamW with uniform learning rate")
+    
+    # LR Scheduler (Warmup + Cosine) - Step-based
+    # 计算总步数
+    steps_per_epoch = len(train_loader)
+    total_steps = train_cfg['epochs'] * steps_per_epoch
+    warmup_steps = int(train_cfg['warmup_epochs'] * steps_per_epoch)
+    
+    if warmup_steps > 0:
+        scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+        scheduler_cosine = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps - warmup_steps,
+            eta_min=train_cfg['min_lr']
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[scheduler_warmup, scheduler_cosine],
+            milestones=[warmup_steps]
+        )
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg['min_lr'])
+    
+    if train_cfg.get('pos_weight') == 'auto':
+        if is_main_process():
+            print("Calculating pos_weight for multi-label BCE automatically...")
+            if isinstance(train_ds, Subset):
+                indices = train_ds.indices
+                base_ds = train_ds.dataset
+            else:
+                indices = list(range(len(train_ds)))
+                base_ds = train_ds
+            
+            from concurrent.futures import ThreadPoolExecutor
+            import pickle
+            
+            LABEL_NAMES = [
+                '高血压', '高血糖', '高血脂', 
+                '冠心病', '心律失常（房颤、频发早搏等）', '糖尿病', 
+                '颈动脉斑块'
+            ]
+            
+            def load_label_vector(idx):
+                try:
+                    filename = base_ds.file_list[idx]
+                    file_path = os.path.join(base_ds.data_root, filename)
+                    with open(file_path, 'rb') as f:
+                        content = pickle.load(f)
+                    if isinstance(content, dict) and 'label' in content:
+                        target_label = content['label']
+                        if isinstance(target_label, dict):
+                            return np.array([float(target_label.get(name, 0)) for name in LABEL_NAMES])
+                    return np.zeros(len(LABEL_NAMES))
+                except:
+                    return np.zeros(len(LABEL_NAMES))
+                    
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                labels_list = list(tqdm(executor.map(load_label_vector, indices), total=len(indices), desc="Loading labels for pos_weight"))
+            
+            labels_np = np.array(labels_list)
+            pos_counts = labels_np.sum(axis=0)
+            neg_counts = len(labels_np) - pos_counts
+            
+            pos_counts = np.maximum(pos_counts, 1)
+            # 使用开根号平滑策略 (Square Root Smoothing) 避免权重过于极端
+            calculated_weights = np.sqrt(neg_counts / pos_counts)
+            # 限制最大权重避免极端不平衡导致的梯度爆炸
+            calculated_weights = np.clip(calculated_weights, 1.0, 50.0) 
+            
+            weights_tensor = torch.tensor(calculated_weights, dtype=torch.float32, device=device)
+        else:
+            weights_tensor = torch.zeros(data_cfg['num_classes'], dtype=torch.float32, device=device)
+            
+        if dist.is_initialized():
+            dist.broadcast(weights_tensor, src=0)
+            
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss(pos_weight=weights_tensor)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  auto pos_weight: {weights_tensor.tolist()}")
+        else:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  auto pos_weight: {weights_tensor.tolist()}")
+    elif train_cfg.get('pos_weight') is not None:
+        weights = torch.tensor(train_cfg['pos_weight'], dtype=torch.float32).to(device)
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss(pos_weight=weights)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  config pos_weight: {weights.tolist()}")
+        else:
+            criterion = nn.BCEWithLogitsLoss(pos_weight=weights)
+            if is_main_process():
+                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  config pos_weight: {weights.tolist()}")
+    else:
+        if train_cfg.get('use_focal_loss'):
+            criterion = MultiLabelFocalLoss()
+            if is_main_process():
+                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  pos_weight: None")
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+            if is_main_process():
+                print("Loss Details:\n  Type: BCEWithLogitsLoss\n  pos_weight: None")
+
+    best_metric = float("-inf")
+    best_threshold = np.array([0.5] * data_cfg['num_classes']) if data_cfg['num_classes'] > 2 else 0.5
+    best_epoch = -1
+    start_epoch = 0
+    no_improve_epochs = 0
+    total_epochs = train_cfg['epochs']
+    use_amp = train_cfg.get('use_amp', True)
+    grad_clip_norm = train_cfg.get('grad_clip_norm', 3.0)
+    amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+    scaler = GradScaler(enabled=(use_amp and device.type == 'cuda' and amp_dtype == torch.float16))
+    if is_main_process():
+        amp_enabled = use_amp and device.type == 'cuda'
+        print(f"AMP Enabled: {amp_enabled} | AMP DType: {amp_dtype} | GradScaler: {scaler.is_enabled()}")
+        logger.info(f"amp_enabled={amp_enabled} amp_dtype={amp_dtype} grad_scaler={scaler.is_enabled()}")
+    early_stop_patience = train_cfg.get('early_stop_patience', 0)
+    resume_path = train_cfg.get('resume_path')
+    if (not resume_path) and train_cfg.get('auto_resume', True):
+        candidate = os.path.join(train_cfg['save_dir'], "last_checkpoint.pth")
+        if os.path.exists(candidate):
+            resume_path = candidate
+    if resume_path and os.path.exists(resume_path):
+        resume_ckpt = load_checkpoint(resume_path, model, optimizer=optimizer, scheduler=scheduler, scaler=scaler)
+        start_epoch = int(resume_ckpt.get('epoch', -1)) + 1
+        best_metric = float(resume_ckpt.get('best_metric', best_metric))
+        saved_threshold = resume_ckpt.get('best_threshold', best_threshold)
+        if isinstance(saved_threshold, (list, np.ndarray)):
+            best_threshold = np.array(saved_threshold)
+        else:
+            best_threshold = float(saved_threshold)
+        if is_main_process():
+            logger.info(f"resume_from={resume_path} start_epoch={start_epoch}")
+
+    for epoch in range(start_epoch, total_epochs):
+        if is_main_process():
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"\nEpoch {epoch+1}/{total_epochs} | LR: {current_lr:.2e}")
+
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, epoch,
+            scaler=scaler, use_amp=use_amp, grad_clip_norm=grad_clip_norm,
+            scheduler=scheduler
+        )
+        
+        # scheduler.step() # Moved to per-step inside train_one_epoch
+
+        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th = validate(
+            model, val_loader, criterion, device, data_cfg['num_classes'], 
+            total_len=val_dataset_len, 
+            use_amp=use_amp,
+            search_threshold=True,
+            fixed_threshold=best_threshold,
+            save_dir=train_cfg['save_dir'],
+            epoch=epoch+1
+        )
+
+        if is_main_process():
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"{eval_split_name} Loss: {val_loss:.4f}")
+            print("-" * 60)
+            if data_cfg['num_classes'] == 2:
+                print(f"Applied Threshold: {best_th:.2f}")
+            elif data_cfg['num_classes'] > 2 and isinstance(best_th, np.ndarray):
+                print(f"Applied Thresholds: {np.round(best_th, 2).tolist()}")
+            print(f"{eval_split_name}准确率 (Accuracy): {val_acc:.4f}")
+            print(f"AUC Score: {val_auc:.4f}")
+            print("-" * 60)
+            print(f"{eval_split_name}分类报告 (Classification Report):")
+            print(val_report)
+            print("-" * 60)
+
+        # 使用 AUC 作为最佳权重的保留标准
+        metric_to_track = val_auc
+        
+        if metric_to_track > best_metric:
+            best_metric = metric_to_track
+            best_threshold = best_th
+            best_epoch = epoch + 1
+            if is_main_process():
+                torch.save(unwrap_model(model).state_dict(), os.path.join(train_cfg['save_dir'], "best_model.pth"))
+                print(f">>> Best model saved! (Metric: {best_metric:.4f})")
+                
+                # 同步生成 ONNX 模型用于 CPU 推理
+                try:
+                    onnx_path = os.path.join(train_cfg['save_dir'], "best_model_cpu.onnx")
+                    real_model = unwrap_model(model)
+                    
+                    # 导出 ONNX 之前，将模型和 dummy 数据统一转移到 CPU 上
+                    # 这是最安全的做法，彻底避免所有由于 CPU/CUDA 引起的 wrapper_CUDA__index_select 等错误
+                    real_model_cpu = copy.deepcopy(real_model).cpu()
+                    real_model_cpu.eval()
+                    
+                    # 构建虚拟输入 (B=1, M=1, L=signal_len)，同样放在 CPU
+                    dummy_x = torch.randn(1, 1, data_cfg['signal_len'], device='cpu')
+                    
+                    # 导出 ONNX (设置动态轴以便支持不同 batch_size 和通道数)
+                    torch.onnx.export(
+                        real_model_cpu,
+                        (dummy_x,),
+                        onnx_path,
+                        export_params=True,
+                        opset_version=14,
+                        do_constant_folding=True,
+                        input_names=['input'],
+                        output_names=['output'],
+                        dynamic_axes={
+                            'input': {0: 'batch_size', 1: 'channels'},
+                            'output': {0: 'batch_size'}
+                        }
+                    )
+                    print(f">>> ONNX model exported to {onnx_path}")
+                    
+                    # 清理 CPU 模型占用
+                    del real_model_cpu
+                    
+                except Exception as e:
+                    print(f"[Warning] Failed to export ONNX model: {e}")
+
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+        if is_main_process():
+            torch.save(unwrap_model(model).state_dict(), os.path.join(train_cfg['save_dir'], "last_model.pth"))
+            save_checkpoint(
+                os.path.join(train_cfg['save_dir'], "last_checkpoint.pth"),
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                best_metric=best_metric,
+                best_threshold=best_threshold,
+                scaler=scaler
+            )
+        if is_main_process():
+            th_str = str(np.round(best_th, 4).tolist()) if isinstance(best_th, np.ndarray) else f"{best_th:.4f}"
+            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={th_str}")
+        if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
+            if is_main_process():
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                logger.info(f"early_stopping epoch={epoch+1}")
+            break
+
+    best_model_path = os.path.join(train_cfg['save_dir'], "best_model.pth")
+    if os.path.exists(best_model_path):
+        state_dict = torch.load(best_model_path, map_location=device)
+        unwrap_model(model).load_state_dict(state_dict, strict=True)
+
+    if is_main_process():
+        threshold_payload = {
+            "threshold": float(best_threshold) if data_cfg['num_classes'] == 2 else best_threshold.tolist() if isinstance(best_threshold, np.ndarray) else best_threshold,
+            "epoch": int(best_epoch),
+            "split_used": val_mode
+        }
+        threshold_path = os.path.join(train_cfg['save_dir'], "best_threshold.json")
+        with open(threshold_path, "w", encoding="utf-8") as f:
+            json.dump(threshold_payload, f, ensure_ascii=False, indent=2)
+        print(f"Best threshold saved to: {threshold_path}")
+
+    if not threshold_calibration_only:
+        test_loss, test_acc, test_prec, test_rec, test_f1, test_auc, test_report, _ = validate(
+            model, test_loader, criterion, device, data_cfg['num_classes'],
+            total_len=test_dataset_len,
+            use_amp=use_amp,
+            search_threshold=False,
+            fixed_threshold=best_threshold,
+            save_dir=train_cfg['save_dir'],
+            epoch="test"
+        )
+
+    if is_main_process():
+        print(f"\nBest Epoch: {best_epoch}")
+        if threshold_calibration_only:
+            if data_cfg['num_classes'] == 2:
+                print(f"Inference Threshold: {best_threshold:.2f} (from split: {val_mode})")
+            elif data_cfg['num_classes'] > 2 and isinstance(best_threshold, np.ndarray):
+                print(f"Inference Thresholds: {np.round(best_threshold, 2).tolist()} (from split: {val_mode})")
+        else:
+            print(f"Test  Loss: {test_loss:.4f}")
+            if data_cfg['num_classes'] == 2:
+                print(f"Test Applied Threshold: {best_threshold:.2f}")
+            elif data_cfg['num_classes'] > 2 and isinstance(best_threshold, np.ndarray):
+                print(f"Test Applied Thresholds: {np.round(best_threshold, 2).tolist()}")
+            print(f"最终测试集准确率 (Accuracy): {test_acc:.4f}")
+            print(f"AUC Score: {test_auc:.4f}")
+            print("-" * 60)
+            print("最终测试集分类报告 (Classification Report):")
+            print(test_report)
+            print("-" * 60)
+    
+    cleanup_distributed()
+
+if __name__ == "__main__":
+    main()

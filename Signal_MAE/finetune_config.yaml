@@ -1,0 +1,77 @@
+train:
+  # ===== 训练轮次与数据划分 =====
+  epochs: 30
+  batch_size: 128
+  val_mode: "test"
+  test_mode: "test"
+
+  # ===== 优化器与学习率 =====
+  base_lr: 5.0e-5
+  min_lr: 1.0e-6
+  warmup_epochs: 5
+  weight_decay: 0.05
+  use_layer_wise_lr: false
+  layer_decay: 0.65
+
+  # ===== 损失函数配置 =====
+  use_focal_loss: false
+  pos_weight: "auto"
+
+  # ===== 训练稳定性与加速 =====
+  use_amp: true
+  grad_clip_norm: 1.0
+  find_unused_parameters: true
+  allow_tf32: true
+  cudnn_benchmark: true
+
+  # ===== 复现性与恢复训练 =====
+  seed: 42
+  deterministic: false
+  auto_resume: false
+  resume_path: null
+  early_stop_patience: 0
+
+  # ===== 输出目录 =====
+  save_dir: "./finetune"
+
+data:
+  # ===== 数据路径 =====
+  data_root: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/ppgchd/ppgchd/data_updated"
+  split_file: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/ppgchd/ppgchd/train_test_split.json"
+
+  # ===== 数据形态 =====
+  signal_len: 1000
+  num_classes: 7
+
+  # ===== DataLoader =====
+  num_workers: 4
+  pin_memory: true
+
+  # ===== 通道与异常处理 =====
+  on_error: "raise"
+  max_error_logs: 20
+
+  # ===== 可选清洗索引 =====
+  clean_indices_path: null
+  clean_val_indices_path: null
+  clean_test_indices_path: null
+
+model:
+  # ===== 预训练权重 =====
+  pretrained_path: "./checkpoint/checkpoint_last.pth"
+
+  # ===== 编码器结构 =====
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  patch_size: 50
+  signal_len: 1000
+
+  # ===== 解码器结构（分类阶段仅用于初始化） =====
+  decoder_embed_dim: 512
+  decoder_depth: 8
+  decoder_num_heads: 16
+
+  # ===== CoT 模块 =====
+  use_cot: true
+  num_reasoning_tokens: 16
