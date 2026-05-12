@@ -404,10 +404,7 @@ class CWT_MAE_RoPE(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
         mask = mask.unsqueeze(1).expand(B, M, N_patches).reshape(B, M * N_patches)
         
-        global_ids_restore =[]
-        for m in range(M):
-            global_ids_restore.append(ids_restore + m * N_patches)
-        global_ids_restore = torch.cat(global_ids_restore, dim=1)
+        global_ids_restore = torch.cat([ids_restore + m * N_patches for m in range(M)], dim=1)
 
         return x_masked, mask, global_ids_restore, ids_keep, len_keep
 
@@ -577,6 +574,7 @@ class CWT_MAE_RoPE(nn.Module):
         loss = loss * self.channel_loss_weights
         loss = loss.sum(dim=-1) 
         
+        # 只在 mask == 1 的位置计算 loss
         loss = (loss * mask).sum() / (mask.sum() + 1e-8)
         return loss
 

@@ -641,19 +641,16 @@ def main():
     )
 
     if is_main_process():
-        print(f"Initializing CWT-MAE Classifier (RoPE + Tensorized + CoT={model_cfg.get('use_cot', True)})...")
+        print(f"Initializing Signal-MAE Classifier (RoPE + CoT={model_cfg.get('use_cot', True)})...")
         
     model = TF_MAE_Classifier(
         pretrained_path=model_cfg.get('pretrained_path'),
         num_classes=data_cfg['num_classes'],
-        signal_len=data_cfg['signal_len'],
-        cwt_scales=model_cfg.get('cwt_scales', 64),
-        patch_size_time=model_cfg.get('patch_size_time', 25),
-        patch_size_freq=model_cfg.get('patch_size_freq', 8),
+        signal_len=model_cfg.get('signal_len', data_cfg['signal_len']),
+        patch_size=model_cfg.get('patch_size', 50),
         embed_dim=model_cfg.get('embed_dim', 768),
         depth=model_cfg.get('depth', 12),
         num_heads=model_cfg.get('num_heads', 12),
-        use_diff=model_cfg.get('use_diff', False),
         decoder_embed_dim=model_cfg.get('decoder_embed_dim', 512), 
         decoder_depth=model_cfg.get('decoder_depth', 8),
         decoder_num_heads=model_cfg.get('decoder_num_heads', 16),
