@@ -171,6 +171,11 @@ class TF_MAE_Classifier(nn.Module):
     def forward(self, x, channel_mask=None, channel_ids=None):
         if x.dim() == 2: x = x.unsqueeze(1)
 
+        # 确保输入数据类型与模型参数类型一致
+        param_dtype = next(self.encoder_model.parameters()).dtype
+        if x.dtype != param_dtype:
+            x = x.to(param_dtype)
+
         x_norm = self.encoder_model.prepare_tokens(x)
 
         if torch.onnx.is_in_onnx_export():
