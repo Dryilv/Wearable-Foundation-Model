@@ -68,12 +68,16 @@ class TF_MAE_Classifier(nn.Module):
                  **kwargs):
         super().__init__()
         
+        self.use_stats_features = kwargs.get('use_stats_features', False)
+        self.embed_dim = kwargs.get('embed_dim', 768)
+        
+        # 移除 CWT_MAE_RoPE 不需要的参数
+        encoder_kwargs = {k: v for k, v in kwargs.items() if k != 'use_stats_features'}
+        
         self.encoder_model = CWT_MAE_RoPE(
             mask_ratio=0.0, 
-            **kwargs
+            **encoder_kwargs
         )
-        self.embed_dim = kwargs.get('embed_dim', 768)
-        self.use_stats_features = kwargs.get('use_stats_features', False)
         
         if pretrained_path:
             self._load_pretrained_weights(pretrained_path)
