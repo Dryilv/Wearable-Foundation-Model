@@ -305,8 +305,10 @@ def save_reconstruction_images(model, x_time, channel_ids, epoch, save_dir):
         output = real_model(x_time, channel_ids)
         
         # Unpack output (Handling potentially varying return values)
-        # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask, latent
-        if len(output) == 7:
+        # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask, latent, pred_stats
+        if len(output) == 8:
+            loss, loss_dict, pred_spec, pred_time, imgs, mask, latent, pred_stats = output
+        elif len(output) == 7:
             loss, loss_dict, pred_spec, pred_time, imgs, mask, latent = output
         elif len(output) == 6:
             # Fallback for old signature (loss, loss_dict, pred_spec, pred_time, imgs, mask)
