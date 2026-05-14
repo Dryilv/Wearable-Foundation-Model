@@ -575,7 +575,8 @@ def main():
         decoder_depth=model_cfg.get('decoder_depth', 8),
         decoder_num_heads=model_cfg.get('decoder_num_heads', 16),
         use_cot=model_cfg.get('use_cot', True),
-        num_reasoning_tokens=model_cfg.get('num_reasoning_tokens', 16)
+        num_reasoning_tokens=model_cfg.get('num_reasoning_tokens', 16),
+        use_stats_features=model_cfg.get('use_stats_features', False)
     )
     model.to(device)
     

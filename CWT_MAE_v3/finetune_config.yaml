@@ -78,4 +78,7 @@ model:
   use_cot: true
   num_reasoning_tokens: 16
 
+  # ===== 统计特征拼接 =====
+  use_stats_features: true
+
   
