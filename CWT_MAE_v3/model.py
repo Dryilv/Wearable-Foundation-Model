@@ -703,10 +703,17 @@ class CWT_MAE_RoPE(nn.Module):
         pred_stats = self.stats_pred_head(latent_pooled)  # (B, 16)
         
         if stats_target is not None:
-            # Stats target 归一化？在这里最好对 target 做个简单的归一化，
-            # 但既然是 SmoothL1，它对尺度有一定的容忍度。
-            # 这里直接计算 loss
-            loss_stats = self.forward_loss_stats(pred_stats, stats_target.float())
+            stats_target = stats_target.float()
+            # 解决统计量量级过大导致 Loss 爆炸的问题：进行 Batch 级 Z-Score 归一化
+            # 使得目标特征分布在均值 0，方差 1 附近，从而使 MSE/SmoothL1 Loss 降到 1.0 左右的合理区间
+            stats_mean = stats_target.mean(dim=0, keepdim=True)
+            stats_std = stats_target.std(dim=0, keepdim=True).clamp(min=1e-5)
+            stats_target_norm = (stats_target - stats_mean) / stats_std
+            
+            # 为了防止异常极值，进行裁剪
+            stats_target_norm = torch.clamp(stats_target_norm, min=-10.0, max=10.0)
+            
+            loss_stats = self.forward_loss_stats(pred_stats, stats_target_norm)
             loss = loss + self.stats_loss_weight * loss_stats
             loss_dict['loss_stats'] = loss_stats
 
