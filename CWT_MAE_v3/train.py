@@ -62,6 +62,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_spec'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_time'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
+    metric_logger['loss_stats'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     metric_logger['grad_norm'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
     metric_logger['throughput'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
@@ -92,8 +93,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         step_start_time = time.time()
         global_step = epoch * num_steps_per_epoch + step
 
-        # 【修改】适配新的返回值格式: (batch, channel_ids, labels)
-        batch, channel_ids, labels = batch_data
+        # 【修改】适配新的返回值格式: (batch, channel_ids, labels, stats)
+        batch, channel_ids, labels, stats = batch_data
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
@@ -134,14 +135,16 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                # 【修改】传递 channel_ids
+                # 【修改】传递 channel_ids 和 stats_target
                 channel_ids = channel_ids.to(device, non_blocking=True)
-                loss, loss_dict, _, _, _, _, _ = model(batch, channel_ids, mask_ratio=mask_ratio)
+                stats = stats.to(device, non_blocking=True)
+                loss, loss_dict, _, _, _, _, _, _ = model(batch, channel_ids, stats_target=stats, mask_ratio=mask_ratio)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
             loss_spec_val = loss_dict.get('loss_spec', torch.tensor(0.0)).item()
             loss_time_val = loss_dict.get('loss_time', torch.tensor(0.0)).item()
+            loss_stats_val = loss_dict.get('loss_stats', torch.tensor(0.0)).item()
             
             if not math.isfinite(loss_value):
                 print(f"Loss is {loss_value}, stopping training")
@@ -174,6 +177,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         metric_logger['loss'].update(loss_value)
         metric_logger['loss_spec'].update(loss_spec_val)
         metric_logger['loss_time'].update(loss_time_val)
+        metric_logger['loss_stats'].update(loss_stats_val)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
         metric_logger['throughput'].update(throughput)
 
@@ -202,6 +206,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
                 f"Loss: {metric_logger['loss']} "
                 f"Spec: {metric_logger['loss_spec']} "
                 f"Time: {metric_logger['loss_time']} "
+                f"Stats: {metric_logger['loss_stats']} "
                 f"LR: {metric_logger['lr']} "
                 f"Grad: {metric_logger['grad_norm']} "
                 f"Speed: {metric_logger['throughput'].avg:.1f} samples/s "
@@ -216,6 +221,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         'loss': metric_logger['loss'].global_avg,
         'loss_spec': metric_logger['loss_spec'].global_avg,
         'loss_time': metric_logger['loss_time'].global_avg,
+        'loss_stats': metric_logger['loss_stats'].global_avg,
         'grad_norm': metric_logger['grad_norm'].global_avg,
         'throughput': metric_logger['throughput'].global_avg * (dist.get_world_size() if dist.is_initialized() else 1)
     }
@@ -311,7 +317,8 @@ def main():
         'mask_ratio': config['model'].get('mask_ratio', 0.75),
         'time_loss_weight': config['model'].get('time_loss_weight', 1.0),
         'use_diff': config['model'].get('use_diff', False),
-        'diff_loss_weight': config['model'].get('diff_loss_weight', None)
+        'diff_loss_weight': config['model'].get('diff_loss_weight', None),
+        'stats_loss_weight': config['model'].get('stats_loss_weight', 1.0)
     }
 
     if is_main_process():
@@ -371,15 +378,17 @@ def main():
             for k, v in state_dict.items():
                 name = k.replace('module.', '')
                 new_state_dict[name] = v
-            model.load_state_dict(new_state_dict)
+            msg = model.load_state_dict(new_state_dict, strict=False)
         else:
-            model.module.load_state_dict(state_dict)
+            msg = model.module.load_state_dict(state_dict, strict=False)
             
         optimizer.load_state_dict(checkpoint['optimizer'])
         scaler.load_state_dict(checkpoint['scaler'])
         start_epoch = checkpoint['epoch'] + 1
         if is_main_process():
             logger.info(f"Resumed from epoch {start_epoch}")
+            if msg.missing_keys:
+                logger.warning(f"Missing keys when resuming (expected if adding new modules like stats_pred_head): {msg.missing_keys}")
 
     start_time_global = time.time()
     
@@ -415,6 +424,7 @@ def main():
                 'train_loss': train_metrics['loss'],
                 'loss_spec': train_metrics['loss_spec'],
                 'loss_time': train_metrics['loss_time'],
+                'loss_stats': train_metrics['loss_stats'],
                 'grad_norm': train_metrics['grad_norm'],
                 'gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 / 1024,
                 'throughput': train_metrics['throughput'],

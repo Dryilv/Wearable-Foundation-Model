@@ -40,7 +40,7 @@ class LatentReasoningHead(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, x_encoder, token_padding_mask=None):
+    def forward(self, x_encoder, token_padding_mask=None, extra_features=None):
         B = x_encoder.shape[0]
         queries = self.reasoning_tokens.expand(B, -1, -1) 
         
@@ -53,6 +53,8 @@ class LatentReasoningHead(nn.Module):
         queries = self.norm3(queries + self.ffn(queries))
         
         decision_token = queries.mean(dim=1) 
+        if extra_features is not None:
+            decision_token = torch.cat([decision_token, extra_features], dim=-1)
         logits = self.classifier(decision_token)
         return logits
 
@@ -71,26 +73,34 @@ class TF_MAE_Classifier(nn.Module):
             **kwargs
         )
         self.embed_dim = kwargs.get('embed_dim', 768)
+        self.use_stats_features = kwargs.get('use_stats_features', False)
         
         if pretrained_path:
             self._load_pretrained_weights(pretrained_path)
         
         self._delete_decoder_components()
+        
+        classifier_in_dim = self.embed_dim
+        if self.use_stats_features:
+            classifier_in_dim += 16 # 16 is the number of stats features
 
         if use_cot:
             if is_main_process():
                 print(f">>> Initializing Latent Reasoning Head (CoT) with {num_reasoning_tokens} tokens.")
             self.head = LatentReasoningHead(
-                embed_dim=self.embed_dim,
+                embed_dim=self.embed_dim, # CoT head itself handles embed_dim internally, wait!
                 num_heads=kwargs.get('num_heads', 12),
                 num_classes=num_classes,
                 num_reasoning_tokens=num_reasoning_tokens,
                 dropout=0.2
             )
+            if self.use_stats_features:
+                # modify the final classifier of LatentReasoningHead
+                self.head.classifier = nn.Linear(self.embed_dim + 16, num_classes)
         else:
             self.head = nn.Sequential(
-                nn.LayerNorm(self.embed_dim),
-                nn.Linear(self.embed_dim, num_classes)
+                nn.LayerNorm(classifier_in_dim),
+                nn.Linear(classifier_in_dim, num_classes)
             )
 
 
@@ -107,8 +117,6 @@ class TF_MAE_Classifier(nn.Module):
                 delattr(self.encoder_model, component)
 
     def _load_pretrained_weights(self, path):
-        if is_main_process():
-            print(f"Loading weights from {path}...")
         checkpoint = torch.load(path, map_location='cpu')
         state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
 
@@ -184,6 +192,10 @@ class TF_MAE_Classifier(nn.Module):
             channel_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs, channel_ids)
         
+        # Get stats predictions
+        latent_pooled = latent.mean(dim=1)
+        pred_stats = self.encoder_model.stats_pred_head(latent_pooled)
+        
         patch_tokens = latent 
         token_padding_mask = None
         if channel_mask is not None:
@@ -195,9 +207,11 @@ class TF_MAE_Classifier(nn.Module):
                 token_padding_mask = (~channel_mask).unsqueeze(-1).expand(B_mask, M_mask, n_patches).reshape(B_mask, total_tokens)
         
         if isinstance(self.head, LatentReasoningHead):
-            logits = self.head(patch_tokens, token_padding_mask=token_padding_mask)
+            logits = self.head(patch_tokens, token_padding_mask=token_padding_mask, extra_features=pred_stats if self.use_stats_features else None)
         else:
             global_feat = patch_tokens.mean(dim=1)
+            if self.use_stats_features:
+                global_feat = torch.cat([global_feat, pred_stats], dim=-1)
             logits = self.head(global_feat)
         
         return logits

@@ -286,6 +286,7 @@ class CWT_MAE_RoPE(nn.Module):
         mask_ratio=0.75,       
         norm_layer=nn.LayerNorm,
         time_loss_weight=1.0,
+        stats_loss_weight=1.0,
         use_diff=False,
         diff_loss_weight=None,
         max_modalities=16 
@@ -355,6 +356,14 @@ class CWT_MAE_RoPE(nn.Module):
             norm_layer(decoder_embed_dim)
         )
         self.time_pred = nn.Linear(decoder_embed_dim, patch_size_time, bias=True)
+
+        # 【新增】统计量预测头 (预测 16 个统计特征)
+        self.stats_pred_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, 16)
+        )
+        self.stats_loss_weight = stats_loss_weight
 
         self.initialize_weights()
 
@@ -599,6 +608,14 @@ class CWT_MAE_RoPE(nn.Module):
         loss = (loss * mask_time).sum() / (mask_time.sum() + 1e-8)
         return loss
 
+    def forward_loss_stats(self, pred_stats, stats_target):
+        """
+        计算统计量预测的 MSE 损失，可考虑 Smooth L1 也可以。这里采用 MSE。
+        由于特征尺度不一，建议外部已归一化，或这里进行 SmoothL1。
+        """
+        loss = F.smooth_l1_loss(pred_stats, stats_target)
+        return loss
+
     def prepare_tokens(self, x):
         if x.dim() == 2: x = x.unsqueeze(1)
         imgs = cwt_wrap(x, num_scales=self.cwt_scales, lowest_scale=0.1, step=1.0, use_diff=self.use_diff)
@@ -610,10 +627,11 @@ class CWT_MAE_RoPE(nn.Module):
         imgs = torch.clamp(imgs, min=-100.0, max=100.0)
         return imgs.to(dtype=next(self.parameters()).dtype)
 
-    def forward(self, x, channel_ids, mask_ratio=None):
+    def forward(self, x, channel_ids, stats_target=None, mask_ratio=None):
         """
         新增参数:
             channel_ids: (B,) tensor
+            stats_target: (B, 16) tensor, 统计量目标
         """
         B = x.shape[0]
         current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
@@ -678,5 +696,19 @@ class CWT_MAE_RoPE(nn.Module):
         loss = loss_spec + self.time_loss_weight * loss_time
         loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
 
-        return loss, loss_dict, pred_spec, pred_time, imgs_target, mask, latent
+        # 【新增】统计特征预测
+        # 编码器输出 latent 形状为 (B, M * len_keep, D)
+        # 我们进行全局平均池化
+        latent_pooled = latent.mean(dim=1)  # (B, D)
+        pred_stats = self.stats_pred_head(latent_pooled)  # (B, 16)
+        
+        if stats_target is not None:
+            # Stats target 归一化？在这里最好对 target 做个简单的归一化，
+            # 但既然是 SmoothL1，它对尺度有一定的容忍度。
+            # 这里直接计算 loss
+            loss_stats = self.forward_loss_stats(pred_stats, stats_target.float())
+            loss = loss + self.stats_loss_weight * loss_stats
+            loss_dict['loss_stats'] = loss_stats
+
+        return loss, loss_dict, pred_spec, pred_time, imgs_target, mask, latent, pred_stats
 

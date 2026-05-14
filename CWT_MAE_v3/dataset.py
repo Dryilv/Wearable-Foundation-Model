@@ -8,6 +8,7 @@ import pickle
 import hashlib
 from sklearn.model_selection import StratifiedShuffleSplit
 from functools import lru_cache
+from utils_features import extract_features
 
 # 独立的缓存函数，避免实例绑定的序列化问题
 @lru_cache(maxsize=8)
@@ -226,6 +227,10 @@ class PhysioSignalDataset(Dataset):
                 # 2. 同步裁剪或填充 (使用固定起始位置或随机起始位置)
                 processed_signal = self._process_signal(raw_signal, fixed_start)
 
+                # 计算统计特征 (在归一化前)
+                fs = self.index_data[original_idx].get('fs', 100) # Assuming 100Hz if not present
+                stats = extract_features(processed_signal, channel_idx, fs=fs, item_info=item_info)
+
                 # 3. 逐通道质量检查
                 std_vals = np.std(processed_signal, axis=1, keepdims=True) # (M, 1)
                 
@@ -257,9 +262,10 @@ class PhysioSignalDataset(Dataset):
 
                 # 转为 Tensor
                 signal_tensor = torch.from_numpy(processed_signal)
+                stats_tensor = torch.from_numpy(stats)
 
-                # 【修改】返回 channel_id (0=ECG, 1=PPG)
-                return signal_tensor, torch.tensor(channel_idx, dtype=torch.long), torch.tensor(label, dtype=torch.long)
+                # 【修改】返回 channel_id (0=ECG, 1=PPG), 以及统计特征
+                return signal_tensor, torch.tensor(channel_idx, dtype=torch.long), torch.tensor(label, dtype=torch.long), stats_tensor
 
             except Exception as e:
                 print(f"Error loading sample {idx}: {e}")
@@ -284,13 +290,18 @@ class PhysioSignalDataset(Dataset):
             # fallback 时固定使用通道 0，避免越界
             safe_channel = 0
             safe_signal = safe_signal[safe_channel:safe_channel+1, :self.signal_len]
+            
+            fs = self.index_data[sample_info['idx']].get('fs', 100)
+            stats = extract_features(safe_signal, safe_channel, fs=fs, item_info=self.index_data[sample_info['idx']])
+            
             # 简单的归一化
             safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
-            return torch.from_numpy(safe_signal).float(), torch.tensor(safe_channel, dtype=torch.long), torch.tensor(0, dtype=torch.long)
+            return torch.from_numpy(safe_signal).float(), torch.tensor(safe_channel, dtype=torch.long), torch.tensor(0, dtype=torch.long), torch.from_numpy(stats)
         except:
             # 极度兜底：返回全一信号而非全零
             fallback_signal = torch.ones((1, self.signal_len), dtype=torch.float32) * 0.01
-            return fallback_signal, torch.tensor(0, dtype=torch.long), torch.tensor(0, dtype=torch.long)
+            fallback_stats = torch.zeros(16, dtype=torch.float32)
+            return fallback_signal, torch.tensor(0, dtype=torch.long), torch.tensor(0, dtype=torch.long), fallback_stats
 
     def _process_signal(self, signal, fixed_start=None):
         """
@@ -326,14 +337,16 @@ class PhysioSignalDataset(Dataset):
 def fixed_channel_collate_fn(batch):
     """
     单通道数据的 Collate Function。
-    Output: (B, 1, L), (B,) channel_ids, (B,) labels
+    Output: (B, 1, L), (B,) channel_ids, (B,) labels, (B, 16) stats
     """
     signals = [item[0] for item in batch]
     channel_ids = [item[1] for item in batch]
     labels = [item[2] for item in batch]
+    stats = [item[3] for item in batch]
 
     padded_signals = torch.stack(signals)  # (B, 1, L)
     channel_ids = torch.stack(channel_ids)  # (B,)
     labels = torch.stack(labels)  # (B,)
+    stats_tensor = torch.stack(stats) # (B, 16)
 
-    return padded_signals, channel_ids, labels
+    return padded_signals, channel_ids, labels, stats_tensor
