@@ -2,8 +2,6 @@ import os
 import argparse
 import yaml
 import json
-import random
-import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,7 +10,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, classification_report, precision_recall_curve, average_precision_score, fbeta_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score, classification_report, precision_recall_curve, average_precision_score, fbeta_score
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import torch.nn.functional as F
@@ -26,58 +24,12 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 from dataset_finetune import DownstreamClassificationDataset
 from model_finetune import TF_MAE_Classifier
-from utils import get_layer_wise_lr
+from utils import get_layer_wise_lr, setup_distributed, cleanup_distributed, is_main_process
+from utils import unwrap_model, set_seed, setup_logger, reduce_tensor, gather_tensors
 
 # -------------------------------------------------------------------
-# 1. DDP 辅助函数
+# 1. DDP 辅助函数 (已迁移至 utils.py)
 # -------------------------------------------------------------------
-def setup_distributed():
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
-        dist.barrier()
-        return local_rank, rank, world_size
-    else:
-        print("Not using distributed mode")
-        return 0, 0, 1
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-def is_main_process():
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-def unwrap_model(model):
-    return model.module if hasattr(model, 'module') else model
-
-def set_seed(seed, deterministic=False):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = deterministic
-    torch.backends.cudnn.benchmark = not deterministic
-
-def setup_logger(save_dir):
-    logger = logging.getLogger("finetune")
-    logger.setLevel(logging.INFO)
-    logger.handlers = []
-    if is_main_process():
-        file_handler = logging.FileHandler(os.path.join(save_dir, "finetune.log"), encoding="utf-8")
-        stream_handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        stream_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        logger.addHandler(stream_handler)
-    else:
-        logger.addHandler(logging.NullHandler())
-    return logger
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_metric, best_threshold, scaler):
     payload = {
@@ -103,41 +55,6 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None):
     if scaler is not None and 'scaler' in checkpoint:
         scaler.load_state_dict(checkpoint['scaler'])
     return checkpoint
-
-def reduce_tensor(tensor):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    rt /= dist.get_world_size()
-    return rt
-
-def gather_tensors(tensor, device):
-    if not dist.is_initialized():
-        return tensor
-    
-    local_size = torch.tensor([tensor.shape[0]], device=device)
-    all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
-    dist.all_gather(all_sizes, local_size)
-    max_size = max([x.item() for x in all_sizes])
-
-    size_diff = max_size - local_size.item()
-    
-    # 确保 tensor 在 GPU 上以支持 NCCL
-    tensor = tensor.to(device)
-    
-    if size_diff > 0:
-        padding = torch.zeros((size_diff, *tensor.shape[1:]), device=device, dtype=tensor.dtype)
-        tensor_padded = torch.cat((tensor, padding))
-    else:
-        tensor_padded = tensor
-
-    gathered_tensors = [torch.zeros_like(tensor_padded) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered_tensors, tensor_padded)
-
-    output = []
-    for i, gathered_tensor in enumerate(gathered_tensors):
-        output.append(gathered_tensor[:all_sizes[i].item()])
-    
-    return torch.cat(output)
 
 # -------------------------------------------------------------------
 # 2. 关键：处理变长通道的 Collate Function (与 Pretrain 保持一致)
@@ -523,7 +440,7 @@ def main():
     if is_main_process():
         os.makedirs(train_cfg['save_dir'], exist_ok=True)
         print(f"World Size: {world_size}, Master running on {device}")
-    logger = setup_logger(train_cfg['save_dir'])
+    logger = setup_logger(train_cfg['save_dir'], name="finetune")
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = train_cfg.get('allow_tf32', True)
         torch.backends.cudnn.allow_tf32 = train_cfg.get('allow_tf32', True)

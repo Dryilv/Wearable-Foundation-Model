@@ -1,12 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from model import CWT_MAE_RoPE, cwt_wrap
-
-def is_main_process():
-    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+from utils import is_main_process
 
 # ===================================================================
 # 1. 隐式思维链模块 (Latent Reasoning / Chain-of-Thought Head)

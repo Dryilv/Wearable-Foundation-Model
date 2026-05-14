@@ -6,15 +6,11 @@ import argparse
 import yaml
 import math
 import time
-import datetime
-import logging
 from pathlib import Path
-from collections import deque, defaultdict
-import matplotlib.pyplot as plt
+from collections import defaultdict
 import numpy as np
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -29,97 +25,15 @@ torch._dynamo.config.suppress_errors = True
 from model import CWT_MAE_RoPE
 from dataset import PhysioSignalDataset, fixed_channel_collate_fn
 from utils_metrics import ExperimentTracker
-from utils import save_reconstruction_images
+from utils import save_reconstruction_images, SmoothedValue, format_time, is_main_process
+from utils import setup_logger, init_distributed_mode
 
 # 启用 TensorFloat-32 (A100/3090/4090 必备加速)
 torch.set_float32_matmul_precision('high') 
 
 # -------------------------------------------------------------------
-# 1. 辅助工具类
+# 1. 辅助工具类 (已迁移至 utils.py)
 # -------------------------------------------------------------------
-class SmoothedValue(object):
-    """用于平滑记录 Loss 和 LR"""
-    def __init__(self, window_size=20, fmt=None):
-        if fmt is None:
-            fmt = "{median:.4f} ({global_avg:.4f})"
-        self.deque = deque(maxlen=window_size)
-        self.total = 0.0
-        self.count = 0
-        self.fmt = fmt
-
-    def update(self, value, n=1):
-        self.deque.append(value)
-        self.count += n
-        self.total += value * n
-
-    @property
-    def median(self):
-        d = torch.tensor(list(self.deque))
-        if d.numel() == 0:
-            return 0.0
-        return d.median().item()
-
-    @property
-    def avg(self):
-        d = torch.tensor(list(self.deque))
-        if d.numel() == 0:
-            return 0.0
-        return d.mean().item()
-
-    @property
-    def global_avg(self):
-        if self.count == 0:
-            return 0.0
-        return self.total / self.count
-
-    def __str__(self):
-        if self.count == 0:
-            return "N/A"
-        return self.fmt.format(
-            median=self.median,
-            avg=self.avg,
-            global_avg=self.global_avg,
-            max=max(self.deque) if len(self.deque) > 0 else 0,
-            value=self.deque[-1] if len(self.deque) > 0 else 0
-        )
-
-def format_time(seconds):
-    time_delta = datetime.timedelta(seconds=int(seconds))
-    return str(time_delta)
-
-def is_main_process():
-    return not dist.is_initialized() or dist.get_rank() == 0
-
-def setup_logger(save_dir):
-    logger = logging.getLogger("CWT-MAE")
-    logger.setLevel(logging.INFO)
-    if logger.hasHandlers():
-        return logger
-    if is_main_process():
-        handler = logging.FileHandler(os.path.join(save_dir, "train.log"))
-        formatter = logging.Formatter('%(asctime)s - %(message)s')
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        console = logging.StreamHandler()
-        console.setFormatter(formatter)
-        logger.addHandler(console)
-    else:
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-def init_distributed_mode():
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        gpu = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(gpu)
-        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank, timeout=datetime.timedelta(minutes=120))
-        dist.barrier()
-        print(f"| distributed init (rank {rank}): success")
-        return gpu, rank, world_size
-    else:
-        print('Not using distributed mode')
-        return 0, 0, 1
 
 # -------------------------------------------------------------------
 # 4. 学习率调度器
@@ -330,7 +244,7 @@ def main():
         # 初始化 Tracker
         tracker = ExperimentTracker(config['train']['save_dir'])
     
-    logger = setup_logger(config['train']['save_dir'])
+    logger = setup_logger(config['train']['save_dir'], name="CWT-MAE")
 
     # 1. Dataset - 使用全部数据作为训练集
     train_dataset = PhysioSignalDataset(

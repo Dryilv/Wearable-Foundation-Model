@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import torch.fft
 
 # ===================================================================
 # 1. CWT 模块 (保持不变，优秀的特征工程)

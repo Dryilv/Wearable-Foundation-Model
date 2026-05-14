@@ -5,12 +5,7 @@ import pickle
 import json
 import os
 import random
-from scipy import signal as scipy_signal
-import torch.distributed as dist
-
-
-def is_main_process():
-    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+from utils import is_main_process
 
 # ===================================================================
 # 1. 通用信号增强器 (适配多通道 & 增强多样性)

@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import os
 import numpy as np
 import logging
+import pickle
+import random
 import torch.distributed as dist
 from collections import deque
 import datetime
@@ -63,8 +65,8 @@ def format_time(seconds):
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
-def setup_logger(save_dir):
-    logger = logging.getLogger("TF-MAE")
+def setup_logger(save_dir, name="TF-MAE"):
+    logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     if logger.hasHandlers():
         return logger
@@ -81,24 +83,152 @@ def setup_logger(save_dir):
         logger.addHandler(logging.NullHandler())
     return logger
 
-def init_distributed_mode():
+def init_distributed_mode(timeout_minutes=120):
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         gpu = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(gpu)
-        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank, timeout=datetime.timedelta(minutes=timeout_minutes))
         dist.barrier()
         print(f"| distributed init (rank {rank}): success")
         return gpu, rank, world_size
     else:
         print('Not using distributed mode')
         return 0, 0, 1
-    
-    
-# In utils.py
 
-import torch
+
+# -------------------------------------------------------------------
+# DDP Utilities
+# -------------------------------------------------------------------
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank():
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
+
+def get_world_size():
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+def setup_distributed():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+        dist.barrier()
+        print(f"| distributed init (rank {rank}): success")
+        return local_rank, rank, world_size
+    else:
+        print("Not using distributed mode")
+        return 0, 0, 1
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def unwrap_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+def reduce_tensor(tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= dist.get_world_size()
+    return rt
+
+def gather_tensors(tensor, device):
+    if not dist.is_initialized():
+        return tensor
+    local_size = torch.tensor([tensor.shape[0]], device=device)
+    all_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
+    dist.all_gather(all_sizes, local_size)
+    max_size = max([x.item() for x in all_sizes])
+    size_diff = max_size - local_size.item()
+    tensor = tensor.to(device)
+    if size_diff > 0:
+        padding = torch.zeros((size_diff, *tensor.shape[1:]), device=device, dtype=tensor.dtype)
+        tensor_padded = torch.cat((tensor, padding))
+    else:
+        tensor_padded = tensor
+    gathered_tensors = [torch.zeros_like(tensor_padded) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered_tensors, tensor_padded)
+    output = []
+    for i, gathered_tensor in enumerate(gathered_tensors):
+        output.append(gathered_tensor[:all_sizes[i].item()])
+    return torch.cat(output)
+
+def all_gather_pyobj(data, device):
+    if not is_dist_avail_and_initialized():
+        return [data]
+    world_size = get_world_size()
+    buffer = pickle.dumps(data)
+    storage = torch.ByteStorage.from_buffer(buffer)
+    tensor = torch.ByteTensor(storage).to(device=device)
+    local_size = torch.tensor([tensor.numel()], device=device, dtype=torch.long)
+    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_list, local_size)
+    max_size = int(torch.stack(size_list).max().item())
+    if tensor.numel() < max_size:
+        pad = torch.zeros(max_size - tensor.numel(), dtype=torch.uint8, device=device)
+        tensor = torch.cat([tensor, pad], dim=0)
+    tensor_list = [torch.empty(max_size, dtype=torch.uint8, device=device) for _ in range(world_size)]
+    dist.all_gather(tensor_list, tensor)
+    data_list = []
+    for t, sz in zip(tensor_list, size_list):
+        n = int(sz.item())
+        bytes_ = t[:n].cpu().numpy().tobytes()
+        data_list.append(pickle.loads(bytes_))
+    return data_list
+
+
+# -------------------------------------------------------------------
+# Signal Processing Utilities
+# -------------------------------------------------------------------
+def check_basic_validity(signal):
+    if len(signal) == 0: return False
+    if not np.isfinite(signal).all(): return False
+    if np.std(signal) < 1e-6: return False
+    return True
+
+def robust_normalize_iqr(segment, iqr_scale=1.5, clip_range=(-20.0, 20.0)):
+    median = np.median(segment, axis=1, keepdims=True)
+    q25 = np.percentile(segment, 25, axis=1, keepdims=True)
+    q75 = np.percentile(segment, 75, axis=1, keepdims=True)
+    iqr_val = q75 - q25
+    iqr_val = np.where(iqr_val < 1e-6, 1.0, iqr_val)
+    segment_norm = (segment - median) / iqr_val
+    segment_norm = np.clip(segment_norm, clip_range[0], clip_range[1])
+    return segment_norm
+
+def robust_normalize_zscore(segment, eps=1e-5, clip_range=(-10.0, 10.0)):
+    mean = np.mean(segment, axis=1, keepdims=True)
+    std = np.std(segment, axis=1, keepdims=True)
+    segment_norm = (segment - mean) / (std + eps)
+    segment_norm = np.clip(segment_norm, clip_range[0], clip_range[1])
+    return segment_norm
+
+
+# -------------------------------------------------------------------
+# Common Training Utilities
+# -------------------------------------------------------------------
+def set_seed(seed, deterministic=False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+def get_amp_dtype():
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+def load_state_dict_ignore_prefix(model, state_dict, prefix='module.'):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace(prefix, '')
+        new_state_dict[name] = v
+    model.load_state_dict(new_state_dict)
 
 def get_layer_wise_lr(model, base_lr, layer_decay):
     param_groups = {}

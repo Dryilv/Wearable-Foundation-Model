@@ -12,89 +12,10 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import autocast 
 
-# 导入 v1 版本的模型定义
 from model_finetune import TF_MAE_Classifier
 from finetune import variable_channel_collate_fn_cls, move_batch_to_device
-
-# ==========================================
-# 1. 基础信号检查 (保持不变)
-# ==========================================
-def check_basic_validity(signal):
-    if len(signal) == 0: return False
-    if not np.isfinite(signal).all(): return False
-    if np.std(signal) < 1e-6: return False 
-    return True
-
-def is_dist_avail_and_initialized():
-    return dist.is_available() and dist.is_initialized()
-
-def get_rank():
-    return dist.get_rank() if is_dist_avail_and_initialized() else 0
-
-def get_world_size():
-    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
-
-def is_main_process():
-    return get_rank() == 0
-
-def setup_distributed():
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        return False, 0, 1, 0
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-    if world_size <= 1:
-        return False, rank, world_size, local_rank
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        backend = "nccl"
-    else:
-        backend = "gloo"
-
-    dist.init_process_group(
-        backend=backend,
-        init_method="env://",
-        world_size=world_size,
-        rank=rank,
-    )
-    dist.barrier()
-    return True, rank, world_size, local_rank
-
-def cleanup_distributed():
-    if is_dist_avail_and_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-def all_gather_pyobj(data, device):
-    if not is_dist_avail_and_initialized():
-        return [data]
-
-    world_size = get_world_size()
-    buffer = pickle.dumps(data)
-    storage = torch.ByteStorage.from_buffer(buffer)
-    tensor = torch.ByteTensor(storage).to(device=device)
-    local_size = torch.tensor([tensor.numel()], device=device, dtype=torch.long)
-
-    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
-    dist.all_gather(size_list, local_size)
-    max_size = int(torch.stack(size_list).max().item())
-
-    if tensor.numel() < max_size:
-        pad = torch.zeros(max_size - tensor.numel(), dtype=torch.uint8, device=device)
-        tensor = torch.cat([tensor, pad], dim=0)
-
-    tensor_list = [torch.empty(max_size, dtype=torch.uint8, device=device) for _ in range(world_size)]
-    dist.all_gather(tensor_list, tensor)
-
-    data_list = []
-    for t, sz in zip(tensor_list, size_list):
-        n = int(sz.item())
-        bytes_ = t[:n].cpu().numpy().tobytes()
-        data_list.append(pickle.loads(bytes_))
-    return data_list
+from utils import check_basic_validity, setup_distributed, cleanup_distributed, is_main_process
+from utils import all_gather_pyobj
 
 def build_balanced_shards(patient_folders, world_size):
     patient_items = []
@@ -286,7 +207,8 @@ def main():
 
     args = parser.parse_args()
 
-    distributed, rank, world_size, local_rank = setup_distributed()
+    local_rank, rank, world_size = setup_distributed()
+    distributed = dist.is_initialized()
     if torch.cuda.is_available():
         device = torch.device("cuda", local_rank if distributed else 0)
     else:

@@ -15,18 +15,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-# 导入项目中现有的模块
 from model_finetune import TF_MAE_Classifier
-from finetune import variable_channel_collate_fn_cls, move_batch_to_device, setup_distributed, cleanup_distributed, is_main_process, reduce_tensor
-
-# ==========================================
-# 1. 基础信号检查
-# ==========================================
-def check_basic_validity(signal):
-    if len(signal) == 0: return False
-    if not np.isfinite(signal).all(): return False
-    if np.std(signal) < 1e-6: return False 
-    return True
+from finetune import variable_channel_collate_fn_cls, move_batch_to_device
+from utils import setup_distributed, cleanup_distributed, is_main_process, reduce_tensor, check_basic_validity
 
 # ==========================================
 # 2. 推理域自适应数据集 (Lazy Loading 懒加载优化版)
