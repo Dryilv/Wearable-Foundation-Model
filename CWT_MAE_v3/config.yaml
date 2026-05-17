@@ -26,7 +26,7 @@ train:
   use_amp: True             
   use_compile: False        # TITAN V 不完全支持 bfloat16 的本地编译，建议关闭
 
-  save_freq: 1             # 改为每轮保存
+  save_freq: 10             # 改为每轮保存
   save_dir: "./checkpoint" 
   resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint/checkpoint_last.pth"                
 
