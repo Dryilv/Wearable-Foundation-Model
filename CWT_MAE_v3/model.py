@@ -122,10 +122,11 @@ class RotaryEmbedding(nn.Module):
             return cos.unsqueeze(2), sin.unsqueeze(2)
             
         seq_len = torch.max(pos_ids) + 1
-        seq_len_val = seq_len.item()
         
-        if seq_len_val > self.max_seq_len:
-            self._update_cache(int(seq_len_val * 1.5))
+        with torch.no_grad():
+            if seq_len > self.max_seq_len:
+                new_len = (seq_len * 3 // 2).int().item()
+                self._update_cache(new_len)
 
         # 【修复】避免在 forward 中覆盖自身 buffer，改为按需转换
         cos = self.cos_cached[pos_ids].to(device=x.device, dtype=x.dtype, non_blocking=True)
