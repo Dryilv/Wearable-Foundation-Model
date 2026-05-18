@@ -6,7 +6,7 @@
 # 1. Training & Optimization
 # ------------------------------------------------------------------------------
 train:
-  epochs: 200               # [建议] MAE 通常需要较长训练周期，100 可能未收敛，建议 200-400
+  epochs: 1000               # [建议] MAE 通常需要较长训练周期，100 可能未收敛，建议 200-400
   
   # [显存优化] 80GB 显卡火力全开
   # 单塔模式下内部 Batch 会翻倍，但 256 依然很轻松。
@@ -18,17 +18,17 @@ train:
   # [学习率调整] 配合较大的 Batch Size
   base_lr: 1.5e-4           # 配合 auto_scale_lr，实际 lr ≈ 1.5e-4 * 256 / 256 = 1.5e-4
   min_lr: 1.0e-6            
-  warmup_epochs: 10         # [建议] 增加预热轮数，保证对比学习初期稳定
+  warmup_epochs: 10         
   auto_scale_lr: True       
 
   weight_decay: 0.05        
   clip_grad: 3.0            
   use_amp: True             
-  use_compile: False        # TITAN V 不完全支持 bfloat16 的本地编译，建议关闭
+  use_compile: True         # TITAN V 不完全支持 bfloat16 的本地编译，建议关闭
 
-  save_freq: 10             # 改为每轮保存
+  save_freq: 50             # 改为每轮保存
   save_dir: "./checkpoint" 
-  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint/checkpoint_last.pth"                
+  resume: ""                
 
 # ------------------------------------------------------------------------------
 # 2. Dataset Configuration
@@ -67,7 +67,7 @@ model:
 
   # --- Signal Difference ---
   use_diff: True
-  diff_loss_weight: [1.0, 0.6, 0.5]
+  diff_loss_weight: [1.0, 0.9, 0.6]
 
   # --- Loss Weighting ---
   time_loss_weight: 1.0     # 时域重建损失权重
