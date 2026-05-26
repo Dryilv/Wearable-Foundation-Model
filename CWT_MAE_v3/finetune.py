@@ -303,8 +303,8 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
 
     if count == 0 or len(local_labels) == 0:
         if is_main_process():
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "Empty validation loader.", fixed_threshold
-        return 0, 0, 0, 0, 0, 0, None, 0
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "Empty validation loader.", fixed_threshold, []
+        return 0, 0, 0, 0, 0, 0, None, 0, []
 
     local_labels = torch.cat(local_labels)
     local_probs = torch.cat(local_probs)
@@ -409,9 +409,9 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
                 if is_main_process():
                     print(f"[Warning] Failed to plot PR curve: {e}")
 
-        return avg_loss, final_acc, precision, recall, final_f1, auroc, report_str, best_threshold
+        return avg_loss, final_acc, precision, recall, final_f1, auroc, report_str, best_threshold, auc_list
     else:
-        return 0, 0, 0, 0, 0, 0, None, 0
+        return 0, 0, 0, 0, 0, 0, None, 0, []
 
 # -------------------------------------------------------------------
 # 主函数
@@ -750,7 +750,7 @@ def main():
         
         # scheduler.step() # Moved to per-step inside train_one_epoch
 
-        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th = validate(
+        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc, val_report, best_th, val_auc_list = validate(
             model, val_loader, criterion, device, data_cfg['num_classes'], 
             total_len=val_dataset_len, 
             use_amp=use_amp,
@@ -770,6 +770,10 @@ def main():
                 print(f"Applied Thresholds: {np.round(best_th, 2).tolist()}")
             print(f"{eval_split_name}准确率 (Accuracy): {val_acc:.4f}")
             print(f"AUC Score: {val_auc:.4f}")
+            if len(val_auc_list) > 0:
+                print(f"每类 AUC:")
+                for i, auc_val in enumerate(val_auc_list):
+                    print(f"  类别 {i}: {auc_val:.4f}")
             print("-" * 60)
             print(f"{eval_split_name}分类报告 (Classification Report):")
             print(val_report)
@@ -802,7 +806,8 @@ def main():
             )
         if is_main_process():
             th_str = str(np.round(best_th, 4).tolist()) if isinstance(best_th, np.ndarray) else f"{best_th:.4f}"
-            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} lr={optimizer.param_groups[0]['lr']:.8e} th={th_str}")
+            auc_str = str([round(a, 4) for a in val_auc_list]) if isinstance(val_auc_list, list) else "[]"
+            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} val_auc_per_class={auc_str} lr={optimizer.param_groups[0]['lr']:.8e} th={th_str}")
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             if is_main_process():
                 print(f"Early stopping triggered at epoch {epoch+1}")
@@ -826,7 +831,7 @@ def main():
         print(f"Best threshold saved to: {threshold_path}")
 
     if not threshold_calibration_only:
-        test_loss, test_acc, test_prec, test_rec, test_f1, test_auc, test_report, _ = validate(
+        test_loss, test_acc, test_prec, test_rec, test_f1, test_auc, test_report, _, test_auc_list = validate(
             model, test_loader, criterion, device, data_cfg['num_classes'],
             total_len=test_dataset_len,
             use_amp=use_amp,
@@ -851,10 +856,16 @@ def main():
                 print(f"Test Applied Thresholds: {np.round(best_threshold, 2).tolist()}")
             print(f"最终测试集准确率 (Accuracy): {test_acc:.4f}")
             print(f"AUC Score: {test_auc:.4f}")
+            if len(test_auc_list) > 0:
+                print(f"每类 AUC:")
+                for i, auc_val in enumerate(test_auc_list):
+                    print(f"  类别 {i}: {auc_val:.4f}")
             print("-" * 60)
-            print("最终测试集分类报告 (Classification Report):")
+            print(f"最终测试集分类报告 (Classification Report):")
             print(test_report)
             print("-" * 60)
+            test_auc_str = str([round(a, 4) for a in test_auc_list]) if isinstance(test_auc_list, list) else "[]"
+            logger.info(f"final_test test_loss={test_loss:.6f} test_acc={test_acc:.6f} test_f0.5={test_f1:.6f} test_auc={test_auc:.6f} test_auc_per_class={test_auc_str} best_epoch={best_epoch}")
     
     cleanup_distributed()
 
