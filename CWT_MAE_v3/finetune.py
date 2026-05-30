@@ -213,6 +213,56 @@ class MultiLabelFocalLoss(nn.Module):
         else:
             return loss
 
+class AsymmetricLoss(nn.Module):
+    """
+    Asymmetric Loss for Multi-Label Classification
+    From: "Asymmetric Loss For Multi-Label Classification" (Ben-Baruch et al., 2021)
+
+    Key ideas:
+      - Asymmetric focusing: gamma_neg > gamma_pos, so easy negatives are
+        down-weighted much more aggressively than easy positives.
+      - Probability shifting (margin m): for negative samples, max(p - m, 0)
+        eliminates the loss contribution from very-low-probability negatives.
+    """
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8,
+                 disable_torch_grad_focal_loss=False, pos_weight=None):
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+        self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
+        if pos_weight is not None:
+            self.register_buffer('pos_weight', pos_weight)
+        else:
+            self.pos_weight = None
+
+    def forward(self, logits, targets):
+        xs_pos = logits
+        xs_neg = -logits + self.clip
+
+        los_pos = targets * F.logsigmoid(xs_pos)
+        los_neg = (1 - targets) * F.logsigmoid(xs_neg)
+
+        if self.gamma_pos > 0:
+            pt_pos = torch.sigmoid(-xs_pos)
+            if self.disable_torch_grad_focal_loss:
+                pt_pos = pt_pos.detach()
+            los_pos = los_pos * (pt_pos ** self.gamma_pos)
+
+        if self.gamma_neg > 0:
+            pt_neg = torch.sigmoid(xs_neg)
+            if self.disable_torch_grad_focal_loss:
+                pt_neg = pt_neg.detach()
+            los_neg = los_neg * (pt_neg ** self.gamma_neg)
+
+        loss = los_pos + los_neg
+
+        if self.pos_weight is not None:
+            loss = loss * self.pos_weight
+
+        return -loss.sum(dim=-1).mean()
+
 
 def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, grad_clip_norm=3.0, scheduler=None):
     model.train()
@@ -626,6 +676,11 @@ def main():
     else:
         scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg['min_lr'])
     
+    # Resolve loss type: explicit 'loss_type' takes priority, else fall back to 'use_focal_loss' flag
+    loss_type = train_cfg.get('loss_type', None)
+    if loss_type is None:
+        loss_type = 'focal' if train_cfg.get('use_focal_loss') else 'bce'
+
     if train_cfg.get('pos_weight') == 'auto':
         if is_main_process():
             print("Calculating pos_weight for multi-label BCE automatically...")
@@ -678,34 +733,35 @@ def main():
             
         if dist.is_initialized():
             dist.broadcast(weights_tensor, src=0)
-            
-        if train_cfg.get('use_focal_loss'):
-            criterion = MultiLabelFocalLoss(pos_weight=weights_tensor)
-            if is_main_process():
-                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  auto pos_weight: {weights_tensor.tolist()}")
-        else:
-            criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor)
-            if is_main_process():
-                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  auto pos_weight: {weights_tensor.tolist()}")
     elif train_cfg.get('pos_weight') is not None:
-        weights = torch.tensor(train_cfg['pos_weight'], dtype=torch.float32).to(device)
-        if train_cfg.get('use_focal_loss'):
-            criterion = MultiLabelFocalLoss(pos_weight=weights)
-            if is_main_process():
-                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  config pos_weight: {weights.tolist()}")
-        else:
-            criterion = nn.BCEWithLogitsLoss(pos_weight=weights)
-            if is_main_process():
-                print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  config pos_weight: {weights.tolist()}")
+        weights_tensor = torch.tensor(train_cfg['pos_weight'], dtype=torch.float32).to(device)
     else:
-        if train_cfg.get('use_focal_loss'):
-            criterion = MultiLabelFocalLoss()
-            if is_main_process():
-                print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  pos_weight: None")
-        else:
-            criterion = nn.BCEWithLogitsLoss()
-            if is_main_process():
-                print("Loss Details:\n  Type: BCEWithLogitsLoss\n  pos_weight: None")
+        weights_tensor = None
+
+    if loss_type == 'asl':
+        asl_cfg = train_cfg.get('asl', {})
+        criterion = AsymmetricLoss(
+            gamma_neg=asl_cfg.get('gamma_neg', 4),
+            gamma_pos=asl_cfg.get('gamma_pos', 1),
+            clip=asl_cfg.get('clip', 0.05),
+            disable_torch_grad_focal_loss=asl_cfg.get('disable_torch_grad_focal_loss', False),
+            pos_weight=weights_tensor
+        )
+        if is_main_process():
+            print(f"Loss Details:\n  Type: AsymmetricLoss\n  gamma_neg: {criterion.gamma_neg}\n  gamma_pos: {criterion.gamma_pos}\n  clip: {criterion.clip}\n  pos_weight: {'auto' if train_cfg.get('pos_weight') == 'auto' else train_cfg.get('pos_weight')}")
+    elif loss_type == 'focal':
+        focal_cfg = train_cfg.get('focal', {})
+        criterion = MultiLabelFocalLoss(
+            gamma=focal_cfg.get('gamma', 2.0),
+            alpha=focal_cfg.get('alpha', None),
+            pos_weight=weights_tensor
+        )
+        if is_main_process():
+            print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  pos_weight: {'auto' if train_cfg.get('pos_weight') == 'auto' else train_cfg.get('pos_weight')}")
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor) if weights_tensor is not None else nn.BCEWithLogitsLoss()
+        if is_main_process():
+            print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  pos_weight: {'auto' if train_cfg.get('pos_weight') == 'auto' else train_cfg.get('pos_weight')}")
 
     best_metric = float("-inf")
     best_threshold = np.array([0.5] * data_cfg['num_classes']) if data_cfg['num_classes'] > 2 else 0.5

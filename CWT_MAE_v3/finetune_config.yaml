@@ -14,8 +14,24 @@ train:
   layer_decay: 0.65
 
   # ===== 损失函数配置 =====
+  # loss_type: "bce" | "focal" | "asl"  (若未指定, 回退至 use_focal_loss 标记)
+  loss_type: "asl"
   use_focal_loss: false
   pos_weight: "auto"
+
+  # ---------- Asymmetric Loss (ASL) 参数 ----------
+  # 仅在 loss_type: "asl" 时生效
+  asl:
+    gamma_neg: 4       # 负样本聚焦系数 (通常 > gamma_pos)
+    gamma_pos: 1       # 正样本聚焦系数
+    clip: 0.05          # 概率偏移量 (margin m), 消除极易负样本的贡献
+    disable_torch_grad_focal_loss: false
+
+  # ---------- Focal Loss 参数 ----------
+  # 仅在 loss_type: "focal" 时生效
+  focal:
+    gamma: 2.0
+    alpha: null         # float 或 null
 
   # ===== 训练稳定性与加速 =====
   use_amp: true
