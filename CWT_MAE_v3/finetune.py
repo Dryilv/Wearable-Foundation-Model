@@ -238,20 +238,22 @@ class AsymmetricLoss(nn.Module):
             self.pos_weight = None
 
     def forward(self, logits, targets):
-        xs_pos = logits
-        xs_neg = -logits + self.clip
+        p = torch.sigmoid(logits)
 
-        los_pos = targets * F.logsigmoid(xs_pos)
-        los_neg = (1 - targets) * F.logsigmoid(xs_neg)
+        los_pos = targets * F.logsigmoid(logits)
 
         if self.gamma_pos > 0:
-            pt_pos = torch.sigmoid(-xs_pos)
+            pt_pos = (1 - p)
             if self.disable_torch_grad_focal_loss:
                 pt_pos = pt_pos.detach()
             los_pos = los_pos * (pt_pos ** self.gamma_pos)
 
+        p_m = torch.clamp(p - self.clip, min=0.0)
+
+        los_neg = (1 - targets) * torch.log(torch.clamp(1 - p_m, min=self.eps))
+
         if self.gamma_neg > 0:
-            pt_neg = torch.sigmoid(xs_neg)
+            pt_neg = p_m
             if self.disable_torch_grad_focal_loss:
                 pt_neg = pt_neg.detach()
             los_neg = los_neg * (pt_neg ** self.gamma_neg)
