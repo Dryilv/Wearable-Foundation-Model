@@ -13,7 +13,8 @@ class LatentReasoningHead(nn.Module):
                  num_reasoning_tokens=32,
                  num_kv_layers=1,
                  dropout=0.1,
-                 drop_path=0.0):
+                 drop_path=0.0,
+                 init_reasoning_token=None):
         super().__init__()
         self.num_reasoning_tokens = num_reasoning_tokens
         self.embed_dim = embed_dim
@@ -22,6 +23,13 @@ class LatentReasoningHead(nn.Module):
         effective_dim = embed_dim * num_kv_layers
 
         self.reasoning_tokens = nn.Parameter(torch.zeros(1, num_reasoning_tokens, embed_dim))
+
+        if init_reasoning_token is not None:
+            init_data = init_reasoning_token.expand(-1, num_reasoning_tokens, -1).contiguous()
+            with torch.no_grad():
+                self.reasoning_tokens.data = init_data.clone()
+        else:
+            nn.init.normal_(self.reasoning_tokens, std=0.02)
 
         self.cross_attn_q_proj = nn.Linear(embed_dim, embed_dim)
         self.cross_attn_kv_proj = nn.Linear(effective_dim, embed_dim * 2)
@@ -48,7 +56,6 @@ class LatentReasoningHead(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self._init_weights()
-        nn.init.normal_(self.reasoning_tokens, std=0.02)
         nn.init.trunc_normal_(self.pool_query, std=0.02)
 
     def _init_weights(self):
@@ -117,7 +124,13 @@ class TF_MAE_Classifier(nn.Module):
             self._load_pretrained_weights(pretrained_path)
         
         self._delete_decoder_components()
-        
+
+        pretrained_cls = None
+        if hasattr(self.encoder_model, 'cls_token') and self.encoder_model.cls_token is not None:
+            pretrained_cls = self.encoder_model.cls_token.data.clone().detach()
+            if is_main_process():
+                print(">>> Using pretrained cls_token to initialize reasoning tokens.")
+
         classifier_in_dim = self.embed_dim
         if self.use_stats_features:
             classifier_in_dim += 16
@@ -133,7 +146,8 @@ class TF_MAE_Classifier(nn.Module):
                 num_reasoning_tokens=num_reasoning_tokens,
                 num_kv_layers=num_kv_layers,
                 dropout=0.2,
-                drop_path=kwargs.get('drop_path_rate', 0.0)
+                drop_path=kwargs.get('drop_path_rate', 0.0),
+                init_reasoning_token=pretrained_cls
             )
             if self.use_stats_features:
                 self.head.classifier = nn.Linear(self.embed_dim + 16, num_classes)
@@ -149,7 +163,10 @@ class TF_MAE_Classifier(nn.Module):
             'decoder_blocks', 'decoder_embed', 'decoder_pred_spec',
             'time_reducer', 'time_pred', 'mask_token',
             'decoder_pos_embed', 'rope_decoder', 'decoder_norm',
-            'decoder_channel_embed', 'channel_embed' 
+            'decoder_channel_embed', 'channel_embed',
+            'teacher_blocks', 'teacher_norm',
+            'student_projector', 'student_predictor', 'teacher_projector',
+            'augment',
         ]
         
         for component in components_to_delete:

@@ -26,7 +26,7 @@ from model import CWT_MAE_RoPE
 from dataset import PhysioSignalDataset, fixed_channel_collate_fn
 from utils_metrics import ExperimentTracker
 from utils import save_reconstruction_images, SmoothedValue, format_time, is_main_process
-from utils import setup_logger, init_distributed_mode
+from utils import setup_logger, init_distributed_mode, update_teacher
 
 # 启用 TensorFloat-32 (A100/3090/4090 必备加速)
 torch.set_float32_matmul_precision('high') 
@@ -63,6 +63,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     metric_logger['loss_spec'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_time'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['loss_stats'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
+    metric_logger['loss_contrast'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
     metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     metric_logger['grad_norm'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
     metric_logger['throughput'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
@@ -145,6 +146,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             loss_spec_val = loss_dict.get('loss_spec', torch.tensor(0.0)).item()
             loss_time_val = loss_dict.get('loss_time', torch.tensor(0.0)).item()
             loss_stats_val = loss_dict.get('loss_stats', torch.tensor(0.0)).item()
+            loss_contrast_val = loss_dict.get('loss_contrast', torch.tensor(0.0)).item()
             
             if not math.isfinite(loss_value):
                 print(f"Loss is {loss_value}, stopping training")
@@ -165,6 +167,11 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             optimizer.zero_grad(set_to_none=True)
             
             metric_logger['grad_norm'].update(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+
+            real_model = model.module if hasattr(model, 'module') else model
+            if hasattr(real_model, '_orig_mod'):
+                real_model = real_model._orig_mod
+            update_teacher(real_model, real_model.ema_decay)
         else:
             # 如果没有 sync，grad_norm 暂不更新或保持上一次的值
             pass
@@ -178,6 +185,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         metric_logger['loss_spec'].update(loss_spec_val)
         metric_logger['loss_time'].update(loss_time_val)
         metric_logger['loss_stats'].update(loss_stats_val)
+        metric_logger['loss_contrast'].update(loss_contrast_val)
         metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
         metric_logger['throughput'].update(throughput)
 
@@ -207,6 +215,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
                 f"Spec: {metric_logger['loss_spec']} "
                 f"Time: {metric_logger['loss_time']} "
                 f"Stats: {metric_logger['loss_stats']} "
+                f"Contrast: {metric_logger['loss_contrast']} "
                 f"LR: {metric_logger['lr']} "
                 f"Grad: {metric_logger['grad_norm']} "
                 f"Speed: {metric_logger['throughput'].avg:.1f} samples/s "
@@ -222,6 +231,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         'loss_spec': metric_logger['loss_spec'].global_avg,
         'loss_time': metric_logger['loss_time'].global_avg,
         'loss_stats': metric_logger['loss_stats'].global_avg,
+        'loss_contrast': metric_logger['loss_contrast'].global_avg,
         'grad_norm': metric_logger['grad_norm'].global_avg,
         'throughput': metric_logger['throughput'].global_avg * (dist.get_world_size() if dist.is_initialized() else 1)
     }
@@ -318,7 +328,8 @@ def main():
         'time_loss_weight': config['model'].get('time_loss_weight', 1.0),
         'use_diff': config['model'].get('use_diff', False),
         'diff_loss_weight': config['model'].get('diff_loss_weight', None),
-        'stats_loss_weight': config['model'].get('stats_loss_weight', 1.0)
+        'stats_loss_weight': config['model'].get('stats_loss_weight', 1.0),
+        'contrast_loss_weight': config['model'].get('contrast_loss_weight', 1.0)
     }
 
     if is_main_process():
@@ -425,6 +436,7 @@ def main():
                 'loss_spec': train_metrics['loss_spec'],
                 'loss_time': train_metrics['loss_time'],
                 'loss_stats': train_metrics['loss_stats'],
+                'loss_contrast': train_metrics['loss_contrast'],
                 'grad_norm': train_metrics['grad_norm'],
                 'gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 / 1024,
                 'throughput': train_metrics['throughput'],

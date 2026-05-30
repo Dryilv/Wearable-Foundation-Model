@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import copy
 
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
@@ -17,6 +18,47 @@ class DropPath(nn.Module):
         random_tensor = torch.floor(random_tensor + keep_prob)
         output = x / keep_prob * random_tensor
         return output
+
+# ===================================================================
+# 0. CMAE 新增组件：生理信号增广 + 投影头
+# ===================================================================
+class PhysioAugment(nn.Module):
+    def __init__(self, jitter_std=0.02, scale_range=(0.85, 1.15),
+                 max_shift=50, wander_amp=0.05):
+        super().__init__()
+        self.jitter_std = jitter_std
+        self.scale_range = scale_range
+        self.max_shift = max_shift
+        self.wander_amp = wander_amp
+
+    @torch.no_grad()
+    def forward(self, x):
+        squeeze = (x.dim() == 2)
+        if squeeze:
+            x = x.unsqueeze(1)
+        B, M, L = x.shape
+        s = torch.empty(B, M, 1, device=x.device).uniform_(*self.scale_range)
+        x = x * s
+        x = x + torch.randn_like(x) * self.jitter_std
+        t = torch.linspace(0, 1, L, device=x.device)
+        f = torch.rand(B, M, 1, device=x.device) * 2 + 0.5
+        ph = torch.rand(B, M, 1, device=x.device) * 6.283
+        x = x + self.wander_amp * torch.sin(2 * math.pi * f * t + ph)
+        shift = int(torch.randint(-self.max_shift, self.max_shift + 1, (1,)).item())
+        x = torch.roll(x, shifts=shift, dims=-1)
+        return x.squeeze(1) if squeeze else x
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, dim, hidden=2048, out=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden), nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Linear(hidden, out)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 # ===================================================================
 # 1. CWT 模块 (保持不变，优秀的特征工程)
@@ -298,6 +340,7 @@ class CWT_MAE_RoPE(nn.Module):
         norm_layer=nn.LayerNorm,
         time_loss_weight=1.0,
         stats_loss_weight=1.0,
+        contrast_loss_weight=1.0,
         use_diff=False,
         diff_loss_weight=None,
         max_modalities=16,
@@ -378,14 +421,35 @@ class CWT_MAE_RoPE(nn.Module):
         )
         self.stats_loss_weight = stats_loss_weight
 
+        self.register_buffer('stats_running_mean', torch.zeros(16))
+        self.register_buffer('stats_running_var', torch.ones(16))
+        self.stats_momentum = 0.01
+
+        self.contrast_loss_weight = contrast_loss_weight
+        self.ema_decay = 0.999
+
+        self.augment = PhysioAugment()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        self.student_projector = ProjectionHead(embed_dim, hidden=2048, out=256)
+        self.student_predictor = ProjectionHead(256, hidden=1024, out=256)
+        self.teacher_projector = ProjectionHead(embed_dim, hidden=2048, out=256)
+
+        self.teacher_blocks = nn.ModuleList([
+            TrueFactorizedBlock(embed_dim, num_heads, drop_path=0.0, norm_layer=norm_layer)
+            for _ in range(depth)
+        ])
+        self.teacher_norm = norm_layer(embed_dim)
+
         self.initialize_weights()
+        self._init_teacher()
 
     def initialize_weights(self):
         torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.decoder_pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.mask_token, std=.02)
-        # 【新增】初始化通道类型 Embedding
         torch.nn.init.trunc_normal_(self.channel_type_embed.weight, std=.02)
+        torch.nn.init.trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -395,6 +459,36 @@ class CWT_MAE_RoPE(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    def _init_teacher(self):
+        for ps, pt in zip(self.blocks.parameters(), self.teacher_blocks.parameters()):
+            pt.data.copy_(ps.data)
+        for ps, pt in zip(self.norm.parameters(), self.teacher_norm.parameters()):
+            pt.data.copy_(ps.data)
+        for ps, pt in zip(self.student_projector.parameters(), self.teacher_projector.parameters()):
+            pt.data.copy_(ps.data)
+        for p in self.teacher_blocks.parameters():
+            p.requires_grad_(False)
+        for p in self.teacher_norm.parameters():
+            p.requires_grad_(False)
+        for p in self.teacher_projector.parameters():
+            p.requires_grad_(False)
+
+    def student_encoder_params(self):
+        for p in self.blocks.parameters():
+            yield p
+        for p in self.norm.parameters():
+            yield p
+        for p in self.student_projector.parameters():
+            yield p
+
+    def teacher_encoder_params(self):
+        for p in self.teacher_blocks.parameters():
+            yield p
+        for p in self.teacher_norm.parameters():
+            yield p
+        for p in self.teacher_projector.parameters():
+            yield p
 
     def tubelet_masking(self, x, mask_ratio, M, N_patches, noise_w=None):
         B, _, D = x.shape
@@ -544,6 +638,58 @@ class CWT_MAE_RoPE(nn.Module):
             return x_masked, mask, global_ids_restore, M, intermediate_features
         return x_masked, mask, global_ids_restore, M
 
+    def forward_encoder_teacher(self, x_raw, imgs, channel_ids):
+        B, M, C, H, W = imgs.shape
+        max_id = self.channel_type_embed.num_embeddings - 1
+        assert (channel_ids >= 0).all() and (channel_ids <= max_id).all()
+
+        x_cwt = imgs.reshape(B * M, C, H, W)
+        x_cwt = self.patch_embed(x_cwt)
+
+        if x_raw.dim() == 2:
+            x_raw = x_raw.unsqueeze(1)
+        x_raw = x_raw.reshape(B * M, 1, -1)
+        mean_raw = x_raw.mean(dim=-1, keepdim=True)
+        std_raw = torch.clamp(x_raw.std(dim=-1, keepdim=True), min=1e-5)
+        x_raw_norm = (x_raw - mean_raw) / std_raw
+        x_raw_embed = self.raw_patch_embed(x_raw_norm.to(dtype=next(self.parameters()).dtype))
+
+        H_grid, W_grid = self.grid_size
+        D = x_cwt.shape[-1]
+        x_cwt_2d = x_cwt.reshape(B * M, H_grid, W_grid, D)
+        x_raw_2d = x_raw_embed.unsqueeze(1)
+        raw_scale = self.raw_signal_scale.to(x_raw_2d.device) if self.raw_signal_scale.device != x_raw_2d.device else self.raw_signal_scale
+        x_fused = x_cwt_2d + x_raw_2d * raw_scale
+
+        if channel_ids.dim() == 1:
+            ch_embed = self.channel_type_embed(channel_ids)
+            ch_embed = ch_embed.unsqueeze(1).unsqueeze(1)
+            ch_embed = ch_embed.expand(-1, M, -1, -1)
+        else:
+            M_ids = channel_ids.shape[1]
+            if M_ids != M:
+                if M_ids < M:
+                    channel_ids = torch.nn.functional.pad(channel_ids, (0, M - M_ids), value=0)
+                else:
+                    channel_ids = channel_ids[:, :M]
+            ch_embed = self.channel_type_embed(channel_ids)
+            ch_embed = ch_embed.unsqueeze(2)
+        x_fused = x_fused + ch_embed
+
+        x = x_fused.reshape(B, M, -1, D)
+        N_patches = x.shape[2]
+        x = x + self.pos_embed.unsqueeze(1).to(x.device)
+        x = x.reshape(B, M * N_patches, -1)
+
+        pos_ids_flat = torch.arange(N_patches, device=x.device) % W_grid
+        pos_ids_flat = pos_ids_flat.unsqueeze(0).expand(B, -1)
+        rope_cos, rope_sin = self.rope_encoder(x, pos_ids_flat)
+
+        for blk in self.teacher_blocks:
+            x = blk(x, M, N_patches, rope_cos=rope_cos, rope_sin=rope_sin)
+        x = self.teacher_norm(x)
+        return x
+
     def forward_decoder(self, x, ids_restore, M):
         x = self.decoder_embed(x)
         B, _, D_dec = x.shape
@@ -674,10 +820,15 @@ class CWT_MAE_RoPE(nn.Module):
                 mask_raw = mask_raw[..., :L_dim]
                 
             if x.dim() == 2:
-                x_masked = x.unsqueeze(1) * mask_raw
+                x_exp = x.unsqueeze(1)
+                x_visible = x_exp * mask_raw
+                local_mean = x_visible.sum(dim=-1, keepdim=True) / (mask_raw.sum(dim=-1, keepdim=True) + 1e-8)
+                x_masked = x_visible + local_mean * (1 - mask_raw)
                 x_masked = x_masked.squeeze(1)
             else:
-                x_masked = x * mask_raw
+                x_visible = x * mask_raw
+                local_mean = x_visible.sum(dim=-1, keepdim=True) / (mask_raw.sum(dim=-1, keepdim=True) + 1e-8)
+                x_masked = x_visible + local_mean * (1 - mask_raw)
         else:
             x_masked = x
             noise_w = None
@@ -722,18 +873,32 @@ class CWT_MAE_RoPE(nn.Module):
         
         if stats_target is not None:
             stats_target = stats_target.float()
-            # 解决统计量量级过大导致 Loss 爆炸的问题：进行 Batch 级 Z-Score 归一化
-            # 使得目标特征分布在均值 0，方差 1 附近，从而使 MSE/SmoothL1 Loss 降到 1.0 左右的合理区间
-            stats_mean = stats_target.mean(dim=0, keepdim=True)
-            stats_std = stats_target.std(dim=0, keepdim=True).clamp(min=1e-5)
-            stats_target_norm = (stats_target - stats_mean) / stats_std
-            
-            # 为了防止异常极值，进行裁剪
+            if self.training:
+                with torch.no_grad():
+                    batch_mean = stats_target.mean(dim=0)
+                    batch_var = stats_target.var(dim=0, unbiased=False)
+                    self.stats_running_mean = (1 - self.stats_momentum) * self.stats_running_mean + self.stats_momentum * batch_mean
+                    self.stats_running_var = (1 - self.stats_momentum) * self.stats_running_var + self.stats_momentum * batch_var
+            stats_target_norm = (stats_target - self.stats_running_mean) / torch.sqrt(self.stats_running_var + 1e-5)
             stats_target_norm = torch.clamp(stats_target_norm, min=-10.0, max=10.0)
-            
+
             loss_stats = self.forward_loss_stats(pred_stats, stats_target_norm)
             loss = loss + self.stats_loss_weight * loss_stats
             loss_dict['loss_stats'] = loss_stats
+
+        if self.training and self.contrast_loss_weight > 0:
+            z_student = self.student_predictor(self.student_projector(latent_pooled))
+            with torch.no_grad():
+                x_teacher = self.augment(x)
+                imgs_teacher = self.prepare_tokens(x_teacher)
+                t_latent = self.forward_encoder_teacher(x_teacher, imgs_teacher, channel_ids)
+                t_pooled = t_latent.mean(dim=1)
+                z_teacher = self.teacher_projector(t_pooled)
+            loss_contrast = 2 - 2 * F.cosine_similarity(
+                F.normalize(z_student, dim=-1),
+                F.normalize(z_teacher, dim=-1), dim=-1).mean()
+            loss = loss + self.contrast_loss_weight * loss_contrast
+            loss_dict['loss_contrast'] = loss_contrast
 
         return loss, loss_dict, pred_spec, pred_time, imgs_target, mask, latent, pred_stats
 

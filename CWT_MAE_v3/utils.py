@@ -223,6 +223,11 @@ def set_seed(seed, deterministic=False):
 def get_amp_dtype():
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
+@torch.no_grad()
+def update_teacher(model, decay=0.999):
+    for ps, pt in zip(model.student_encoder_params(), model.teacher_encoder_params()):
+        pt.data.mul_(decay).add_(ps.data, alpha=1 - decay)
+
 def load_state_dict_ignore_prefix(model, state_dict, prefix='module.'):
     new_state_dict = {}
     for k, v in state_dict.items():

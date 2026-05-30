@@ -72,4 +72,5 @@ model:
   # --- Loss Weighting ---
   time_loss_weight: 1.0     # 时域重建损失权重
   stats_loss_weight: 1.0    # 统计量预测损失权重
+  contrast_loss_weight: 1.0 # CMAE 对比损失权重
   
