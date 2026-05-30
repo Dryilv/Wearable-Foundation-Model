@@ -681,9 +681,10 @@ def main():
     if loss_type is None:
         loss_type = 'focal' if train_cfg.get('use_focal_loss') else 'bce'
 
+    loss_label = {'asl': 'AsymmetricLoss', 'focal': 'MultiLabelFocalLoss'}.get(loss_type, 'BCEWithLogitsLoss')
     if train_cfg.get('pos_weight') == 'auto':
         if is_main_process():
-            print("Calculating pos_weight for multi-label BCE automatically...")
+            print(f"Calculating pos_weight for {loss_label} automatically...")
             if isinstance(train_ds, Subset):
                 indices = train_ds.indices
                 base_ds = train_ds.dataset
@@ -738,6 +739,11 @@ def main():
     else:
         weights_tensor = None
 
+    def _fmt_pos_weight(w):
+        if w is None:
+            return "None"
+        return str([round(v, 2) for v in w.cpu().tolist()])
+
     if loss_type == 'asl':
         asl_cfg = train_cfg.get('asl', {})
         criterion = AsymmetricLoss(
@@ -748,7 +754,7 @@ def main():
             pos_weight=weights_tensor
         )
         if is_main_process():
-            print(f"Loss Details:\n  Type: AsymmetricLoss\n  gamma_neg: {criterion.gamma_neg}\n  gamma_pos: {criterion.gamma_pos}\n  clip: {criterion.clip}\n  pos_weight: {'auto' if train_cfg.get('pos_weight') == 'auto' else train_cfg.get('pos_weight')}")
+            print(f"Loss: AsymmetricLoss | gamma_neg={criterion.gamma_neg} gamma_pos={criterion.gamma_pos} clip={criterion.clip} | pos_weight={_fmt_pos_weight(weights_tensor)}")
     elif loss_type == 'focal':
         focal_cfg = train_cfg.get('focal', {})
         criterion = MultiLabelFocalLoss(
@@ -757,11 +763,11 @@ def main():
             pos_weight=weights_tensor
         )
         if is_main_process():
-            print(f"Loss Details:\n  Type: MultiLabelFocalLoss\n  gamma: {criterion.gamma}\n  alpha: {criterion.alpha}\n  pos_weight: {'auto' if train_cfg.get('pos_weight') == 'auto' else train_cfg.get('pos_weight')}")
+            print(f"Loss: MultiLabelFocalLoss | gamma={criterion.gamma} alpha={criterion.alpha} | pos_weight={_fmt_pos_weight(weights_tensor)}")
     else:
         criterion = nn.BCEWithLogitsLoss(pos_weight=weights_tensor) if weights_tensor is not None else nn.BCEWithLogitsLoss()
         if is_main_process():
-            print(f"Loss Details:\n  Type: BCEWithLogitsLoss\n  pos_weight: {'auto' if train_cfg.get('pos_weight') == 'auto' else train_cfg.get('pos_weight')}")
+            print(f"Loss: BCEWithLogitsLoss | pos_weight={_fmt_pos_weight(weights_tensor)}")
 
     best_metric = float("-inf")
     best_threshold = np.array([0.5] * data_cfg['num_classes']) if data_cfg['num_classes'] > 2 else 0.5
