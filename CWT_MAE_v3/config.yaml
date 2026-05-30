@@ -28,7 +28,7 @@ train:
 
   save_freq: 50             # 改为每轮保存
   save_dir: "./checkpoint" 
-  resume: ""                
+  resume: "/home/bml/storage/mnt/v-044d0fb740b04ad3/org/WFM/vit16trans/CWT_MAE_v3/checkpoint/checkpoint_last.pth"                
 
 # ------------------------------------------------------------------------------
 # 2. Dataset Configuration
