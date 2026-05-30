@@ -22,7 +22,6 @@ class LatentReasoningHead(nn.Module):
         effective_dim = embed_dim * num_kv_layers
 
         self.reasoning_tokens = nn.Parameter(torch.zeros(1, num_reasoning_tokens, embed_dim))
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
         self.cross_attn_q_proj = nn.Linear(embed_dim, embed_dim)
         self.cross_attn_kv_proj = nn.Linear(effective_dim, embed_dim * 2)
@@ -40,15 +39,9 @@ class LatentReasoningHead(nn.Module):
         )
         self.norm3 = nn.LayerNorm(embed_dim)
 
-        self.cls_cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
-        self.norm_cls1 = nn.LayerNorm(embed_dim)
-        self.norm_cls2 = nn.LayerNorm(embed_dim)
-        self.cls_ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim * 4, embed_dim)
-        )
+        self.pool_query = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pool_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.pool_norm = nn.LayerNorm(embed_dim)
 
         self.classifier = nn.Linear(embed_dim, num_classes)
 
@@ -56,7 +49,7 @@ class LatentReasoningHead(nn.Module):
 
         self._init_weights()
         nn.init.normal_(self.reasoning_tokens, std=0.02)
-        nn.init.normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pool_query, std=0.02)
 
     def _init_weights(self):
         for p in self.parameters():
@@ -88,14 +81,9 @@ class LatentReasoningHead(nn.Module):
 
         queries = self.norm3(queries + self.drop_path(self.ffn(queries)))
 
-        cls = self.cls_token.expand(B, -1, -1)
-        cls_attn, _ = self.cls_cross_attn(
-            query=cls, key=queries, value=queries
-        )
-        cls = self.norm_cls1(cls + self.drop_path(cls_attn))
-        cls = self.norm_cls2(cls + self.drop_path(self.cls_ffn(cls)))
-
-        decision_token = cls.squeeze(1)
+        q = self.pool_query.expand(B, -1, -1)
+        pooled, _ = self.pool_attn(q, queries, queries)
+        decision_token = self.pool_norm(pooled.squeeze(1))
 
         if extra_features is not None:
             decision_token = torch.cat([decision_token, extra_features], dim=-1)
