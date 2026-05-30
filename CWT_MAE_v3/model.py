@@ -32,6 +32,7 @@ class PhysioAugment(nn.Module):
         self.wander_amp = wander_amp
 
     @torch.no_grad()
+    @torch.compiler.disable
     def forward(self, x):
         squeeze = (x.dim() == 2)
         if squeeze:
