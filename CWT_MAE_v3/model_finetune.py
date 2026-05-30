@@ -2,26 +2,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import CWT_MAE_RoPE, cwt_wrap
+from model import CWT_MAE_RoPE, cwt_wrap, DropPath
 from utils import is_main_process
 
 # ===================================================================
 # 1. 隐式思维链模块 (Latent Reasoning / Chain-of-Thought Head)
 # ===================================================================
 class LatentReasoningHead(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_classes, num_reasoning_tokens=32, dropout=0.1):
+    def __init__(self, embed_dim, num_heads, num_classes,
+                 num_reasoning_tokens=32,
+                 num_kv_layers=1,
+                 dropout=0.1,
+                 drop_path=0.0):
         super().__init__()
         self.num_reasoning_tokens = num_reasoning_tokens
         self.embed_dim = embed_dim
-        
+        self.num_kv_layers = num_kv_layers
+
+        effective_dim = embed_dim * num_kv_layers
+
         self.reasoning_tokens = nn.Parameter(torch.zeros(1, num_reasoning_tokens, embed_dim))
-        
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+
+        self.cross_attn_q_proj = nn.Linear(embed_dim, embed_dim)
+        self.cross_attn_kv_proj = nn.Linear(effective_dim, embed_dim * 2)
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
-        
+
         self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
-        
+
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
@@ -29,30 +39,64 @@ class LatentReasoningHead(nn.Module):
             nn.Linear(embed_dim * 4, embed_dim)
         )
         self.norm3 = nn.LayerNorm(embed_dim)
-        
+
+        self.cls_cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.norm_cls1 = nn.LayerNorm(embed_dim)
+        self.norm_cls2 = nn.LayerNorm(embed_dim)
+        self.cls_ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+
         self.classifier = nn.Linear(embed_dim, num_classes)
-        
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
         self._init_weights()
         nn.init.normal_(self.reasoning_tokens, std=0.02)
+        nn.init.normal_(self.cls_token, std=0.02)
 
     def _init_weights(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, x_encoder, token_padding_mask=None, extra_features=None):
+    def forward(self, x_encoder, token_padding_mask=None, extra_features=None,
+                multi_layer_features=None):
         B = x_encoder.shape[0]
-        queries = self.reasoning_tokens.expand(B, -1, -1) 
-        
-        attn_out, _ = self.cross_attn(query=queries, key=x_encoder, value=x_encoder, key_padding_mask=token_padding_mask)
-        queries = self.norm1(queries + attn_out)
-        
+        queries = self.reasoning_tokens.expand(B, -1, -1)
+
+        if multi_layer_features is not None:
+            kv_input = torch.cat(multi_layer_features, dim=-1)
+        else:
+            kv_input = x_encoder
+
+        q = self.cross_attn_q_proj(queries)
+        kv = self.cross_attn_kv_proj(kv_input)
+        k, v = kv.chunk(2, dim=-1)
+
+        attn_out, _ = self.cross_attn(
+            query=q, key=k, value=v,
+            key_padding_mask=token_padding_mask
+        )
+        queries = self.norm1(queries + self.drop_path(attn_out))
+
         attn_out2, _ = self.self_attn(query=queries, key=queries, value=queries)
-        queries = self.norm2(queries + attn_out2)
-        
-        queries = self.norm3(queries + self.ffn(queries))
-        
-        decision_token = queries.mean(dim=1) 
+        queries = self.norm2(queries + self.drop_path(attn_out2))
+
+        queries = self.norm3(queries + self.drop_path(self.ffn(queries)))
+
+        cls = self.cls_token.expand(B, -1, -1)
+        cls_attn, _ = self.cls_cross_attn(
+            query=cls, key=queries, value=queries
+        )
+        cls = self.norm_cls1(cls + self.drop_path(cls_attn))
+        cls = self.norm_cls2(cls + self.drop_path(self.cls_ffn(cls)))
+
+        decision_token = cls.squeeze(1)
+
         if extra_features is not None:
             decision_token = torch.cat([decision_token, extra_features], dim=-1)
         logits = self.classifier(decision_token)
@@ -65,13 +109,15 @@ class TF_MAE_Classifier(nn.Module):
     def __init__(self, pretrained_path, num_classes, 
                  use_cot=True, 
                  num_reasoning_tokens=16, 
+                 cot_kv_layers=None,
                  **kwargs):
         super().__init__()
         
         self.use_stats_features = kwargs.get('use_stats_features', False)
         self.embed_dim = kwargs.get('embed_dim', 768)
+        self.cot_kv_layers = cot_kv_layers
+        depth = kwargs.get('depth', 12)
         
-        # 移除 CWT_MAE_RoPE 不需要的参数
         encoder_kwargs = {k: v for k, v in kwargs.items() if k != 'use_stats_features'}
         
         self.encoder_model = CWT_MAE_RoPE(
@@ -86,20 +132,22 @@ class TF_MAE_Classifier(nn.Module):
         
         classifier_in_dim = self.embed_dim
         if self.use_stats_features:
-            classifier_in_dim += 16 # 16 is the number of stats features
+            classifier_in_dim += 16
 
         if use_cot:
+            num_kv_layers = len(cot_kv_layers) if cot_kv_layers else 1
             if is_main_process():
-                print(f">>> Initializing Latent Reasoning Head (CoT) with {num_reasoning_tokens} tokens.")
+                print(f">>> Initializing Latent Reasoning Head (CoT) with {num_reasoning_tokens} tokens, {num_kv_layers} KV layers.")
             self.head = LatentReasoningHead(
-                embed_dim=self.embed_dim, # CoT head itself handles embed_dim internally, wait!
+                embed_dim=self.embed_dim,
                 num_heads=kwargs.get('num_heads', 12),
                 num_classes=num_classes,
                 num_reasoning_tokens=num_reasoning_tokens,
-                dropout=0.2
+                num_kv_layers=num_kv_layers,
+                dropout=0.2,
+                drop_path=kwargs.get('drop_path_rate', 0.0)
             )
             if self.use_stats_features:
-                # modify the final classifier of LatentReasoningHead
                 self.head.classifier = nn.Linear(self.embed_dim + 16, num_classes)
         else:
             self.head = nn.Sequential(
@@ -194,9 +242,16 @@ class TF_MAE_Classifier(nn.Module):
         self.encoder_model.mask_ratio = 0.0
         if channel_ids is None:
             channel_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs, channel_ids)
+
+        if self.cot_kv_layers and isinstance(self.head, LatentReasoningHead):
+            latent, _, _, _, intermediate_features = self.encoder_model.forward_encoder(
+                x, imgs, channel_ids, return_layer_indices=self.cot_kv_layers
+            )
+            multi_layer = [intermediate_features[i] for i in self.cot_kv_layers]
+        else:
+            latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs, channel_ids)
+            multi_layer = None
         
-        # Get stats predictions
         latent_pooled = latent.mean(dim=1)
         pred_stats = self.encoder_model.stats_pred_head(latent_pooled)
         
@@ -211,7 +266,12 @@ class TF_MAE_Classifier(nn.Module):
                 token_padding_mask = (~channel_mask).unsqueeze(-1).expand(B_mask, M_mask, n_patches).reshape(B_mask, total_tokens)
         
         if isinstance(self.head, LatentReasoningHead):
-            logits = self.head(patch_tokens, token_padding_mask=token_padding_mask, extra_features=pred_stats if self.use_stats_features else None)
+            logits = self.head(
+                patch_tokens,
+                token_padding_mask=token_padding_mask,
+                extra_features=pred_stats if self.use_stats_features else None,
+                multi_layer_features=multi_layer
+            )
         else:
             global_feat = patch_tokens.mean(dim=1)
             if self.use_stats_features:

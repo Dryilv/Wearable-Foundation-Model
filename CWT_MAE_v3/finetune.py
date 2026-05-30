@@ -576,7 +576,9 @@ def main():
         decoder_num_heads=model_cfg.get('decoder_num_heads', 16),
         use_cot=model_cfg.get('use_cot', True),
         num_reasoning_tokens=model_cfg.get('num_reasoning_tokens', 16),
-        use_stats_features=model_cfg.get('use_stats_features', False)
+        use_stats_features=model_cfg.get('use_stats_features', False),
+        drop_path_rate=model_cfg.get('drop_path_rate', 0.0),
+        cot_kv_layers=model_cfg.get('cot_kv_layers', None)
     )
     model.to(device)
     

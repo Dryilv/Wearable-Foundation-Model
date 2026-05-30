@@ -68,6 +68,7 @@ model:
   patch_size_time: 25
   patch_size_freq: 8
   use_diff: true
+  drop_path_rate: 0.1
 
   # ===== 解码器结构（分类阶段仅用于初始化） =====
   decoder_embed_dim: 512
@@ -77,6 +78,7 @@ model:
   # ===== CoT 模块 =====
   use_cot: true
   num_reasoning_tokens: 16
+  cot_kv_layers: [3, 7, 11]
 
   # ===== 统计特征拼接 =====
   use_stats_features: true

@@ -3,6 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor = torch.floor(random_tensor + keep_prob)
+        output = x / keep_prob * random_tensor
+        return output
+
 # ===================================================================
 # 1. CWT 模块 (保持不变，优秀的特征工程)
 # ===================================================================
@@ -200,7 +215,7 @@ class RoPEAttention(nn.Module):
 # 3. 时空因子化 Block
 # ===================================================================
 class TrueFactorizedBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
+    def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., drop_path=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm_spatial_temporal = norm_layer(dim)
         self.spatial_temporal_attn = RoPEAttention(dim, num_heads=num_heads, proj_drop=drop)
@@ -217,11 +232,11 @@ class TrueFactorizedBlock(nn.Module):
             nn.Linear(int(dim * mlp_ratio), dim),
             nn.Dropout(drop)
         )
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x, M, N, rope_cos=None, rope_sin=None):
         B, MN, D = x.shape
 
-        # --- 1. Intra-modality Spatial-Temporal Attention ---
         x_time = x.contiguous().reshape(B * M, N, D)
 
         if rope_cos is not None and rope_sin is not None:
@@ -231,30 +246,23 @@ class TrueFactorizedBlock(nn.Module):
         else:
             cos_t, sin_t = None, None
 
-        x_time = x_time + self.spatial_temporal_attn(self.norm_spatial_temporal(x_time), cos_t, sin_t)
+        attn_out = self.spatial_temporal_attn(self.norm_spatial_temporal(x_time), cos_t, sin_t)
+        x_time = x_time + self.drop_path(attn_out)
 
-        # --- 2. Cross-Channel Attention ---
-        # 【修改】单通道模式下跳过跨通道注意力
         if M > 1:
-            # 【修复】temporal_smooth 只在时间维度 (W_grid) 上平滑，不跨越频率边界
-            # N = H_grid * W_grid, 需要 reshape 为 2D 再做时间维度平滑
             x_c = x_time.reshape(B, M, N, D)
-            # 假设 N 可以分解为 H_grid * W_grid (需要外部传入或从 config 获取)
-            # 这里使用安全方案：如果 M>1 才做通道注意力，跳过 temporal_smooth
             x_channel = x_c.transpose(1, 2).contiguous().reshape(B * N, M, D)
             attn_out = self.channel_attn(self.norm_channel(x_channel))
-            x_c = x_c + attn_out.reshape(B, N, M, D).transpose(1, 2)
+            x_c = x_c + self.drop_path(attn_out.reshape(B, N, M, D).transpose(1, 2))
             x = x_c.reshape(B, MN, D)
         else:
-            # M=1，直接返回时间注意力输出
             x = x_time.reshape(B, MN, D)
             
-        # --- 3. MLP ---
-        x = x + self.mlp(self.norm_mlp(x))
+        x = x + self.drop_path(self.mlp(self.norm_mlp(x)))
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
+    def __init__(self, dim, num_heads, mlp_ratio=4., drop=0., drop_path=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = RoPEAttention(dim, num_heads=num_heads, proj_drop=drop)
@@ -263,9 +271,11 @@ class Block(nn.Module):
             nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(), nn.Dropout(drop),
             nn.Linear(int(dim * mlp_ratio), dim), nn.Dropout(drop)
         )
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
     def forward(self, x, rope_cos=None, rope_sin=None):
-        x = x + self.attn(self.norm1(x), rope_cos, rope_sin)
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.drop_path(self.attn(self.norm1(x), rope_cos, rope_sin))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 # ===================================================================
@@ -290,7 +300,8 @@ class CWT_MAE_RoPE(nn.Module):
         stats_loss_weight=1.0,
         use_diff=False,
         diff_loss_weight=None,
-        max_modalities=16 
+        max_modalities=16,
+        drop_path_rate=0.0
     ):
         super().__init__()
         self.mask_ratio = mask_ratio
@@ -332,9 +343,10 @@ class CWT_MAE_RoPE(nn.Module):
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
         self.rope_decoder = RotaryEmbedding(dim=decoder_embed_dim // decoder_num_heads)
 
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
-            TrueFactorizedBlock(embed_dim, num_heads, norm_layer=norm_layer) 
-            for _ in range(depth)
+            TrueFactorizedBlock(embed_dim, num_heads, drop_path=dpr[i], norm_layer=norm_layer) 
+            for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim)
 
@@ -420,10 +432,11 @@ class CWT_MAE_RoPE(nn.Module):
     def mixed_masking(self, x, mask_ratio, M, N_patches, noise_w=None):
         return self.tubelet_masking(x, mask_ratio, M, N_patches, noise_w)
 
-    def forward_encoder(self, x_raw, imgs, channel_ids, mask_ratio=None, noise_w=None):
+    def forward_encoder(self, x_raw, imgs, channel_ids, mask_ratio=None, noise_w=None, return_layer_indices=None):
         """
         新增参数:
             channel_ids: (B,) tensor, 0=ECG, 1=PPG
+            return_layer_indices: list[int], 需要返回的中间层索引，如 [3, 7, 11]
         """
         B, M, C, H, W = imgs.shape  # M=1 (单通道)
 
@@ -519,12 +532,16 @@ class CWT_MAE_RoPE(nn.Module):
 
         rope_cos, rope_sin = self.rope_encoder(x_masked, pos_ids_flat)
 
-        # 标准的前向传播，使用残差连接
+        intermediate_features = {}
         for i, blk in enumerate(self.blocks):
             x_masked = blk(x_masked, M_enc, len_keep, rope_cos=rope_cos, rope_sin=rope_sin)
+            if return_layer_indices is not None and i in return_layer_indices:
+                intermediate_features[i] = self.norm(x_masked)
 
         x_masked = self.norm(x_masked)
         
+        if return_layer_indices is not None:
+            return x_masked, mask, global_ids_restore, M, intermediate_features
         return x_masked, mask, global_ids_restore, M
 
     def forward_decoder(self, x, ids_restore, M):
