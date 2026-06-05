@@ -381,9 +381,6 @@ class CWT_MAE_RoPE(nn.Module):
         self.raw_signal_scale = nn.Parameter(torch.ones(1, 1, 1, embed_dim) * 0.1)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
 
-        # 【新增】通道类型 Embedding (0=ECG, 1=PPG)
-        self.channel_type_embed = nn.Embedding(2, embed_dim)
-
         self.rope_encoder = RotaryEmbedding(dim=embed_dim // num_heads)
         self.rope_decoder = RotaryEmbedding(dim=decoder_embed_dim // decoder_num_heads)
 
@@ -449,7 +446,6 @@ class CWT_MAE_RoPE(nn.Module):
         torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.decoder_pos_embed, std=.02)
         torch.nn.init.trunc_normal_(self.mask_token, std=.02)
-        torch.nn.init.trunc_normal_(self.channel_type_embed.weight, std=.02)
         torch.nn.init.trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
 
@@ -527,18 +523,12 @@ class CWT_MAE_RoPE(nn.Module):
     def mixed_masking(self, x, mask_ratio, M, N_patches, noise_w=None):
         return self.tubelet_masking(x, mask_ratio, M, N_patches, noise_w)
 
-    def forward_encoder(self, x_raw, imgs, channel_ids, mask_ratio=None, noise_w=None, return_layer_indices=None):
+    def forward_encoder(self, x_raw, imgs, mask_ratio=None, noise_w=None, return_layer_indices=None):
         """
-        新增参数:
-            channel_ids: (B,) tensor, 0=ECG, 1=PPG
+        参数:
             return_layer_indices: list[int], 需要返回的中间层索引，如 [3, 7, 11]
         """
-        B, M, C, H, W = imgs.shape  # M=1 (单通道)
-
-        # 【修复】动态校验 channel_ids 边界，支持未来扩展
-        max_id = self.channel_type_embed.num_embeddings - 1
-        assert (channel_ids >= 0).all() and (channel_ids <= max_id).all(), \
-            f"channel_ids must be between 0 and {max_id}"
+        B, M, C, H, W = imgs.shape
         
         x_cwt = imgs.reshape(B * M, C, H, W)
         x_cwt = self.patch_embed(x_cwt) 
@@ -566,32 +556,6 @@ class CWT_MAE_RoPE(nn.Module):
             raw_scale = self.raw_signal_scale
             
         x_fused = x_cwt_2d + x_raw_2d * raw_scale
-
-        # 【新增】注入通道类型标识
-        # 【修复】支持 M>1 多通道模式：channel_ids 需要扩展到每个通道
-        # channel_ids 可以是 (B,) 或 (B, M)
-        # 【修复】确保 channel_ids 的形状与 M 匹配
-        if channel_ids.dim() == 1:
-            # (B,) → (B, M, 1, D) 广播到所有通道
-            ch_embed = self.channel_type_embed(channel_ids)  # (B, D)
-            ch_embed = ch_embed.unsqueeze(1).unsqueeze(1)    # (B, 1, 1, D)
-            ch_embed = ch_embed.expand(-1, M, -1, -1)        # (B, M, 1, D)
-        else:
-            # (B, M_ids) → 需要与 M 对齐
-            M_ids = channel_ids.shape[1]
-            if M_ids != M:
-                # 填充或截断 channel_ids 以匹配 M
-                if M_ids < M:
-                    # 填充到 M
-                    channel_ids = torch.nn.functional.pad(channel_ids, (0, M - M_ids), value=0)
-                else:
-                    # 截断到 M
-                    channel_ids = channel_ids[:, :M]
-            # (B, M) → (B, M, 1, D)
-            ch_embed = self.channel_type_embed(channel_ids)  # (B, M, D)
-            ch_embed = ch_embed.unsqueeze(2)                 # (B, M, 1, D)
-
-        x_fused = x_fused + ch_embed  # (B, M, N, D)
         
         x = x_fused.reshape(B, M, -1, D)
         N_patches = x.shape[2]
@@ -639,10 +603,8 @@ class CWT_MAE_RoPE(nn.Module):
             return x_masked, mask, global_ids_restore, M, intermediate_features
         return x_masked, mask, global_ids_restore, M
 
-    def forward_encoder_teacher(self, x_raw, imgs, channel_ids):
+    def forward_encoder_teacher(self, x_raw, imgs):
         B, M, C, H, W = imgs.shape
-        max_id = self.channel_type_embed.num_embeddings - 1
-        assert (channel_ids >= 0).all() and (channel_ids <= max_id).all()
 
         x_cwt = imgs.reshape(B * M, C, H, W)
         x_cwt = self.patch_embed(x_cwt)
@@ -661,21 +623,6 @@ class CWT_MAE_RoPE(nn.Module):
         x_raw_2d = x_raw_embed.unsqueeze(1)
         raw_scale = self.raw_signal_scale.to(x_raw_2d.device) if self.raw_signal_scale.device != x_raw_2d.device else self.raw_signal_scale
         x_fused = x_cwt_2d + x_raw_2d * raw_scale
-
-        if channel_ids.dim() == 1:
-            ch_embed = self.channel_type_embed(channel_ids)
-            ch_embed = ch_embed.unsqueeze(1).unsqueeze(1)
-            ch_embed = ch_embed.expand(-1, M, -1, -1)
-        else:
-            M_ids = channel_ids.shape[1]
-            if M_ids != M:
-                if M_ids < M:
-                    channel_ids = torch.nn.functional.pad(channel_ids, (0, M - M_ids), value=0)
-                else:
-                    channel_ids = channel_ids[:, :M]
-            ch_embed = self.channel_type_embed(channel_ids)
-            ch_embed = ch_embed.unsqueeze(2)
-        x_fused = x_fused + ch_embed
 
         x = x_fused.reshape(B, M, -1, D)
         N_patches = x.shape[2]
@@ -792,10 +739,9 @@ class CWT_MAE_RoPE(nn.Module):
         imgs = torch.clamp(imgs, min=-100.0, max=100.0)
         return imgs.to(dtype=next(self.parameters()).dtype)
 
-    def forward(self, x, channel_ids, stats_target=None, mask_ratio=None):
+    def forward(self, x, stats_target=None, mask_ratio=None):
         """
-        新增参数:
-            channel_ids: (B,) tensor
+        参数:
             stats_target: (B, 16) tensor, 统计量目标
         """
         B = x.shape[0]
@@ -836,7 +782,7 @@ class CWT_MAE_RoPE(nn.Module):
 
         # 2. 对被破坏的信号做 CWT (作为 Encoder 输入)
         imgs_input = self.prepare_tokens(x_masked)
-        latent, mask, ids, M = self.forward_encoder(x_masked, imgs_input, channel_ids, mask_ratio=mask_ratio, noise_w=noise_w)
+        latent, mask, ids, M = self.forward_encoder(x_masked, imgs_input, mask_ratio=mask_ratio, noise_w=noise_w)
         
         # 3. Decoder
         decoder_features = self.forward_decoder(latent, ids, M)
@@ -892,7 +838,7 @@ class CWT_MAE_RoPE(nn.Module):
             with torch.no_grad():
                 x_teacher = self.augment(x)
                 imgs_teacher = self.prepare_tokens(x_teacher)
-                t_latent = self.forward_encoder_teacher(x_teacher, imgs_teacher, channel_ids)
+                t_latent = self.forward_encoder_teacher(x_teacher, imgs_teacher)
                 t_pooled = t_latent.mean(dim=1)
                 z_teacher = self.teacher_projector(t_pooled)
             loss_contrast = 2 - 2 * F.cosine_similarity(

@@ -1,5 +1,6 @@
 import numpy as np
-from scipy.signal import find_peaks, welch
+from scipy.signal import find_peaks, welch, butter, filtfilt
+from scipy.stats import skew, kurtosis
 
 def extract_ecg_features(signal, fs=100):
     """
@@ -114,21 +115,117 @@ def extract_ppg_features(signal, fs=100):
     
     return np.nan_to_num(np.array(features, dtype=np.float32))
 
+def extract_acc_features(signal, fs=100):
+    """
+    Extracts features from accelerometer signals based on SARP system methodology.
+    References:
+    - Moatamed et al. (BSN 2016): Activity recognition with statistical features
+    - Ramezani et al. (JMIR 2019): MAD-based energy quantification, bandpass filtering
+    
+    Features (15 total to match ECG/PPG):
+    1. mean - filtered signal mean
+    2. median - filtered signal median
+    3. variance - filtered signal variance
+    4. skewness - distribution asymmetry
+    5. kurtosis - distribution tail heaviness
+    6. peak_frequency - dominant frequency from PSD
+    7. peak_power - power at dominant frequency
+    8. total_power - total spectral power (0.5-8 Hz band)
+    9. mad - Mean Absolute Deviation (energy proxy, Ramezani 2019)
+    10. activity_level - MAD / 0.02 threshold (>=1 means active)
+    11. rms - root mean square
+    12. zero_crossing_rate - signal oscillation frequency
+    13. signal_energy - sum of squared values
+    14. max_val - maximum amplitude
+    15. min_val - minimum amplitude
+    """
+    std_val = np.std(signal)
+    if std_val < 1e-6:
+        return np.zeros(15, dtype=np.float32)
+    
+    nyquist = 0.5 * fs
+    lowcut = 0.5
+    highcut = min(8.0, nyquist * 0.95)
+    
+    if lowcut < nyquist and highcut > lowcut:
+        try:
+            b, a = butter(5, [lowcut / nyquist, highcut / nyquist], btype='band')
+            filtered = filtfilt(b, a, signal)
+        except:
+            filtered = signal
+    else:
+        filtered = signal
+    
+    mean_val = np.mean(filtered)
+    median_val = np.median(filtered)
+    var_val = np.var(filtered)
+    skew_val = skew(filtered) if len(filtered) > 2 else 0.0
+    kurt_val = kurtosis(filtered) if len(filtered) > 3 else 0.0
+    
+    mad = np.mean(np.abs(filtered - mean_val))
+    activity_level = mad / 0.02
+    
+    rms = np.sqrt(np.mean(filtered**2))
+    signal_energy = np.sum(filtered**2) / len(filtered)
+    
+    zero_crossings = np.sum(np.diff(np.sign(filtered)) != 0) / len(filtered)
+    
+    max_val = np.max(filtered)
+    min_val = np.min(filtered)
+    
+    try:
+        nperseg = min(len(filtered), 256)
+        f, pxx = welch(filtered, fs, nperseg=nperseg)
+        
+        band_mask = (f >= lowcut) & (f <= highcut)
+        if np.any(band_mask):
+            f_band = f[band_mask]
+            pxx_band = pxx[band_mask]
+            peak_idx = np.argmax(pxx_band)
+            peak_freq = f_band[peak_idx]
+            peak_power = pxx_band[peak_idx]
+            total_power = np.sum(pxx_band)
+        else:
+            peak_freq = f[np.argmax(pxx)]
+            peak_power = np.max(pxx)
+            total_power = np.sum(pxx)
+    except:
+        peak_freq = peak_power = total_power = 0.0
+    
+    features = [
+        mean_val,
+        median_val,
+        var_val,
+        skew_val,
+        kurt_val,
+        peak_freq,
+        peak_power,
+        total_power,
+        mad,
+        activity_level,
+        rms,
+        zero_crossings,
+        signal_energy,
+        max_val,
+        min_val
+    ]
+    
+    return np.nan_to_num(np.array(features, dtype=np.float32))
+
 def extract_features(signal_np, channel_id, fs=100, item_info=None):
     """
     signal_np: (1, L)
-    channel_id: 0 for ECG, 1 for PPG
+    channel_id: 0=ECG, 1=ACC_X, 2=ACC_Y, 3=ACC_Z, 4=PPG
     item_info: metadata dictionary from index json, which may contain age etc.
     """
     sig = signal_np.flatten()
     if channel_id == 0:
         feats = extract_ecg_features(sig, fs=fs)
-    else:
+    elif channel_id == 4:
         feats = extract_ppg_features(sig, fs=fs)
+    else:
+        feats = extract_acc_features(sig, fs=fs)
         
-    # Append external stats if requested (e.g., age)
-    # The target feature vector size must be constant.
-    # Let's add 'age' as the 16th feature if available, else 0
     age = 0.0
     if item_info is not None and 'age' in item_info:
         age = float(item_info['age'])

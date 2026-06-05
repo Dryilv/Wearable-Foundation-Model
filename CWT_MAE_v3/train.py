@@ -94,7 +94,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         step_start_time = time.time()
         global_step = epoch * num_steps_per_epoch + step
 
-        # 【修改】适配新的返回值格式: (batch, channel_ids, labels, stats)
+        # 适配返回值格式: (batch, channel_ids, labels, stats)
         batch, channel_ids, labels, stats = batch_data
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
@@ -136,10 +136,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                # 【修改】传递 channel_ids 和 stats_target
-                channel_ids = channel_ids.to(device, non_blocking=True)
                 stats = stats.to(device, non_blocking=True)
-                loss, loss_dict, _, _, _, _, _, _ = model(batch, channel_ids, stats_target=stats, mask_ratio=mask_ratio)
+                loss, loss_dict, _, _, _, _, _, _ = model(batch, stats_target=stats, mask_ratio=mask_ratio)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
@@ -452,24 +450,18 @@ def main():
             # 保存可视化 - 随机抽取一个样本
             if vis_dataloader is not None:
                 try:
-                    # 随机获取一个样本进行可视化
                     vis_batch_data = next(iter(vis_dataloader))
                     vis_batch = vis_batch_data[0].to(device)
-                    vis_channel_ids = vis_batch_data[1].to(device)
                     
-                    # 单通道可视化：需要 channel_ids
-                    # 1. 提取 Encoder (CWT_MAE_RoPE)
                     real_model = model.module if hasattr(model, 'module') else model
                     if hasattr(real_model, 'encoder'):
                         encoder_model = real_model.encoder
                     else:
                         encoder_model = real_model
 
-                    # 2. 传入单通道数据和 channel_ids 进行可视化
                     save_reconstruction_images(
                         encoder_model,
-                        vis_batch,  # (B, 1, L)
-                        vis_channel_ids,  # (B,)
+                        vis_batch,
                         epoch,
                         config['train']['save_dir']
                     )

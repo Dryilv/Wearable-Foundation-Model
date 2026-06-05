@@ -284,7 +284,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=N
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
+            logits = model(x, channel_mask=channel_mask)
             loss = criterion(logits, y)
         
         if use_amp and amp_dtype == torch.float16:
@@ -338,7 +338,7 @@ def validate(model, loader, criterion, device, num_classes, total_len, use_amp=T
             x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
             
             with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                logits = model(x, channel_mask=channel_mask, channel_ids=modality_ids)
+                logits = model(x, channel_mask=channel_mask)
                 loss = criterion(logits, y)
             
             if dist.is_initialized():

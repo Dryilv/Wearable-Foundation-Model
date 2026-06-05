@@ -163,7 +163,7 @@ class TF_MAE_Classifier(nn.Module):
             'decoder_blocks', 'decoder_embed', 'decoder_pred_spec',
             'time_reducer', 'time_pred', 'mask_token',
             'decoder_pos_embed', 'rope_decoder', 'decoder_norm',
-            'decoder_channel_embed', 'channel_embed',
+            'decoder_channel_embed', 'channel_embed', 'channel_type_embed',
             'teacher_blocks', 'teacher_norm',
             'student_projector', 'student_predictor', 'teacher_projector',
             'augment',
@@ -186,9 +186,9 @@ class TF_MAE_Classifier(nn.Module):
         
         encoder_dict = {}
         for k, v in new_state_dict.items():
-            if any(x in k for x in["decoder", "mask_token", "time_reducer", "time_pred", "rope_decoder"]):
+            if any(x in k for x in ["decoder", "mask_token", "time_reducer", "time_pred", "rope_decoder"]):
                 continue
-            if "channel_embed" in k:
+            if "channel_embed" in k or "channel_type_embed" in k:
                 continue
             encoder_dict[k] = v
             
@@ -233,7 +233,7 @@ class TF_MAE_Classifier(nn.Module):
         
         state_dict[key] = patch_tokens
 
-    def forward(self, x, channel_mask=None, channel_ids=None):
+    def forward(self, x, channel_mask=None):
         if x.dim() == 2: x = x.unsqueeze(1)
 
         imgs = self.encoder_model.prepare_tokens(x)
@@ -245,16 +245,14 @@ class TF_MAE_Classifier(nn.Module):
                 imgs = imgs.to(x.device)
 
         self.encoder_model.mask_ratio = 0.0
-        if channel_ids is None:
-            channel_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
 
         if self.cot_kv_layers and isinstance(self.head, LatentReasoningHead):
             latent, _, _, _, intermediate_features = self.encoder_model.forward_encoder(
-                x, imgs, channel_ids, return_layer_indices=self.cot_kv_layers
+                x, imgs, return_layer_indices=self.cot_kv_layers
             )
             multi_layer = [intermediate_features[i] for i in self.cot_kv_layers]
         else:
-            latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs, channel_ids)
+            latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs)
             multi_layer = None
         
         latent_pooled = latent.mean(dim=1)

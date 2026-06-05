@@ -291,7 +291,7 @@ def get_layer_wise_lr(model, base_lr, layer_decay):
     return list(param_groups.values())
 # Visualization (已修改：支持 5 通道多变量可视化)
 # -------------------------------------------------------------------
-def save_reconstruction_images(model, x_time, channel_ids, epoch, save_dir):
+def save_reconstruction_images(model, x_time, epoch, save_dir):
     """
     单通道 Visualization for CWT-MAE-v3
     """
@@ -300,14 +300,11 @@ def save_reconstruction_images(model, x_time, channel_ids, epoch, save_dir):
     os.makedirs(vis_dir, exist_ok=True)
 
     with torch.no_grad():
-        # 1. 获取模型实例 (处理 DDP/Compile 包装)
         real_model = model.module if hasattr(model, 'module') else model
         if hasattr(real_model, '_orig_mod'):
             real_model = real_model._orig_mod
 
-        # 2. 模型推理 (直接使用原始信号，模型内部处理 CWT 和归一化)
-        # x_time shape: (B, 1, L)
-        output = real_model(x_time, channel_ids)
+        output = real_model(x_time)
         
         # Unpack output (Handling potentially varying return values)
         # CWT_MAE_RoPE.forward returns: loss, loss_dict, pred_spec, pred_time, imgs, mask, latent, pred_stats
