@@ -187,9 +187,6 @@ class PhysioSignalDataset(Dataset):
                     idx = random.randint(0, len(self.samples) - 1)
                     continue
 
-                channel_idx = random.randint(0, num_channels - 1)
-                raw_signal = raw_signal[channel_idx:channel_idx+1, :]  # (1, L)
-
                 if np.isnan(raw_signal).any() or np.isinf(raw_signal).any():
                     idx = random.randint(0, len(self.samples) - 1)
                     continue
@@ -201,9 +198,18 @@ class PhysioSignalDataset(Dataset):
                 # 2. 同步裁剪或填充 (使用固定起始位置或随机起始位置)
                 processed_signal = self._process_signal(raw_signal, fixed_start)
 
-                # 计算统计特征 (在归一化前)
+                # 计算统计特征 (跨通道聚合)
                 fs = self.index_data[original_idx].get('fs', 100)
-                stats = extract_features(processed_signal, channel_idx, fs=fs, item_info=item_info)
+                all_feats = []
+                for ch in range(num_channels):
+                    ch_signal = processed_signal[ch:ch+1, :]
+                    ch_stats = extract_features(ch_signal, ch, fs=fs, item_info=item_info)
+                    all_feats.append(ch_stats[:-1])
+                stats = np.mean(np.stack(all_feats), axis=0)
+                age = 0.0
+                if item_info is not None and 'age' in item_info:
+                    age = float(item_info['age'])
+                stats = np.append(stats, [age])
 
                 # 3. 逐通道质量检查
                 std_vals = np.std(processed_signal, axis=1, keepdims=True) # (M, 1)
@@ -235,10 +241,10 @@ class PhysioSignalDataset(Dataset):
                      continue
 
                 # 转为 Tensor
-                signal_tensor = torch.from_numpy(processed_signal)  # (1, L)
+                signal_tensor = torch.from_numpy(processed_signal)  # (M, L)
                 stats_tensor = torch.from_numpy(stats)
 
-                return signal_tensor, torch.tensor(channel_idx, dtype=torch.long), torch.tensor(label, dtype=torch.long), stats_tensor
+                return signal_tensor, torch.tensor(label, dtype=torch.long), stats_tensor
 
             except Exception as e:
                 print(f"Error loading sample {idx}: {e}")
@@ -256,18 +262,27 @@ class PhysioSignalDataset(Dataset):
                 safe_signal = safe_signal[np.newaxis, :]
             if safe_signal.dtype != np.float32:
                 safe_signal = safe_signal.astype(np.float32)
-            safe_channel = 0
-            safe_signal = safe_signal[safe_channel:safe_channel+1, :self.signal_len]
+            safe_signal = safe_signal[:, :self.signal_len]
             
             fs = self.index_data[sample_info['idx']].get('fs', 100)
-            stats = extract_features(safe_signal, safe_channel, fs=fs, item_info=self.index_data[sample_info['idx']])
+            num_ch = safe_signal.shape[0]
+            all_feats = []
+            for ch in range(num_ch):
+                ch_signal = safe_signal[ch:ch+1, :]
+                ch_stats = extract_features(ch_signal, ch, fs=fs, item_info=self.index_data[sample_info['idx']])
+                all_feats.append(ch_stats[:-1])
+            stats = np.mean(np.stack(all_feats), axis=0)
+            age = 0.0
+            if 'age' in self.index_data[sample_info['idx']]:
+                age = float(self.index_data[sample_info['idx']]['age'])
+            stats = np.append(stats, [age])
             
-            safe_signal = (safe_signal - np.mean(safe_signal)) / (np.std(safe_signal) + 1e-5)
-            return torch.from_numpy(safe_signal).float(), torch.tensor(safe_channel, dtype=torch.long), torch.tensor(0, dtype=torch.long), torch.from_numpy(stats)
+            safe_signal = (safe_signal - np.mean(safe_signal, axis=1, keepdims=True)) / (np.std(safe_signal, axis=1, keepdims=True) + 1e-5)
+            return torch.from_numpy(safe_signal).float(), torch.tensor(0, dtype=torch.long), torch.from_numpy(stats)
         except:
             fallback_signal = torch.ones((1, self.signal_len), dtype=torch.float32) * 0.01
             fallback_stats = torch.zeros(16, dtype=torch.float32)
-            return fallback_signal, torch.tensor(0, dtype=torch.long), torch.tensor(0, dtype=torch.long), fallback_stats
+            return fallback_signal, torch.tensor(0, dtype=torch.long), fallback_stats
 
     def _process_signal(self, signal, fixed_start=None):
         """
@@ -316,3 +331,31 @@ def fixed_channel_collate_fn(batch):
     stats_tensor = torch.stack(stats) # (B, 16)
 
     return padded_signals, channel_ids, labels, stats_tensor
+
+def multi_channel_collate_fn(batch):
+    """
+    多通道预训练的 Collate Function，处理不同样本通道数不一致的情况。
+    Batch: list of tuples (signal_tensor, label, stats)
+    signal_tensor shape: (M_i, L)
+    Output: padded_signals (B, Max_M, L), None, labels (B,), stats (B, 16), channel_mask (B, Max_M)
+    """
+    signals = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+    stats = [item[2] for item in batch]
+
+    max_m = max([s.shape[0] for s in signals])
+    signal_len = signals[0].shape[1]
+    batch_size = len(batch)
+
+    padded_signals = torch.zeros((batch_size, max_m, signal_len), dtype=signals[0].dtype)
+    channel_mask = torch.zeros((batch_size, max_m), dtype=torch.bool)
+
+    for i, s in enumerate(signals):
+        m = s.shape[0]
+        padded_signals[i, :m, :] = s
+        channel_mask[i, :m] = True
+
+    labels = torch.stack(labels)
+    stats_tensor = torch.stack(stats)
+
+    return padded_signals, None, labels, stats_tensor, channel_mask

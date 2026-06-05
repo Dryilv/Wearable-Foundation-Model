@@ -671,7 +671,7 @@ class CWT_MAE_RoPE(nn.Module):
         x = x.reshape(B, M, N_patches, D_dec)
         return x
 
-    def forward_loss_spec(self, imgs, pred, mask):
+    def forward_loss_spec(self, imgs, pred, mask, channel_mask=None):
         B, M, C, H, W = imgs.shape
         p_h, p_w = self.patch_embed.patch_size
         
@@ -694,11 +694,15 @@ class CWT_MAE_RoPE(nn.Module):
         loss = loss * self.channel_loss_weights
         loss = loss.sum(dim=-1) 
         
-        # 只在 mask == 1 的位置计算 loss
-        loss = (loss * mask).sum() / (mask.sum() + 1e-8)
+        if channel_mask is not None:
+            ch_mask = channel_mask.unsqueeze(-1).float()
+            loss = loss * ch_mask
+            loss = (loss * mask).sum() / ((mask * ch_mask).sum() + 1e-8)
+        else:
+            loss = (loss * mask).sum() / (mask.sum() + 1e-8)
         return loss
 
-    def forward_loss_time(self, x_raw, pred_time, mask):
+    def forward_loss_time(self, x_raw, pred_time, mask, channel_mask=None):
         x_raw = x_raw.float()
         mean = x_raw.mean(dim=-1, keepdim=True)
         std = torch.clamp(x_raw.std(dim=-1, keepdim=True), min=1e-5)
@@ -717,7 +721,14 @@ class CWT_MAE_RoPE(nn.Module):
         mask_time = mask_time.reshape(B, M, -1) 
         
         loss = (pred_time.float() - target) ** 2
-        loss = (loss * mask_time).sum() / (mask_time.sum() + 1e-8)
+        
+        if channel_mask is not None:
+            ch_mask = channel_mask.unsqueeze(-1).float()
+            loss = loss * ch_mask
+            mask_time = mask_time * ch_mask
+            loss = (loss * mask_time).sum() / (mask_time.sum() + 1e-8)
+        else:
+            loss = (loss * mask_time).sum() / (mask_time.sum() + 1e-8)
         return loss
 
     def forward_loss_stats(self, pred_stats, stats_target):
@@ -739,7 +750,7 @@ class CWT_MAE_RoPE(nn.Module):
         imgs = torch.clamp(imgs, min=-100.0, max=100.0)
         return imgs.to(dtype=next(self.parameters()).dtype)
 
-    def forward(self, x, stats_target=None, mask_ratio=None):
+    def forward(self, x, stats_target=None, mask_ratio=None, channel_mask=None):
         """
         参数:
             stats_target: (B, 16) tensor, 统计量目标
@@ -792,7 +803,7 @@ class CWT_MAE_RoPE(nn.Module):
         with torch.no_grad():
             imgs_target = self.prepare_tokens(x)
             
-        loss_spec = self.forward_loss_spec(imgs_target, pred_spec, mask)
+        loss_spec = self.forward_loss_spec(imgs_target, pred_spec, mask, channel_mask)
         
         B_dec, M_dec, N, D = decoder_features.shape
         H_grid, W_grid = self.grid_size
@@ -807,7 +818,7 @@ class CWT_MAE_RoPE(nn.Module):
         pred_time = self.time_pred(feat_time_agg).flatten(1).reshape(B_dec, M_dec, -1)
         
         # 时间域重构也是预测原始未被破坏的信号 x
-        loss_time = self.forward_loss_time(x, pred_time, mask)
+        loss_time = self.forward_loss_time(x, pred_time, mask, channel_mask)
         
         loss = loss_spec + self.time_loss_weight * loss_time
         loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
@@ -837,6 +848,8 @@ class CWT_MAE_RoPE(nn.Module):
             z_student = self.student_predictor(self.student_projector(latent_pooled))
             with torch.no_grad():
                 x_teacher = self.augment(x)
+                if channel_mask is not None:
+                    x_teacher = x_teacher * channel_mask.unsqueeze(-1).float()
                 imgs_teacher = self.prepare_tokens(x_teacher)
                 t_latent = self.forward_encoder_teacher(x_teacher, imgs_teacher)
                 t_pooled = t_latent.mean(dim=1)

@@ -23,7 +23,7 @@ torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
 from model import CWT_MAE_RoPE
-from dataset import PhysioSignalDataset, fixed_channel_collate_fn
+from dataset import PhysioSignalDataset, fixed_channel_collate_fn, multi_channel_collate_fn
 from utils_metrics import ExperimentTracker
 from utils import save_reconstruction_images, SmoothedValue, format_time, is_main_process
 from utils import setup_logger, init_distributed_mode, update_teacher
@@ -94,8 +94,12 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         step_start_time = time.time()
         global_step = epoch * num_steps_per_epoch + step
 
-        # 适配返回值格式: (batch, channel_ids, labels, stats)
-        batch, channel_ids, labels, stats = batch_data
+        # 适配返回值格式: (batch, channel_ids, labels, stats, channel_mask)
+        if len(batch_data) == 5:
+            batch, channel_ids, labels, stats, channel_mask = batch_data
+        else:
+            batch, channel_ids, labels, stats = batch_data
+            channel_mask = None
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
@@ -137,7 +141,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
                 stats = stats.to(device, non_blocking=True)
-                loss, loss_dict, _, _, _, _, _, _ = model(batch, stats_target=stats, mask_ratio=mask_ratio)
+                if channel_mask is not None:
+                    channel_mask = channel_mask.to(device, non_blocking=True)
+                loss, loss_dict, _, _, _, _, _, _ = model(batch, stats_target=stats, mask_ratio=mask_ratio, channel_mask=channel_mask)
                 loss = loss / accum_iter # Normalize loss for accumulation
 
             loss_value = loss.item() * accum_iter # Restore for logging
@@ -281,7 +287,7 @@ def main():
         num_workers=config['data']['num_workers'],
         pin_memory=True,
         drop_last=True,
-        collate_fn=fixed_channel_collate_fn
+        collate_fn=multi_channel_collate_fn
     )
     
     # 创建可视化专用 DataLoader (batch_size=1, shuffle=True)
@@ -291,7 +297,7 @@ def main():
         shuffle=True,
         num_workers=1,
         pin_memory=True,
-        collate_fn=fixed_channel_collate_fn
+        collate_fn=multi_channel_collate_fn
     ) if is_main_process() else None
 
     num_steps_per_epoch = len(train_dataloader)
