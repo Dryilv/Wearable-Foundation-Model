@@ -17,6 +17,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.amp import autocast, GradScaler
 import copy
+from muon import Muon
 
 import warnings
 from sklearn.exceptions import UndefinedMetricWarning
@@ -24,19 +25,21 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 from dataset_finetune import DownstreamClassificationDataset
 from model_finetune import TF_MAE_Classifier
-from utils import get_layer_wise_lr, setup_distributed, cleanup_distributed, is_main_process
+from utils import setup_distributed, cleanup_distributed, is_main_process
 from utils import unwrap_model, set_seed, setup_logger, reduce_tensor, gather_tensors
 
 # -------------------------------------------------------------------
 # 1. DDP 辅助函数 (已迁移至 utils.py)
 # -------------------------------------------------------------------
 
-def save_checkpoint(path, model, optimizer, scheduler, epoch, best_metric, best_threshold, scaler):
+def save_checkpoint(path, model, optimizer_muon, optimizer_adamw, scheduler_muon, scheduler_adamw, epoch, best_metric, best_threshold, scaler):
     payload = {
         'epoch': epoch,
         'model': unwrap_model(model).state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
+        'optimizer_muon': optimizer_muon.state_dict(),
+        'optimizer_adamw': optimizer_adamw.state_dict(),
+        'scheduler_muon': scheduler_muon.state_dict(),
+        'scheduler_adamw': scheduler_adamw.state_dict(),
         'best_metric': best_metric,
         'best_threshold': best_threshold
     }
@@ -44,14 +47,18 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_metric, best_
         payload['scaler'] = scaler.state_dict()
     torch.save(payload, path)
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None):
+def load_checkpoint(path, model, optimizer_muon=None, optimizer_adamw=None, scheduler_muon=None, scheduler_adamw=None, scaler=None):
     checkpoint = torch.load(path, map_location='cpu')
     state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
     unwrap_model(model).load_state_dict(state_dict, strict=True)
-    if optimizer is not None and 'optimizer' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer'])
-    if scheduler is not None and 'scheduler' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler'])
+    if optimizer_muon is not None and 'optimizer_muon' in checkpoint:
+        optimizer_muon.load_state_dict(checkpoint['optimizer_muon'])
+    if optimizer_adamw is not None and 'optimizer_adamw' in checkpoint:
+        optimizer_adamw.load_state_dict(checkpoint['optimizer_adamw'])
+    if scheduler_muon is not None and 'scheduler_muon' in checkpoint:
+        scheduler_muon.load_state_dict(checkpoint['scheduler_muon'])
+    if scheduler_adamw is not None and 'scheduler_adamw' in checkpoint:
+        scheduler_adamw.load_state_dict(checkpoint['scheduler_adamw'])
     if scaler is not None and 'scaler' in checkpoint:
         scaler.load_state_dict(checkpoint['scaler'])
     return checkpoint
@@ -266,51 +273,62 @@ class AsymmetricLoss(nn.Module):
         return -loss.sum(dim=-1).mean()
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None, use_amp=True, grad_clip_norm=3.0, scheduler=None):
+def train_one_epoch(model, loader, criterion, optimizer_muon, optimizer_adamw, device, epoch, scaler=None, use_amp=True, grad_clip_norm=3.0, scheduler_muon=None, scheduler_adamw=None):
     model.train()
     if hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
 
     total_loss = 0
     count = 0
-    
+
     amp_dtype = torch.bfloat16 if (device.type == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
     amp_enabled = use_amp and device.type == 'cuda'
     iterator = tqdm(loader, desc=f"Epoch {epoch + 1} Train") if is_main_process() else loader
-    
+
     for batch in iterator:
         x, modality_ids, y, channel_mask = move_batch_to_device(batch, device)
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer_muon.zero_grad(set_to_none=True)
+        optimizer_adamw.zero_grad(set_to_none=True)
 
         with autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             logits = model(x, channel_mask=channel_mask)
             loss = criterion(logits, y)
-        
+
         if use_amp and amp_dtype == torch.float16:
             if scaler is None:
                 raise RuntimeError("GradScaler is required for float16 AMP training.")
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            scaler.unscale_(optimizer_muon)
+            scaler.unscale_(optimizer_adamw)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
-            scaler.step(optimizer)
+            # 全局 found_inf 检查：确保两个 optimizer 同步
+            found_inf = sum(
+                v.item()
+                for state in scaler._per_optimizer_states.values()
+                for v in state["found_inf_per_device"].values()
+            )
+            if found_inf == 0:
+                scaler.step(optimizer_muon)
+                scaler.step(optimizer_adamw)
             scaler.update()
         else:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
-            optimizer.step()
-        
-        # Step-based scheduler
-        if scheduler is not None:
-            scheduler.step()
+            optimizer_muon.step()
+            optimizer_adamw.step()
 
-        # 避免每步进行 all_reduce 导致严重的同步阻塞，仅在本地累加 loss
+        # Step-based scheduler
+        if scheduler_muon is not None:
+            scheduler_muon.step()
+        if scheduler_adamw is not None:
+            scheduler_adamw.step()
+
         total_loss += loss.item()
-            
         count += 1
-        
+
         if is_main_process():
-            current_lr = optimizer.param_groups[0]['lr']
+            current_lr = optimizer_adamw.param_groups[0]['lr']
             iterator.set_postfix({
                 'loss': total_loss / count,
                 'lr': f"{current_lr:.2e}"
@@ -638,45 +656,67 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=find_unused_parameters)
 
-    use_layer_wise_lr = train_cfg.get('use_layer_wise_lr', True)
-    if use_layer_wise_lr:
-        param_groups = get_layer_wise_lr(
-            unwrap_model(model),
-            base_lr=train_cfg['base_lr'],
-            layer_decay=train_cfg.get('layer_decay', 0.65)
-        )
-        optimizer = optim.AdamW(param_groups, weight_decay=train_cfg['weight_decay'])
-        if is_main_process():
-            print("Optimizer: AdamW with layer-wise LR decay")
-    else:
-        optimizer = optim.AdamW(
-            unwrap_model(model).parameters(),
-            lr=train_cfg['base_lr'],
-            weight_decay=train_cfg['weight_decay']
-        )
-        if is_main_process():
-            print("Optimizer: AdamW with uniform learning rate")
-    
-    # LR Scheduler (Warmup + Cosine) - Step-based
-    # 计算总步数
+    # --- Muon + AdamW 双优化器参数分组 ---
+    muon_params = []
+    adamw_params = []
+
+    raw_model = unwrap_model(model)
+    for module_name, module in raw_model.named_modules():
+        if isinstance(module, nn.Linear):
+            if module.weight.requires_grad:
+                muon_params.append(module.weight)
+            if module.bias is not None and module.bias.requires_grad:
+                adamw_params.append(module.bias)
+        else:
+            for param_name, param in module.named_parameters(recurse=False):
+                if param.requires_grad:
+                    adamw_params.append(param)
+
+    # 去重（named_modules 可能重复遍历）
+    muon_params = list(dict.fromkeys(muon_params))
+    adamw_params = list(dict.fromkeys(adamw_params))
+
+    optimizer_muon = Muon(
+        muon_params,
+        lr=train_cfg['base_lr'],
+        momentum=0.95,
+        weight_decay=train_cfg['weight_decay']
+    )
+    optimizer_adamw = optim.AdamW(
+        adamw_params,
+        lr=train_cfg['base_lr'],
+        weight_decay=train_cfg['weight_decay']
+    )
+
+    if is_main_process():
+        print(f"Optimizer: Muon ({len(muon_params)} params) + AdamW ({len(adamw_params)} params)")
+        total_muon = sum(p.numel() for p in muon_params)
+        total_adamw = sum(p.numel() for p in adamw_params)
+        print(f"  Muon parameters: {total_muon:,} | AdamW parameters: {total_adamw:,}")
+
+    # LR Scheduler (Warmup + Cosine) - Step-based, 分别为两个 optimizer 创建
     steps_per_epoch = len(train_loader)
     total_steps = train_cfg['epochs'] * steps_per_epoch
     warmup_steps = int(train_cfg['warmup_epochs'] * steps_per_epoch)
-    
-    if warmup_steps > 0:
-        scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-        scheduler_cosine = CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps - warmup_steps,
-            eta_min=train_cfg['min_lr']
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[scheduler_warmup, scheduler_cosine],
-            milestones=[warmup_steps]
-        )
-    else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg['min_lr'])
+
+    def build_scheduler(optimizer):
+        if warmup_steps > 0:
+            sched_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+            sched_cosine = CosineAnnealingLR(
+                optimizer,
+                T_max=total_steps - warmup_steps,
+                eta_min=train_cfg['min_lr']
+            )
+            return SequentialLR(
+                optimizer,
+                schedulers=[sched_warmup, sched_cosine],
+                milestones=[warmup_steps]
+            )
+        else:
+            return CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=train_cfg['min_lr'])
+
+    scheduler_muon = build_scheduler(optimizer_muon)
+    scheduler_adamw = build_scheduler(optimizer_adamw)
     
     # Resolve loss type: explicit 'loss_type' takes priority, else fall back to 'use_focal_loss' flag
     loss_type = train_cfg.get('loss_type', None)
@@ -792,7 +832,7 @@ def main():
         if os.path.exists(candidate):
             resume_path = candidate
     if resume_path and os.path.exists(resume_path):
-        resume_ckpt = load_checkpoint(resume_path, model, optimizer=optimizer, scheduler=scheduler, scaler=scaler)
+        resume_ckpt = load_checkpoint(resume_path, model, optimizer_muon=optimizer_muon, optimizer_adamw=optimizer_adamw, scheduler_muon=scheduler_muon, scheduler_adamw=scheduler_adamw, scaler=scaler)
         start_epoch = int(resume_ckpt.get('epoch', -1)) + 1
         best_metric = float(resume_ckpt.get('best_metric', best_metric))
         saved_threshold = resume_ckpt.get('best_threshold', best_threshold)
@@ -805,13 +845,13 @@ def main():
 
     for epoch in range(start_epoch, total_epochs):
         if is_main_process():
-            current_lr = optimizer.param_groups[0]['lr']
+            current_lr = optimizer_adamw.param_groups[0]['lr']
             print(f"\nEpoch {epoch+1}/{total_epochs} | LR: {current_lr:.2e}")
 
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch,
+            model, train_loader, criterion, optimizer_muon, optimizer_adamw, device, epoch,
             scaler=scaler, use_amp=use_amp, grad_clip_norm=grad_clip_norm,
-            scheduler=scheduler
+            scheduler_muon=scheduler_muon, scheduler_adamw=scheduler_adamw
         )
         
         # scheduler.step() # Moved to per-step inside train_one_epoch
@@ -863,8 +903,10 @@ def main():
             save_checkpoint(
                 os.path.join(train_cfg['save_dir'], "last_checkpoint.pth"),
                 model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
+                optimizer_muon=optimizer_muon,
+                optimizer_adamw=optimizer_adamw,
+                scheduler_muon=scheduler_muon,
+                scheduler_adamw=scheduler_adamw,
                 epoch=epoch,
                 best_metric=best_metric,
                 best_threshold=best_threshold,
@@ -873,7 +915,7 @@ def main():
         if is_main_process():
             th_str = str(np.round(best_th, 4).tolist()) if isinstance(best_th, np.ndarray) else f"{best_th:.4f}"
             auc_str = str([round(a, 4) for a in val_auc_list]) if isinstance(val_auc_list, list) else "[]"
-            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} val_auc_per_class={auc_str} lr={optimizer.param_groups[0]['lr']:.8e} th={th_str}")
+            logger.info(f"epoch={epoch+1} train_loss={train_loss:.6f} val_loss={val_loss:.6f} val_acc={val_acc:.6f} val_f0.5={val_f1:.6f} val_auc={val_auc:.6f} val_auc_per_class={auc_str} lr={optimizer_adamw.param_groups[0]['lr']:.8e} th={th_str}")
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             if is_main_process():
                 print(f"Early stopping triggered at epoch {epoch+1}")
