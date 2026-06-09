@@ -25,3 +25,5 @@ class ExperimentTracker:
                     f"{metrics_dict.get('grad_norm', 0):.4f},{metrics_dict.get('gpu_mem_mb', 0):.1f},"
                     f"{metrics_dict.get('throughput', 0):.2f}\n")
 
+    def check_early_stopping(self, patience=3):
+        return False

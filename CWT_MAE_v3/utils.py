@@ -228,6 +228,13 @@ def update_teacher(model, decay=0.999):
     for ps, pt in zip(model.student_encoder_params(), model.teacher_encoder_params()):
         pt.data.mul_(decay).add_(ps.data, alpha=1 - decay)
 
+def load_state_dict_ignore_prefix(model, state_dict, prefix='module.'):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace(prefix, '')
+        new_state_dict[name] = v
+    model.load_state_dict(new_state_dict)
+
 def get_layer_wise_lr(model, base_lr, layer_decay):
     param_groups = {}
     handled = set()

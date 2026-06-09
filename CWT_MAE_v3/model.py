@@ -751,31 +751,32 @@ class CWT_MAE_RoPE(nn.Module):
         return imgs.to(dtype=next(self.parameters()).dtype)
 
     def forward(self, x, stats_target=None, mask_ratio=None, channel_mask=None):
+        """
+        参数:
+            stats_target: (B, 16) tensor, 统计量目标
+        """
         B = x.shape[0]
         current_mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
-
-        # 提前计算 target CWT（只算一次，用于 loss）
-        with torch.no_grad():
-            imgs_target = self.prepare_tokens(x)
-
+        
+        # 1. 方案二 (Pre-Masking): 在原始 1D 信号上生成 Mask 并进行破坏
         if current_mask_ratio > 0.0:
             H_grid, W_grid = self.grid_size
             noise_w = torch.rand(B, W_grid, device=x.device)
             ids_shuffle_w = torch.argsort(noise_w, dim=1)
             len_keep_w = int(W_grid * (1 - current_mask_ratio))
             ids_keep_w = ids_shuffle_w[:, :len_keep_w]
-
+            
             mask_w_bool = torch.zeros(B, W_grid, device=x.device)
-            mask_w_bool.scatter_(1, ids_keep_w, 1.0)
-
+            mask_w_bool.scatter_(1, ids_keep_w, 1.0) # 1 为保留，0 为丢弃
+            
             M_dim = x.shape[1] if x.dim() == 3 else 1
             L_dim = x.shape[-1]
-
+            
             mask_raw = mask_w_bool.unsqueeze(1).unsqueeze(-1).repeat(1, M_dim, 1, self.patch_size_time)
             mask_raw = mask_raw.reshape(B, M_dim, W_grid * self.patch_size_time)
             if mask_raw.shape[-1] != L_dim:
                 mask_raw = mask_raw[..., :L_dim]
-
+                
             if x.dim() == 2:
                 x_exp = x.unsqueeze(1)
                 x_visible = x_exp * mask_raw
@@ -786,42 +787,48 @@ class CWT_MAE_RoPE(nn.Module):
                 x_visible = x * mask_raw
                 local_mean = x_visible.sum(dim=-1, keepdim=True) / (mask_raw.sum(dim=-1, keepdim=True) + 1e-8)
                 x_masked = x_visible + local_mean * (1 - mask_raw)
-
-            imgs_input = self.prepare_tokens(x_masked)
         else:
             x_masked = x
             noise_w = None
-            # mask_ratio == 0 时，输入 == 原始，复用 target CWT
-            imgs_input = imgs_target
 
+        # 2. 对被破坏的信号做 CWT (作为 Encoder 输入)
+        imgs_input = self.prepare_tokens(x_masked)
         latent, mask, ids, M = self.forward_encoder(x_masked, imgs_input, mask_ratio=mask_ratio, noise_w=noise_w)
-
-        # Decoder
+        
+        # 3. Decoder
         decoder_features = self.forward_decoder(latent, ids, M)
         pred_spec = self.decoder_pred_spec(decoder_features)
-
+        
+        # 4. 对未被破坏的原始信号做 CWT (作为 Loss 目标)
+        with torch.no_grad():
+            imgs_target = self.prepare_tokens(x)
+            
         loss_spec = self.forward_loss_spec(imgs_target, pred_spec, mask, channel_mask)
-
+        
         B_dec, M_dec, N, D = decoder_features.shape
         H_grid, W_grid = self.grid_size
         feat_2d = decoder_features.reshape(B_dec * M_dec, N, D).transpose(1, 2).reshape(B_dec * M_dec, D, H_grid, W_grid)
-
-        feat_time_agg = self.time_reducer[0](feat_2d)
-        feat_time_agg = self.time_reducer[1](feat_time_agg)
-
+        
+        feat_time_agg = self.time_reducer[0](feat_2d) 
+        feat_time_agg = self.time_reducer[1](feat_time_agg) 
+        
         feat_time_agg = feat_time_agg.squeeze(2).transpose(1, 2)
-        feat_time_agg = self.time_reducer[2](feat_time_agg)
-
+        feat_time_agg = self.time_reducer[2](feat_time_agg) 
+        
         pred_time = self.time_pred(feat_time_agg).flatten(1).reshape(B_dec, M_dec, -1)
-
+        
+        # 时间域重构也是预测原始未被破坏的信号 x
         loss_time = self.forward_loss_time(x, pred_time, mask, channel_mask)
-
+        
         loss = loss_spec + self.time_loss_weight * loss_time
         loss_dict = {'loss_spec': loss_spec, 'loss_time': loss_time}
 
-        latent_pooled = latent.mean(dim=1)
-        pred_stats = self.stats_pred_head(latent_pooled)
-
+        # 【新增】统计特征预测
+        # 编码器输出 latent 形状为 (B, M * len_keep, D)
+        # 我们进行全局平均池化
+        latent_pooled = latent.mean(dim=1)  # (B, D)
+        pred_stats = self.stats_pred_head(latent_pooled)  # (B, 16)
+        
         if stats_target is not None:
             stats_target = stats_target.float()
             if self.training:
@@ -854,3 +861,4 @@ class CWT_MAE_RoPE(nn.Module):
             loss_dict['loss_contrast'] = loss_contrast
 
         return loss, loss_dict, pred_spec, pred_time, imgs_target, mask, latent, pred_stats
+
