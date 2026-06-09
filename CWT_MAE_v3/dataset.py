@@ -9,6 +9,7 @@ import hashlib
 from sklearn.model_selection import StratifiedShuffleSplit
 from functools import lru_cache
 from utils_features import extract_features
+from preprocess import preprocess_signal
 
 # 独立的缓存函数，避免实例绑定的序列化问题
 @lru_cache(maxsize=8)
@@ -198,8 +199,11 @@ class PhysioSignalDataset(Dataset):
                 # 2. 同步裁剪或填充 (使用固定起始位置或随机起始位置)
                 processed_signal = self._process_signal(raw_signal, fixed_start)
 
+                # 2.5 带通滤波预处理 (去除高频噪声和基线漂移)
+                fs = item_info.get('fs', 100)
+                processed_signal = preprocess_signal(processed_signal, fs=fs, num_channels=num_channels)
+
                 # 计算统计特征 (跨通道聚合)
-                fs = self.index_data[original_idx].get('fs', 100)
                 all_feats = []
                 for ch in range(num_channels):
                     ch_signal = processed_signal[ch:ch+1, :]
