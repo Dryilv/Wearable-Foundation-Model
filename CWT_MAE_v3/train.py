@@ -402,6 +402,9 @@ def main():
                     continue
                 adamw_params.append(p)
 
+    muon_params = list(dict.fromkeys(muon_params))
+    adamw_params = list(dict.fromkeys(adamw_params))
+
     if is_main_process():
         logger.info(f"Optimizer groups: Muon Params (2D Weights)={len(muon_params)}, AdamW Params (1D/Others)={len(adamw_params)}")
 
