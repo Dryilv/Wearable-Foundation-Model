@@ -374,7 +374,7 @@ def main():
         if is_main_process():
             logger.info("torch.compile() is disabled via config.")
 
-    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False) if dist.is_initialized() else model
+    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True) if dist.is_initialized() else model
 
     # 优化器参数分组: 2D 矩阵权重 → Muon, 其余 → AdamW
     muon_params = []
