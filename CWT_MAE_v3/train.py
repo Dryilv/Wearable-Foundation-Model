@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import autocast, GradScaler
 
 from muon import Muon
+from gpu_preprocess import GPUPreprocessor
 
 # 允许编译失败时自动回退
 import torch._dynamo
@@ -60,7 +61,7 @@ def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_s
 # 5. 训练与验证逻辑
 # -------------------------------------------------------------------
 def train_one_epoch(model, dataloader, optimizer_muon, optimizer_adamw, scaler, epoch, logger, config, device, start_time_global,
-                    total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0):
+                    total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0, gpu_preprocessor=None):
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
     metric_logger['loss'] = SmoothedValue(window_size=20, fmt='{median:.4f} ({global_avg:.4f})')
@@ -71,27 +72,24 @@ def train_one_epoch(model, dataloader, optimizer_muon, optimizer_adamw, scaler, 
     metric_logger['lr'] = SmoothedValue(window_size=1, fmt='{value:.6f}')
     metric_logger['grad_norm'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
     metric_logger['throughput'] = SmoothedValue(window_size=20, fmt='{value:.2f}')
-    
+
     header = f'Epoch: [{epoch}/{config["train"]["epochs"]}]'
     num_steps_per_epoch = len(dataloader)
     accum_iter = config['train'].get('accum_iter', 1)
-    
+
     # [Optimization] Linear Scaling Rule
-    # Note: We apply this scaling to the base_lr passed in AFTER dynamic schedule adjustment
     eff_batch_size = config['train']['batch_size'] * accum_iter * (dist.get_world_size() if dist.is_initialized() else 1)
     if config['train'].get('auto_scale_lr', True):
-        # Apply scaling based on effective batch size
         base_lr_scaled = base_lr * eff_batch_size / 256.0
         min_lr_scaled = min_lr * eff_batch_size / 256.0
     else:
         base_lr_scaled = base_lr
         min_lr_scaled = min_lr
-    
-    # 优先使用 bfloat16
+
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    
+
     start_time = time.time()
-    
+
     optimizer_muon.zero_grad(set_to_none=True)
     optimizer_adamw.zero_grad(set_to_none=True)
 
@@ -99,12 +97,8 @@ def train_one_epoch(model, dataloader, optimizer_muon, optimizer_adamw, scaler, 
         step_start_time = time.time()
         global_step = epoch * num_steps_per_epoch + step
 
-        # 适配返回值格式: (batch, channel_ids, labels, stats, channel_mask)
-        if len(batch_data) == 5:
-            batch, channel_ids, labels, stats, channel_mask = batch_data
-        else:
-            batch, channel_ids, labels, stats = batch_data
-            channel_mask = None
+        # 新格式: (signals, labels, ages, channel_mask)
+        batch, labels, ages, channel_mask = batch_data
 
         # 调整 LR (按 step 调整，考虑 accum_iter)
         if step % accum_iter == 0:
@@ -134,10 +128,15 @@ def train_one_epoch(model, dataloader, optimizer_muon, optimizer_adamw, scaler, 
 
         # batch shape: (B, M, L)
         batch = batch.to(device, non_blocking=True)
-        # labels = labels.to(device, non_blocking=True) # MAE 训练暂不需要标签
+        ages = ages.to(device, non_blocking=True)
+        if channel_mask is not None:
+            channel_mask = channel_mask.to(device, non_blocking=True)
+
+        # GPU 预处理: 带通滤波 + 特征提取 + Z-score 归一化
+        with torch.no_grad():
+            batch, stats = gpu_preprocessor(batch.float(), channel_mask, ages)
 
         # 混合精度前向传播
-        # 在 DDP 模式下，如果不是最后一次累积，使用 no_sync 上下文以减少通信
         do_sync = (step + 1) % accum_iter == 0 or (step + 1) == len(dataloader)
 
         if isinstance(model, DDP) and not do_sync:
@@ -147,11 +146,10 @@ def train_one_epoch(model, dataloader, optimizer_muon, optimizer_adamw, scaler, 
 
         with context_manager:
             with autocast('cuda', dtype=amp_dtype, enabled=config['train']['use_amp']):
-                stats = stats.to(device, non_blocking=True)
                 if channel_mask is not None:
                     channel_mask = channel_mask.to(device, non_blocking=True)
                 loss, loss_dict, _, _, _, _, _, _ = model(batch, stats_target=stats, mask_ratio=mask_ratio, channel_mask=channel_mask)
-                loss = loss / accum_iter # Normalize loss for accumulation
+                loss = loss / accum_iter
 
             loss_value = loss.item() * accum_iter # Restore for logging
             loss_spec_val = loss_dict.get('loss_spec', torch.tensor(0.0)).item()
@@ -376,7 +374,7 @@ def main():
         if is_main_process():
             logger.info("torch.compile() is disabled via config.")
 
-    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True) if dist.is_initialized() else model
+    model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=False) if dist.is_initialized() else model
 
     # 优化器参数分组: 2D 矩阵权重 → Muon, 其余 → AdamW
     muon_params = []
@@ -405,8 +403,17 @@ def main():
     
     # GradScaler 用于混合精度
     scaler = GradScaler(enabled=config['train']['use_amp'])
-    
-    # [新增] 梯度累积参数
+
+    # GPU 预处理器
+    gpu_preprocessor = GPUPreprocessor(
+        signal_len=config['data']['signal_len'],
+        fs=100.0,
+        num_channels=5
+    ).to(device)
+    if is_main_process():
+        logger.info("GPUPreprocessor initialized on device.")
+
+    # 梯度累积参数
     accum_iter = config['train'].get('accum_iter', 1)
     if is_main_process():
         logger.info(f"Gradient Accumulation Steps: {accum_iter}")
@@ -467,7 +474,8 @@ def main():
             base_lr=current_base_lr,
             min_lr=min_lr,
             mask_ratio=current_mask_ratio,
-            lr_start_step=current_lr_start_step
+            lr_start_step=current_lr_start_step,
+            gpu_preprocessor=gpu_preprocessor
         )
 
         if is_main_process():
