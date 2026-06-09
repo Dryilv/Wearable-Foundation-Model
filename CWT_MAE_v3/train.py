@@ -11,11 +11,14 @@ from collections import defaultdict
 import numpy as np
 
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import autocast, GradScaler
+
+from muon import Muon
 
 # 允许编译失败时自动回退
 import torch._dynamo
@@ -55,7 +58,7 @@ def adjust_learning_rate_per_step(optimizer, current_step, total_steps, warmup_s
 # -------------------------------------------------------------------
 # 5. 训练与验证逻辑
 # -------------------------------------------------------------------
-def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global, 
+def train_one_epoch(model, dataloader, optimizer_muon, optimizer_adamw, scaler, epoch, logger, config, device, start_time_global,
                     total_steps, warmup_steps, base_lr, min_lr, mask_ratio=None, lr_start_step=0):
     model.train()
     metric_logger = defaultdict(lambda: SmoothedValue(window_size=20))
@@ -88,7 +91,8 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
     
     start_time = time.time()
     
-    optimizer.zero_grad(set_to_none=True) # Initialize gradients
+    optimizer_muon.zero_grad(set_to_none=True)
+    optimizer_adamw.zero_grad(set_to_none=True)
 
     for step, batch_data in enumerate(dataloader):
         step_start_time = time.time()
@@ -111,11 +115,19 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
             if current_step_for_lr < 0: current_step_for_lr = 0
             
             adjust_learning_rate_per_step(
-                optimizer, 
-                current_step=current_step_for_lr // accum_iter, 
-                total_steps=total_steps // accum_iter, 
-                warmup_steps=warmup_steps // accum_iter, 
-                base_lr=base_lr_scaled, 
+                optimizer_muon,
+                current_step=current_step_for_lr // accum_iter,
+                total_steps=total_steps // accum_iter,
+                warmup_steps=warmup_steps // accum_iter,
+                base_lr=base_lr_scaled,
+                min_lr=min_lr_scaled
+            )
+            adjust_learning_rate_per_step(
+                optimizer_adamw,
+                current_step=current_step_for_lr // accum_iter,
+                total_steps=total_steps // accum_iter,
+                warmup_steps=warmup_steps // accum_iter,
+                base_lr=base_lr_scaled,
                 min_lr=min_lr_scaled
             )
 
@@ -161,14 +173,28 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         
         if do_sync:
             # Unscale 之后才能 clip grad
-            scaler.unscale_(optimizer)
-            
-            # Clip Grad
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['train']['clip_grad'])
-            
-            scaler.step(optimizer)
+            scaler.unscale_(optimizer_muon)
+            scaler.unscale_(optimizer_adamw)
+
+            # 检查任一 optimizer 是否检测到 inf/nan，如果是则两个都跳过
+            # 防止双 optimizer 不对称更新导致模型状态不一致
+            found_inf = sum(
+                v.item()
+                for state in scaler._per_optimizer_states.values()
+                for v in state["found_inf_per_device"].values()
+            )
+
+            if found_inf == 0:
+                # Clip Grad
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config['train']['clip_grad'])
+                scaler.step(optimizer_muon)
+                scaler.step(optimizer_adamw)
+            else:
+                grad_norm = torch.tensor(0.0)
+
             scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_adamw.zero_grad(set_to_none=True)
             
             metric_logger['grad_norm'].update(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
 
@@ -190,7 +216,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, epoch, logger, config,
         metric_logger['loss_time'].update(loss_time_val)
         metric_logger['loss_stats'].update(loss_stats_val)
         metric_logger['loss_contrast'].update(loss_contrast_val)
-        metric_logger['lr'].update(optimizer.param_groups[0]["lr"])
+        metric_logger['lr'].update(optimizer_adamw.param_groups[0]["lr"])
         metric_logger['throughput'].update(throughput)
 
         if step % 50 == 0 and is_main_process():
@@ -357,20 +383,30 @@ def main():
 
     model = DDP(model, device_ids=[gpu_id], output_device=gpu_id, find_unused_parameters=True) if dist.is_initialized() else model
 
-    # 优化器参数分组
-    base_params = []
-    
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        base_params.append(param)
-            
-    if is_main_process():
-        logger.info(f"Optimizer groups: Base Params={len(base_params)}")
+    # 优化器参数分组: 2D 矩阵权重 → Muon, 其余 → AdamW
+    muon_params = []
+    adamw_params = []
 
-    optimizer = optim.AdamW([
-        {'params': base_params, 'lr': base_lr}
-    ], weight_decay=float(config['train']['weight_decay']))
+    for module_name, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            for param_name, p in m.named_parameters(recurse=False):
+                if not p.requires_grad:
+                    continue
+                if param_name == 'weight':
+                    muon_params.append(p)
+                elif param_name == 'bias':
+                    adamw_params.append(p)
+        else:
+            for param_name, p in m.named_parameters(recurse=False):
+                if not p.requires_grad:
+                    continue
+                adamw_params.append(p)
+
+    if is_main_process():
+        logger.info(f"Optimizer groups: Muon Params (2D Weights)={len(muon_params)}, AdamW Params (1D/Others)={len(adamw_params)}")
+
+    optimizer_muon = Muon(muon_params, lr=base_lr, weight_decay=float(config['train']['weight_decay']))
+    optimizer_adamw = optim.AdamW(adamw_params, lr=base_lr, weight_decay=float(config['train']['weight_decay']))
     
     # GradScaler 用于混合精度
     scaler = GradScaler(enabled=config['train']['use_amp'])
@@ -384,7 +420,7 @@ def main():
     start_epoch = 0
     if config['train']['resume'] and os.path.isfile(config['train']['resume']):
         checkpoint = torch.load(config['train']['resume'], map_location='cpu')
-        
+
         # 处理 DDP state_dict 加载
         state_dict = checkpoint['model']
         if not dist.is_initialized():
@@ -396,8 +432,14 @@ def main():
             msg = model.load_state_dict(new_state_dict, strict=False)
         else:
             msg = model.module.load_state_dict(state_dict, strict=False)
-            
-        optimizer.load_state_dict(checkpoint['optimizer'])
+
+        # 兼容旧版单 optimizer checkpoint 和新版双 optimizer checkpoint
+        if 'optimizer_muon' in checkpoint:
+            optimizer_muon.load_state_dict(checkpoint['optimizer_muon'])
+            optimizer_adamw.load_state_dict(checkpoint['optimizer_adamw'])
+        else:
+            if is_main_process():
+                logger.warning("Old checkpoint format detected (single optimizer). Skipping optimizer state loading.")
         scaler.load_state_dict(checkpoint['scaler'])
         start_epoch = checkpoint['epoch'] + 1
         if is_main_process():
@@ -424,7 +466,7 @@ def main():
             
         # Train
         train_metrics = train_one_epoch(
-            model, train_dataloader, optimizer, scaler, epoch, logger, config, device, start_time_global,
+            model, train_dataloader, optimizer_muon, optimizer_adamw, scaler, epoch, logger, config, device, start_time_global,
             total_steps=current_total_steps,
             warmup_steps=current_warmup_steps,
             base_lr=current_base_lr,
@@ -477,7 +519,8 @@ def main():
             # 保存 Checkpoint
             save_dict = {
                 'model': model.module.state_dict() if dist.is_initialized() else model.state_dict(),
-                'optimizer': optimizer.state_dict(),
+                'optimizer_muon': optimizer_muon.state_dict(),
+                'optimizer_adamw': optimizer_adamw.state_dict(),
                 'scaler': scaler.state_dict(),
                 'epoch': epoch,
                 'config': config
