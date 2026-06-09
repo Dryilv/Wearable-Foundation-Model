@@ -600,29 +600,29 @@ def main():
     # DataLoader: 必须使用 variable_channel_collate_fn_cls
     pin_memory = data_cfg.get('pin_memory', True)
     train_loader = DataLoader(
-        train_ds, 
-        batch_size=train_cfg['batch_size'], 
-        sampler=train_sampler, 
+        train_ds,
+        batch_size=train_cfg['batch_size'],
+        sampler=train_sampler,
         shuffle=shuffle_train,
-        num_workers=data_cfg.get('num_workers', 4), 
+        num_workers=0,
         pin_memory=pin_memory,
-        collate_fn=variable_channel_collate_fn_cls # 关键修改
+        collate_fn=variable_channel_collate_fn_cls
     )
     val_loader = DataLoader(
-        val_ds, 
-        batch_size=train_cfg['batch_size'], 
-        sampler=val_sampler, 
+        val_ds,
+        batch_size=train_cfg['batch_size'],
+        sampler=val_sampler,
         shuffle=False,
-        num_workers=data_cfg.get('num_workers', 4), 
+        num_workers=0,
         pin_memory=pin_memory,
-        collate_fn=variable_channel_collate_fn_cls # 关键修改
+        collate_fn=variable_channel_collate_fn_cls
     )
     test_loader = DataLoader(
-        test_ds, 
-        batch_size=train_cfg['batch_size'], 
-        sampler=test_sampler, 
+        test_ds,
+        batch_size=train_cfg['batch_size'],
+        sampler=test_sampler,
         shuffle=False,
-        num_workers=data_cfg.get('num_workers', 4), 
+        num_workers=0,
         pin_memory=pin_memory,
         collate_fn=variable_channel_collate_fn_cls
     )

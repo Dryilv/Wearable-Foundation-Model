@@ -85,6 +85,30 @@ class DownstreamClassificationDataset(Dataset):
         if is_main_process():
             print(f"[{mode}] Loaded {len(self.file_list)} samples.")
 
+        # 预加载所有数据到内存
+        self._cache = {}
+        from tqdm import tqdm as _tqdm
+        iter_files = _tqdm(self.file_list, desc=f"[{mode}] Loading data into memory") if is_main_process() else self.file_list
+        for filename in iter_files:
+            file_path = os.path.join(self.data_root, filename)
+            if file_path not in self._cache and os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    try:
+                        self._cache[file_path] = pickle.load(f)
+                    except ModuleNotFoundError as e:
+                        if 'numpy' in str(e):
+                            class NumpyUnpickler(pickle.Unpickler):
+                                def find_class(self, module, name):
+                                    if module.startswith('numpy._core') or module.startswith('numpy.core'):
+                                        module = 'numpy'
+                                    return super().find_class(module, name)
+                            f.seek(0)
+                            self._cache[file_path] = NumpyUnpickler(f).load()
+                        else:
+                            raise
+        if is_main_process():
+            print(f"[{mode}] Loaded {len(self._cache)} files into memory.")
+
     def __len__(self):
         return len(self.file_list)
 
@@ -93,26 +117,10 @@ class DownstreamClassificationDataset(Dataset):
         file_path = os.path.join(self.data_root, filename)
 
         try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Data file not found: {file_path}")
+            if file_path not in self._cache:
+                raise FileNotFoundError(f"Data file not found in cache: {file_path}")
 
-            with open(file_path, 'rb') as f:
-                # 处理 numpy 版本不兼容问题
-                try:
-                    content = pickle.load(f)
-                except ModuleNotFoundError as e:
-                    if 'numpy' in str(e):
-                        # 使用自定义 Unpickler 修复 numpy 模块路径
-                        class NumpyUnpickler(pickle.Unpickler):
-                            def find_class(self, module, name):
-                                # 将旧的 numpy 内部模块映射到当前可用模块
-                                if module.startswith('numpy._core') or module.startswith('numpy.core'):
-                                    module = 'numpy'
-                                return super().find_class(module, name)
-                        f.seek(0)
-                        content = NumpyUnpickler(f).load()
-                    else:
-                        raise
+            content = self._cache[file_path]
             
             # --- 1. 加载数据 ---
             # 兼容不同结构的 content

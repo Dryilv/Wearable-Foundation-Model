@@ -132,11 +132,20 @@ class PhysioSignalDataset(Dataset):
                  self.active_indices = self.active_indices[:keep_num]
             print(f"[{mode.upper()}] Data Ratio: {data_ratio:.2f} | Using {len(self.active_indices)}/{total_samples} samples.")
             
+        # 预加载所有数据到内存
+        unique_paths = list(set(self.index_data[i]['path'] for i in self.active_indices))
+        self._cache = {}
+        from tqdm import tqdm as _tqdm
+        for path in _tqdm(unique_paths, desc=f"[{mode.upper()}] Loading data into memory"):
+            with open(path, 'rb') as f:
+                self._cache[path] = pickle.load(f)
+        print(f"[{mode.upper()}] Loaded {len(self._cache)} unique files into memory.")
+
         # 预生成样本索引 (Mapping local_idx -> global_idx)
         self.samples = []
         for i in self.active_indices:
             item_info = self.index_data[i]
-            
+
             # 如果开启滑动窗口且 index 中包含长度信息
             if self.use_sliding_window and 'len' in item_info:
                 total_len = item_info['len']
@@ -150,7 +159,7 @@ class PhysioSignalDataset(Dataset):
             else:
                 # 默认行为：每个条目作为一个样本，start 为 None (触发随机或中心裁剪)
                 self.samples.append({'idx': i, 'start': None})
-            
+
         print(f"[{mode.upper()}] Dataset initialized with {len(self.samples)} samples.")
 
     def __len__(self):
@@ -170,8 +179,7 @@ class PhysioSignalDataset(Dataset):
                 # row_idx = item_info.get('row', 0) # Deprecated
                 label = item_info.get('label', 0) 
                 
-                # 使用缓存加载，避免频繁 IO 和反序列化
-                content = load_pickle_file(file_path)
+                content = self._cache[file_path]
                 
                 # [Modified] 直接读取 data，不再使用 row 索引
                 raw_signal = content['data']
@@ -260,7 +268,7 @@ class PhysioSignalDataset(Dataset):
         print(f"Warning: Fallback triggered for idx {idx} after 3 retries. Attempting to return a safe sample.")
         try:
             sample_info = self.samples[0]
-            content = load_pickle_file(self.index_data[sample_info['idx']]['path'])
+            content = self._cache[self.index_data[sample_info['idx']]['path']]
             safe_signal = content['data']
             if safe_signal.ndim == 1:
                 safe_signal = safe_signal[np.newaxis, :]
