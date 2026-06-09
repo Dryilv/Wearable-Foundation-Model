@@ -5,82 +5,8 @@ import json
 import os
 import random
 import pickle
-import hashlib
-from sklearn.model_selection import StratifiedShuffleSplit
-from functools import lru_cache
 from utils_features import extract_features
 from preprocess import preprocess_signal
-
-# 独立的缓存函数，避免实例绑定的序列化问题
-@lru_cache(maxsize=8)
-def load_pickle_file(file_path):
-    with open(file_path, 'rb') as f:
-        return pickle.load(f)
-
-class DataSplitter:
-    def __init__(self, index_file, split_ratio=0.1, seed=42):
-        self.index_file = index_file
-        self.split_ratio = split_ratio
-        self.seed = seed
-        
-        with open(index_file, 'r') as f:
-            self.full_data = json.load(f)
-            
-        self.total_samples = len(self.full_data)
-        self.split_meta_file = index_file.replace('.json', f'_split_seed{seed}.json')
-
-    def get_split(self):
-        # 1. Checksum verification
-        data_str = json.dumps(self.full_data, sort_keys=True)
-        current_hash = hashlib.md5(data_str.encode('utf-8')).hexdigest()
-        
-        # 2. Check if split meta exists and matches
-        if os.path.exists(self.split_meta_file):
-            print(f"Loading existing split from {self.split_meta_file}")
-            with open(self.split_meta_file, 'r') as f:
-                meta = json.load(f)
-            
-            if meta['hash'] == current_hash and meta['split_ratio'] == self.split_ratio:
-                print("Split checksum verified.")
-                return meta['train_indices'], meta['val_indices']
-            else:
-                print("Split metadata mismatch or outdated. Re-splitting...")
-        
-        # 3. Create new split
-        print(f"Creating new split (val_ratio={self.split_ratio})...")
-        indices = np.arange(self.total_samples)
-        labels = [item.get('label', 0) for item in self.full_data]
-        
-        # Stratified Split
-        try:
-            sss = StratifiedShuffleSplit(n_splits=1, test_size=self.split_ratio, random_state=self.seed)
-            train_idx, val_idx = next(sss.split(indices, labels))
-        except ValueError:
-            # Fallback to random split if only 1 class or labels issue
-            print("Stratified split failed (maybe single class), falling back to random split.")
-            np.random.seed(self.seed)
-            np.random.shuffle(indices)
-            split_point = int(self.total_samples * (1 - self.split_ratio))
-            train_idx = indices[:split_point]
-            val_idx = indices[split_point:]
-            
-        train_indices = train_idx.tolist()
-        val_indices = val_idx.tolist()
-        
-        # 4. Save metadata
-        meta = {
-            'hash': current_hash,
-            'split_ratio': self.split_ratio,
-            'seed': self.seed,
-            'train_indices': train_indices,
-            'val_indices': val_indices,
-            'timestamp': str(np.datetime64('now'))
-        }
-        
-        with open(self.split_meta_file, 'w') as f:
-            json.dump(meta, f, indent=2)
-            
-        return train_indices, val_indices
 
 class PhysioSignalDataset(Dataset):
     def __init__(self, index_file=None, data_source=None, indices=None, signal_len=500, mode='train', 
@@ -326,23 +252,6 @@ class PhysioSignalDataset(Dataset):
             # np.pad 格式: ((top, bottom), (left, right))
             # 我们只在时间轴 (axis 1) 的右侧填充
             return np.pad(signal, ((0, 0), (0, pad_len)), 'constant', constant_values=0)
-
-def fixed_channel_collate_fn(batch):
-    """
-    单通道数据的 Collate Function。
-    Output: (B, 1, L), (B,) channel_ids, (B,) labels, (B, 16) stats
-    """
-    signals = [item[0] for item in batch]
-    channel_ids = [item[1] for item in batch]
-    labels = [item[2] for item in batch]
-    stats = [item[3] for item in batch]
-
-    padded_signals = torch.stack(signals)  # (B, 1, L)
-    channel_ids = torch.stack(channel_ids)  # (B,)
-    labels = torch.stack(labels)  # (B,)
-    stats_tensor = torch.stack(stats) # (B, 16)
-
-    return padded_signals, channel_ids, labels, stats_tensor
 
 def multi_channel_collate_fn(batch):
     """

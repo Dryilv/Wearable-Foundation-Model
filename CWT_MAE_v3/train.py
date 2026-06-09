@@ -6,6 +6,7 @@ import argparse
 import yaml
 import math
 import time
+import contextlib
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
@@ -26,7 +27,7 @@ torch._dynamo.config.suppress_errors = True
 
 # 导入你的模型和数据集
 from model import CWT_MAE_RoPE
-from dataset import PhysioSignalDataset, fixed_channel_collate_fn, multi_channel_collate_fn
+from dataset import PhysioSignalDataset, multi_channel_collate_fn
 from utils_metrics import ExperimentTracker
 from utils import save_reconstruction_images, SmoothedValue, format_time, is_main_process
 from utils import setup_logger, init_distributed_mode, update_teacher
@@ -138,16 +139,10 @@ def train_one_epoch(model, dataloader, optimizer_muon, optimizer_adamw, scaler, 
         # 混合精度前向传播
         # 在 DDP 模式下，如果不是最后一次累积，使用 no_sync 上下文以减少通信
         do_sync = (step + 1) % accum_iter == 0 or (step + 1) == len(dataloader)
-        
-        # 处理 DDP no_sync
-        my_context = model.no_sync if (isinstance(model, DDP) and not do_sync) else (lambda: contextlib.nullcontext())
-        
-        # 注意：python < 3.7 可能不支持这种 lambda 写法，但这里环境通常较高。
-        # 为了保险，直接写逻辑：
+
         if isinstance(model, DDP) and not do_sync:
              context_manager = model.no_sync()
         else:
-             import contextlib
              context_manager = contextlib.nullcontext()
 
         with context_manager:
@@ -489,11 +484,6 @@ def main():
             }
             tracker.log(epoch, metrics_dict)
             logger.info(f"Epoch {epoch} Metrics: {metrics_dict}")
-
-            # Early Stopping Check
-            if tracker.check_early_stopping(patience=3):
-                logger.info("Early stopping triggered due to no improvement in feature quality.")
-                # break # 取消注释以启用
 
             # 保存可视化 - 随机抽取一个样本
             if vis_dataloader is not None:

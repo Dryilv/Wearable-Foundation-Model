@@ -16,7 +16,6 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import numpy as np
 from torch.amp import autocast, GradScaler
-import copy
 from muon import Muon
 
 import warnings
@@ -117,71 +116,6 @@ def move_batch_to_device(batch, device):
     if channel_mask is not None:
         channel_mask = channel_mask.to(device, non_blocking=True)
     return x, modality_ids, y, channel_mask
-
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=None, reduction='mean', label_smoothing=0.0):
-        super().__init__()
-        self.gamma = float(gamma)
-        self.reduction = reduction
-        self.label_smoothing = float(label_smoothing)
-        self.alpha_scalar = None
-        if alpha is None:
-            self.register_buffer("alpha_tensor", None)
-        elif isinstance(alpha, (list, tuple)):
-            self.register_buffer("alpha_tensor", torch.tensor(alpha, dtype=torch.float32))
-        else:
-            self.register_buffer("alpha_tensor", None)
-            self.alpha_scalar = float(alpha)
-
-    def forward(self, logits, targets):
-        # targets can be either hard labels (long) or soft labels (float)
-        if targets.dtype == torch.long:
-            # For hard labels, get standard cross entropy
-            ce_loss = F.cross_entropy(
-                logits,
-                targets,
-                reduction='none',
-                label_smoothing=self.label_smoothing
-            )
-            # Calculate probabilities of the target class
-            pt = torch.exp(-ce_loss)
-            focal_weight = (1.0 - pt) ** self.gamma
-            loss = focal_weight * ce_loss
-
-            if self.alpha_tensor is not None:
-                alpha_t = self.alpha_tensor[targets]
-                loss = alpha_t * loss
-            elif self.alpha_scalar is not None:
-                loss = self.alpha_scalar * loss
-
-        else:
-            # For soft labels, use KL divergence or compute manually
-            log_probs = F.log_softmax(logits, dim=-1)
-            # Manually apply label smoothing if needed for soft labels
-            if self.label_smoothing > 0:
-                num_classes = logits.size(-1)
-                targets = targets * (1.0 - self.label_smoothing) + self.label_smoothing / num_classes
-                
-            ce_loss = -(targets * log_probs).sum(dim=-1)
-            probs = torch.exp(log_probs)
-            # pt is the probability of the true distribution
-            pt = (targets * probs).sum(dim=-1)
-            
-            focal_weight = (1.0 - pt) ** self.gamma
-            loss = focal_weight * ce_loss
-            
-            if self.alpha_tensor is not None:
-                # Approximate alpha for soft labels by taking expected alpha
-                alpha_t = (targets * self.alpha_tensor).sum(dim=-1)
-                loss = alpha_t * loss
-            elif self.alpha_scalar is not None:
-                loss = self.alpha_scalar * loss
-
-        if self.reduction == 'sum':
-            return loss.sum()
-        if self.reduction == 'none':
-            return loss
-        return loss.mean()
 
 class MultiLabelFocalLoss(nn.Module):
     def __init__(self, gamma=2.0, alpha=None, pos_weight=None, reduction='mean'):
