@@ -215,3 +215,8 @@ Thumbs.db
 
 # Cleanup scripts (not to be committed)
 cleanup-python-cache.ps1
+
+# IDE / AI agent config
+.claude/
+.codegraph/
+.qwen/
