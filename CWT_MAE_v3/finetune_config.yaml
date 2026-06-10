@@ -97,6 +97,6 @@ model:
   cot_kv_layers: [3, 7, 11]
 
   # ===== 统计特征拼接 =====
-  use_stats_features: true
+  use_stats_features: false
 
   
