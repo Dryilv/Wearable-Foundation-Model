@@ -254,19 +254,29 @@ class TF_MAE_Classifier(nn.Module):
         else:
             latent, _, _, _ = self.encoder_model.forward_encoder(x, imgs)
             multi_layer = None
-        
-        latent_pooled = latent.mean(dim=1)
-        pred_stats = self.encoder_model.stats_pred_head(latent_pooled)
-        
-        patch_tokens = latent 
+
+        # 通道感知掩码池化：仅对真实通道 token 取均值，忽略 padding token
         token_padding_mask = None
         if channel_mask is not None:
-            channel_mask = channel_mask.to(patch_tokens.device, dtype=torch.bool)
-            B_mask, total_tokens, _ = patch_tokens.shape
+            channel_mask = channel_mask.to(latent.device, dtype=torch.bool)
+            B_mask, total_tokens, _ = latent.shape
             M_mask = x.shape[1]
             if channel_mask.shape[0] == B_mask and channel_mask.shape[1] == M_mask and M_mask > 0 and total_tokens % M_mask == 0:
                 n_patches = total_tokens // M_mask
                 token_padding_mask = (~channel_mask).unsqueeze(-1).expand(B_mask, M_mask, n_patches).reshape(B_mask, total_tokens)
+                # 掩码均值池化：仅对非 padding 通道的 token 取均值
+                mask_float = (~token_padding_mask).unsqueeze(-1).float()
+                valid_sum = (latent * mask_float).sum(dim=1)
+                valid_count = mask_float.sum(dim=1).clamp(min=1.0)
+                latent_pooled = valid_sum / valid_count
+            else:
+                latent_pooled = latent.mean(dim=1)
+        else:
+            latent_pooled = latent.mean(dim=1)
+
+        pred_stats = self.encoder_model.stats_pred_head(latent_pooled)
+        
+        patch_tokens = latent 
         
         if isinstance(self.head, LatentReasoningHead):
             logits = self.head(
@@ -276,7 +286,13 @@ class TF_MAE_Classifier(nn.Module):
                 multi_layer_features=multi_layer
             )
         else:
-            global_feat = patch_tokens.mean(dim=1)
+            if token_padding_mask is not None:
+                mask_float = (~token_padding_mask).unsqueeze(-1).float()
+                valid_sum = (patch_tokens * mask_float).sum(dim=1)
+                valid_count = mask_float.sum(dim=1).clamp(min=1.0)
+                global_feat = valid_sum / valid_count
+            else:
+                global_feat = patch_tokens.mean(dim=1)
             if self.use_stats_features:
                 global_feat = torch.cat([global_feat, pred_stats], dim=-1)
             logits = self.head(global_feat)

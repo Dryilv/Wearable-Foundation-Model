@@ -37,10 +37,11 @@ def build_balanced_shards(patient_folders, world_size):
 # 2. 自适应推理数据集 (Lazy Loading 优化版)
 # ==========================================
 class AdaptivePatientDataset(Dataset):
-    def __init__(self, file_paths, signal_len=3000, stride=1500, iqr_scale=1.5):
+    def __init__(self, file_paths, signal_len=3000, stride=1500, iqr_scale=1.5, max_channels=None):
         self.signal_len = signal_len
         self.stride = stride
         self.iqr_scale = iqr_scale
+        self.max_channels = max_channels
         self.windows_meta = [] # 存储元数据：(file_path, start_idx, std_val)
         
         self.sqa_stats = {
@@ -167,6 +168,11 @@ class AdaptivePatientDataset(Dataset):
         segment_norm = np.clip(segment_norm, -10.0, 10.0)
 
         sig_tensor = torch.from_numpy(segment_norm) # (M, L)
+        
+        if self.max_channels is not None and sig_tensor.shape[0] > self.max_channels:
+            sig_tensor = sig_tensor[:self.max_channels]
+        
+        M = sig_tensor.shape[0]
         modality_ids = torch.zeros(M, dtype=torch.long)
         
         return sig_tensor, modality_ids, torch.tensor(-1, dtype=torch.long)
@@ -204,6 +210,7 @@ def main():
     
     # 自适应过滤参数
     parser.add_argument('--iqr_scale', type=float, default=1.5)
+    parser.add_argument('--max_channels', type=int, default=8, help="最大通道数限制，防止显存溢出")
 
     args = parser.parse_args()
 
@@ -276,7 +283,8 @@ def main():
             pkl_files, 
             signal_len=args.signal_len, 
             stride=args.stride, 
-            iqr_scale=args.iqr_scale
+            iqr_scale=args.iqr_scale,
+            max_channels=args.max_channels
         )
         
         stats = dataset.sqa_stats

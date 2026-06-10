@@ -47,7 +47,7 @@ class MultiChannelAugmentor:
 # 2. Dataset 定义
 # ===================================================================
 class DownstreamClassificationDataset(Dataset):
-    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2, on_error='raise', max_error_logs=20, refined_labels_path=None):
+    def __init__(self, data_root, split_file, mode='train', signal_len=3000, task_index=0, num_classes=2, on_error='raise', max_error_logs=20, refined_labels_path=None, max_channels=None):
         self.data_root = data_root
         self.signal_len = signal_len
         self.mode = mode
@@ -56,6 +56,7 @@ class DownstreamClassificationDataset(Dataset):
         self.on_error = on_error
         self.max_error_logs = max_error_logs
         self.error_count = 0
+        self.max_channels = max_channels
         
         # 加载软标签 (如果提供)
         self.refined_labels = None
@@ -162,7 +163,8 @@ class DownstreamClassificationDataset(Dataset):
             signal_tensor = torch.from_numpy(processed_signal)
 
             # --- 6. 通道自适应处理 (Modality-Agnostic) ---
-            # 保留所有可用通道，模型通过 channel_mask 和跨通道注意力处理变长通道输入
+            # 保留所有可用通道，由 collate_fn 自动 pad 到 batch 内最大通道数
+            # 模型通过 channel_mask 和跨通道注意力处理变长通道输入
             
             M = signal_tensor.shape[0]
 
