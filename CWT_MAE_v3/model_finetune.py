@@ -18,6 +18,8 @@ class LatentReasoningHead(nn.Module):
         super().__init__()
         self.num_reasoning_tokens = num_reasoning_tokens
         self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
         self.num_kv_layers = num_kv_layers
 
         effective_dim = embed_dim * num_kv_layers
@@ -33,10 +35,13 @@ class LatentReasoningHead(nn.Module):
 
         self.cross_attn_q_proj = nn.Linear(embed_dim, embed_dim)
         self.cross_attn_kv_proj = nn.Linear(effective_dim, embed_dim * 2)
-        self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.cross_attn_out_proj = nn.Linear(embed_dim, embed_dim)
+        self.cross_attn_drop = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
 
-        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.self_attn_qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.self_attn_out_proj = nn.Linear(embed_dim, embed_dim)
+        self.self_attn_drop = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
 
         self.ffn = nn.Sequential(
@@ -48,7 +53,8 @@ class LatentReasoningHead(nn.Module):
         self.norm3 = nn.LayerNorm(embed_dim)
 
         self.pool_query = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pool_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=dropout)
+        self.pool_kv_proj = nn.Linear(embed_dim, embed_dim * 2)
+        self.pool_out_proj = nn.Linear(embed_dim, embed_dim)
         self.pool_norm = nn.LayerNorm(embed_dim)
 
         self.classifier = nn.Linear(embed_dim, num_classes)
@@ -62,6 +68,16 @@ class LatentReasoningHead(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+    def _sdpa(self, q, k, v, num_heads, attn_mask=None, dropout_p=0.0):
+        B, Sq, D = q.shape
+        Sk = k.shape[1]
+        head_dim = D // num_heads
+        q = q.reshape(B, Sq, num_heads, head_dim).transpose(1, 2)
+        k = k.reshape(B, Sk, num_heads, head_dim).transpose(1, 2)
+        v = v.reshape(B, Sk, num_heads, head_dim).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+        return out.transpose(1, 2).contiguous().reshape(B, Sq, D)
 
     def forward(self, x_encoder, token_padding_mask=None, extra_features=None,
                 multi_layer_features=None):
@@ -77,19 +93,30 @@ class LatentReasoningHead(nn.Module):
         kv = self.cross_attn_kv_proj(kv_input)
         k, v = kv.chunk(2, dim=-1)
 
-        attn_out, _ = self.cross_attn(
-            query=q, key=k, value=v,
-            key_padding_mask=token_padding_mask
-        )
+        attn_mask = None
+        if token_padding_mask is not None:
+            attn_mask = token_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype).masked_fill_(attn_mask, -1e4)
+
+        drop_p = self.cross_attn_drop.p if self.training else 0.0
+        attn_out = self._sdpa(q, k, v, self.num_heads, attn_mask=attn_mask, dropout_p=drop_p)
+        attn_out = self.cross_attn_out_proj(attn_out)
         queries = self.norm1(queries + self.drop_path(attn_out))
 
-        attn_out2, _ = self.self_attn(query=queries, key=queries, value=queries)
+        qkv = self.self_attn_qkv(queries)
+        q2, k2, v2 = qkv.chunk(3, dim=-1)
+        drop_p = self.self_attn_drop.p if self.training else 0.0
+        attn_out2 = self._sdpa(q2, k2, v2, self.num_heads, dropout_p=drop_p)
+        attn_out2 = self.self_attn_out_proj(attn_out2)
         queries = self.norm2(queries + self.drop_path(attn_out2))
 
         queries = self.norm3(queries + self.drop_path(self.ffn(queries)))
 
-        q = self.pool_query.expand(B, -1, -1)
-        pooled, _ = self.pool_attn(q, queries, queries)
+        pool_q = self.pool_query.expand(B, -1, -1)
+        pool_kv = self.pool_kv_proj(queries)
+        pool_k, pool_v = pool_kv.chunk(2, dim=-1)
+        pooled = self._sdpa(pool_q, pool_k, pool_v, self.num_heads)
+        pooled = self.pool_out_proj(pooled)
         decision_token = self.pool_norm(pooled.squeeze(1))
 
         if extra_features is not None:
