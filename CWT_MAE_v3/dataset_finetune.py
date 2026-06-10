@@ -162,17 +162,11 @@ class DownstreamClassificationDataset(Dataset):
             signal_tensor = torch.from_numpy(processed_signal)
 
             # --- 6. 通道自适应处理 (Modality-Agnostic) ---
-            # 移除所有人工指定的通道切片逻辑。
-            # 模型将接收所有可用通道，并被强制从信号波形本身学习特征，而不是依赖通道顺序。
+            # 保留所有可用通道，模型通过 channel_mask 和跨通道注意力处理变长通道输入
             
             M = signal_tensor.shape[0]
 
-            # 下游微调阶段：只使用第一个通道
-            if M > 1:
-                signal_tensor = signal_tensor[0:1]  # 只取第一个通道
-                M = 1
-
-            # 单通道模式，modality_id=0
+            # 所有通道共享 modality_id=0 (通用生理信号)
             modality_ids = torch.zeros(M, dtype=torch.long)
             
             # --- 7. 返回标签 (硬标签 or 软标签) ---
